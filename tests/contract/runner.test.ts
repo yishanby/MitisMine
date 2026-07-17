@@ -16,6 +16,15 @@ async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
   return result;
 }
 
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe("runJsonl", () => {
   it("streams JSONL in order", async () => {
     const events = await collect(
@@ -102,6 +111,26 @@ describe("runJsonl", () => {
     ]);
   });
 
+  it("redacts sensitive key-value patterns from stderr and error events", async () => {
+    const stderrEvents = await collect(
+      runJsonl({ command: process.execPath, args: [fake, "stderr-sensitive"] }),
+    );
+    const errorEvents = await collect(
+      runJsonl({ command: process.execPath, args: [fake, "error-sensitive"] }),
+    );
+
+    expect(stderrEvents.at(-1)).toMatchObject({
+      type: "error",
+      code: "process_stderr",
+      message: expect.stringMatching(/\[REDACTED\].*\[REDACTED\]/),
+    });
+    expect(errorEvents.at(-1)).toMatchObject({
+      type: "error",
+      code: "provider_error",
+      message: "API_TOKEN=[REDACTED]",
+    });
+  });
+
   it("terminates children on timeout and cancellation", async () => {
     const timedOut = await collect(
       runJsonl({
@@ -129,4 +158,39 @@ describe("runJsonl", () => {
       expect.objectContaining({ type: "error", code: "cancelled" }),
     );
   });
+
+  it("cancels a spawned process tree and returns within a fixed bound", async () => {
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+    let descendantPid: number | undefined;
+    const startedAt = Date.now();
+
+    try {
+      for await (const event of runJsonl({
+        command: process.execPath,
+        args: [fake, "spawn-tree"],
+        timeoutMs: 10_000,
+        terminationGraceMs: 100,
+        signal: controller.signal,
+      })) {
+        events.push(event);
+        if (event.type === "descendant" && typeof event.pid === "number") {
+          descendantPid = event.pid;
+          controller.abort();
+        }
+      }
+
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      expect(events).toContainEqual(expect.objectContaining({ type: "error", code: "cancelled" }));
+      expect(descendantPid).toBeTypeOf("number");
+      for (let attempt = 0; attempt < 20 && processIsAlive(descendantPid ?? -1); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(processIsAlive(descendantPid ?? -1)).toBe(false);
+    } finally {
+      if (descendantPid !== undefined && processIsAlive(descendantPid)) {
+        process.kill(descendantPid, "SIGKILL");
+      }
+    }
+  }, 10_000);
 });

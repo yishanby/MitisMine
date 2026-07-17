@@ -11,14 +11,21 @@ import {
   type ResumeAgentTask,
 } from "./types.js";
 
-const CODEX_AUTH_ENV = ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] as const;
+const PERMISSION_ARGS = [
+  "--ignore-user-config",
+  "--strict-config",
+  "--skip-git-repo-check",
+  "-c",
+  'default_permissions="workspace"',
+  "-c",
+  'permissions.workspace.filesystem={":workspace_roots"={"."="read","**/*.env"="deny"}}',
+] as const;
 
 function argumentsFor(sessionId?: string): string[] {
   if (sessionId !== undefined) {
     return [
       "exec",
-      "--sandbox",
-      "read-only",
+      ...PERMISSION_ARGS,
       "resume",
       "--json",
       sessionId,
@@ -27,9 +34,8 @@ function argumentsFor(sessionId?: string): string[] {
   }
   return [
     "exec",
+    ...PERMISSION_ARGS,
     "--json",
-    "--sandbox",
-    "read-only",
     "--color",
     "never",
     "-",
@@ -71,7 +77,7 @@ function optionsFor(task: AgentTask, sessionId?: string): RunJsonlOptions {
     args: [...invocation.prefixArgs, ...argumentsFor(sessionId)],
     stdin: task.prompt,
     cwd: task.cwd,
-    providerAuthEnv: CODEX_AUTH_ENV,
+    providerAuthEnv: [],
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.signal === undefined ? {} : { signal: task.signal }),
   };

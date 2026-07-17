@@ -17,7 +17,7 @@ export class OutboxDispatcher {
   readonly #now: () => Date;
   readonly #pollIntervalMs: number;
   #timer: NodeJS.Timeout | undefined;
-  #flushing = false;
+  #flushTask: Promise<void> | undefined;
 
   constructor(options: OutboxDispatcherOptions) {
     this.#outbox = options.outbox;
@@ -33,30 +33,35 @@ export class OutboxDispatcher {
     void this.flushOnce();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
+    await this.#flushTask;
   }
 
-  async flushOnce(): Promise<void> {
-    if (this.#flushing) return;
-    this.#flushing = true;
-    try {
-      const now = this.#now();
-      for (const message of this.#outbox.pending(now.toISOString())) {
-        try {
-          await this.#sender.send(message);
-          this.#outbox.markSent(message.id);
-        } catch {
-          const backoffMs = Math.min(60_000, 1_000 * 2 ** (message.attempts + 1));
-          this.#outbox.markRetry(
-            message.id,
-            new Date(now.getTime() + backoffMs).toISOString(),
-          );
-        }
+  flushOnce(): Promise<void> {
+    if (this.#flushTask !== undefined) return this.#flushTask;
+    const flushTask = this.#performFlush();
+    const trackedTask = flushTask.finally(() => {
+      if (this.#flushTask === trackedTask) this.#flushTask = undefined;
+    });
+    this.#flushTask = trackedTask;
+    return trackedTask;
+  }
+
+  async #performFlush(): Promise<void> {
+    const now = this.#now();
+    for (const message of this.#outbox.pending(now.toISOString())) {
+      try {
+        await this.#sender.send(message);
+        this.#outbox.markSent(message.id);
+      } catch {
+        const backoffMs = Math.min(60_000, 1_000 * 2 ** (message.attempts + 1));
+        this.#outbox.markRetry(
+          message.id,
+          new Date(now.getTime() + backoffMs).toISOString(),
+        );
       }
-    } finally {
-      this.#flushing = false;
     }
   }
 }

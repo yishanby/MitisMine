@@ -46,6 +46,16 @@ export async function collectNormalized(
       }
     }
   }
+  const fatal = events.find(
+    (event) => event.type === "error" && event.code !== "process_stderr",
+  );
+  if (fatal !== undefined) {
+    const code = typeof fatal.code === "string" ? fatal.code : "provider_error";
+    throw new Error(`${provider} failed with ${code}`);
+  }
+  if (!events.some((event) => event.type === "final" && typeof event.text === "string")) {
+    throw new Error(`${provider} did not emit a final event`);
+  }
   if (externalSessionId === undefined) {
     throw new Error(`${provider} did not emit a session identifier`);
   }

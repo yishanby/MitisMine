@@ -10,7 +10,6 @@ import {
   type ResumeAgentTask,
 } from "./types.js";
 
-const COPILOT_AUTH_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] as const;
 const REDACTED_SECRET_NAMES = [
   "FEISHU_HUB_APP_SECRET",
   "FEISHU_CLAUDE_APP_SECRET",
@@ -28,6 +27,7 @@ function argumentsFor(task: AgentTask, sessionId: string, resume: boolean): stri
     "on",
     "--no-ask-user",
     "--no-color",
+    "--available-tools=web_search,web_fetch",
     `--secret-env-vars=${REDACTED_SECRET_NAMES}`,
   ];
   if (resume) args.push(`--resume=${sessionId}`);
@@ -59,7 +59,7 @@ function optionsFor(task: AgentTask, sessionId: string, resume: boolean): RunJso
     command: "copilot",
     args: argumentsFor(task, sessionId, resume),
     cwd: task.cwd,
-    providerAuthEnv: COPILOT_AUTH_ENV,
+    providerAuthEnv: [],
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.signal === undefined ? {} : { signal: task.signal }),
   };

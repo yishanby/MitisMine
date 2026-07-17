@@ -1,8 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { join } from "node:path";
 
 import type { AgentErrorEvent, AgentEvent, RunJsonlOptions } from "./types.js";
 
-const SENSITIVE_ENV = /SECRET|TOKEN|COOKIE|AUTHORIZATION|FEISHU|LARK/i;
+const SENSITIVE_ENV = /SECRET|TOKEN|COOKIE|AUTHORIZATION|FEISHU|LARK|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL/i;
+const SENSITIVE_ASSIGNMENT = /\b([a-z0-9_.-]*(?:secret|token|cookie|authorization|password|passwd|api[_-]?key|private[_-]?key|credential)[a-z0-9_.-]*)\s*([:=])\s*(?:bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
 const BASE_ENV = new Set([
   "PATH",
   "HOME",
@@ -27,6 +29,76 @@ const DEFAULT_MAX_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000;
+const DEFAULT_TERMINATION_GRACE_MS = 1_000;
+
+function redactSensitive(message: string, knownValues: readonly string[] = []): string {
+  let redacted = message;
+  for (const value of [...knownValues].sort((left, right) => right.length - left.length)) {
+    if (value.length < 4) continue;
+    redacted = redacted.split(value).join("[REDACTED]");
+  }
+  return redacted.replace(
+    SENSITIVE_ASSIGNMENT,
+    (_match, key: string, separator: string) => `${key}${separator}[REDACTED]`,
+  );
+}
+
+function waitForClose(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("close", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref();
+    child.once("close", finish);
+  });
+}
+
+async function terminateProcessTree(
+  child: ChildProcessWithoutNullStreams,
+  graceMs: number,
+): Promise<void> {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  if (process.platform === "win32") {
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows";
+    const taskkill = spawn(
+      join(systemRoot, "System32", "taskkill.exe"),
+      ["/PID", String(pid), "/T", "/F"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        taskkill.once("error", () => resolve());
+        taskkill.once("close", () => resolve());
+      }),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, graceMs);
+        timer.unref();
+      }),
+    ]);
+    await waitForClose(child, graceMs);
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+  await waitForClose(child, graceMs);
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+  await waitForClose(child, graceMs);
+}
 
 function lookup(
   key: string,
@@ -82,8 +154,15 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
   const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
   const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+  const childEnvironment = curateChildEnvironment(options.env, options.allowEnv, options.providerAuthEnv);
+  const sensitiveValues = Object.entries(childEnvironment)
+    .filter(([key]) => SENSITIVE_ENV.test(key))
+    .map(([, value]) => value)
+    .filter((value): value is string => value !== undefined);
   const spawnOptions: SpawnOptionsWithoutStdio = {
-    env: curateChildEnvironment(options.env, options.allowEnv, options.providerAuthEnv),
+    env: childEnvironment,
+    detached: process.platform !== "win32",
     windowsHide: true,
   };
   if (options.cwd !== undefined) spawnOptions.cwd = options.cwd;
@@ -109,6 +188,14 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
     wake?.();
     wake = undefined;
   };
+  const finish = (): void => {
+    if (done) return;
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
+    done = true;
+    wake?.();
+    wake = undefined;
+  };
   const terminate = (reason: NonNullable<typeof termination>): void => {
     if (termination !== undefined) return;
     termination = reason;
@@ -118,7 +205,7 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
       output_too_large: `Agent stdout exceeded ${maxStdoutBytes} bytes`,
     } as const;
     emit(errorEvent(reason, messages[reason]));
-    child.kill();
+    void terminateProcessTree(child, terminationGraceMs).finally(finish);
   };
   const processLine = (line: Buffer): void => {
     const normalized = line.at(-1) === 13 ? line.subarray(0, -1) : line;
@@ -132,7 +219,12 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
       if (typeof parsed !== "object" || parsed === null || !("type" in parsed) || typeof parsed.type !== "string") {
         throw new TypeError("JSONL event must be an object with a string type");
       }
-      emit(parsed as AgentEvent);
+      const event = parsed as AgentEvent;
+      emit(
+        event.type === "error" && typeof event.message === "string"
+          ? { ...event, message: redactSensitive(event.message, sensitiveValues) }
+          : event,
+      );
     } catch {
       emit(errorEvent("malformed_jsonl", "Agent emitted malformed JSONL"));
     }
@@ -173,8 +265,7 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
     if (termination === undefined) emit(errorEvent("process_error", "Agent process could not be started"));
   });
   child.once("close", (code) => {
-    clearTimeout(timeout);
-    options.signal?.removeEventListener("abort", abort);
+    if (done) return;
     if (stdout.length > 0 && termination === undefined) processLine(stdout);
     if (termination === undefined && code !== 0) {
       emit(errorEvent("process_exit", `Agent process exited with code ${code ?? "unknown"}`));
@@ -183,14 +274,12 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
       emit(
         errorEvent(
           "process_stderr",
-          stderr.toString("utf8"),
+          redactSensitive(stderr.toString("utf8"), sensitiveValues),
           stderrBytes > maxStderrBytes,
         ),
       );
     }
-    done = true;
-    wake?.();
-    wake = undefined;
+    if (termination === undefined) finish();
   });
 
   while (!done || queue.length > 0) {

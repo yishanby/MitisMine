@@ -33,4 +33,5 @@ export interface RunJsonlOptions {
   readonly maxLineBytes?: number;
   readonly maxStdoutBytes?: number;
   readonly maxStderrBytes?: number;
+  readonly terminationGraceMs?: number;
 }

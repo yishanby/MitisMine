@@ -8,8 +8,6 @@ import {
   type ResumeAgentTask,
 } from "./types.js";
 
-const CLAUDE_AUTH_ENV = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] as const;
-
 function argumentsFor(task: AgentTask, sessionId?: string): string[] {
   const args = [
     "--print",
@@ -19,6 +17,13 @@ function argumentsFor(task: AgentTask, sessionId?: string): string[] {
     "--verbose",
     "--permission-mode",
     "plan",
+    "--tools",
+    "WebSearch,WebFetch",
+    "--allowedTools",
+    "WebSearch,WebFetch",
+    "--disallowedTools",
+    "Read,Glob,Grep,Bash,Edit,Write",
+    "--strict-mcp-config",
   ];
   if (sessionId !== undefined) args.push("--resume", sessionId);
   args.push(task.prompt);
@@ -54,7 +59,7 @@ function optionsFor(task: AgentTask, sessionId?: string): RunJsonlOptions {
     command: "claude",
     args: argumentsFor(task, sessionId),
     cwd: task.cwd,
-    providerAuthEnv: CLAUDE_AUTH_ENV,
+    providerAuthEnv: [],
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.signal === undefined ? {} : { signal: task.signal }),
   };

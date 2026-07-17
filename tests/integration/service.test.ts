@@ -22,6 +22,7 @@ import { createTopic } from "../../packages/domain/src/topic.js";
 import { SqliteOrchestrationStore } from "../../packages/storage/src/orchestration.js";
 import { DurableOutbox } from "../../packages/storage/src/outbox.js";
 import { OutboxDispatcher } from "../../packages/feishu/src/outbox-dispatcher.js";
+import { feishuMessageData } from "../../packages/feishu/src/live.js";
 import { FeishuGateway, type FeishuMessageEvent } from "../../packages/feishu/src/gateway.js";
 import { EventStore } from "../../packages/storage/src/store.js";
 
@@ -82,6 +83,69 @@ describe("control-plane health", () => {
 });
 
 describe("ChannelDispatcher Context Pack", () => {
+  it("does not record an error-only direct result as active or completed", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-error-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "direct.db");
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    const topic = createTopic("Direct failure", "tenant:user:owner", { id: "topic-direct-error" });
+    store.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: { topic },
+    });
+    const failedAdapter = (provider: ProviderName): AgentAdapter => ({
+      provider,
+      start: async () => ({
+        provider,
+        externalSessionId: `${provider}-failed-session`,
+        events: [{ type: "error", code: "process_exit", message: "failed" }],
+      }),
+      resume: async () => { throw new Error("unexpected resume"); },
+    });
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: {
+        claude: failedAdapter("claude"),
+        codex: failedAdapter("codex"),
+        copilot: failedAdapter("copilot"),
+      },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+
+    try {
+      await dispatcher.dispatch({
+        mode: "direct",
+        provider: "claude",
+        topicId: topic.id,
+        topicTitle: topic.title,
+        principalId: topic.ownerPrincipalId,
+        question: "fail safely",
+        idempotencyKey: "direct-error",
+        replyAppRole: "claude",
+        receiveId: "chat",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(store.agentSession(topic.id, "claude", "direct")).toBeUndefined();
+      expect(store.events(topic.id).some((event) => event.type === "agent.direct.completed"))
+        .toBe(false);
+    } finally {
+      store.close();
+      outbox.close();
+    }
+  });
+
   it("passes Topic notes and the current watermark to research and direct provider prompts", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-context-pack-"));
     temporaryDirectories.push(directory);
@@ -137,7 +201,7 @@ describe("ChannelDispatcher Context Pack", () => {
       store,
       outbox,
       adapters,
-      dataDirectory: directory,
+      agentWorkspaceRoot: directory,
       approval: { request: () => { throw new Error("unexpected approval"); } },
     });
     let nextTopic = 0;
@@ -279,6 +343,92 @@ describe("SqliteOrchestrationStore", () => {
 });
 
 describe("OutboxDispatcher", () => {
+  it("reuses the same Feishu uuid when a post-send failure is replayed", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-outbox-replay-"));
+    temporaryDirectories.push(directory);
+    const outbox = DurableOutbox.open(join(directory, "outbox.db"));
+    outbox.enqueue({
+      id: "replay",
+      appRole: "hub",
+      receiveId: "chat",
+      payload: { text: "replay" },
+      idempotencyKey: "dispatch:stable-replay-key",
+      nextAttemptAt: "2026-07-17T12:00:00.000Z",
+    });
+    let now = new Date("2026-07-17T12:00:00.000Z");
+    const uuids: string[] = [];
+    let sends = 0;
+    const dispatcher = new OutboxDispatcher({
+      outbox,
+      now: () => now,
+      sender: {
+        send: async (message) => {
+          uuids.push(feishuMessageData(message).uuid);
+          sends += 1;
+          if (sends === 1) throw new Error("connection lost after remote acceptance");
+        },
+      },
+    });
+
+    try {
+      await dispatcher.flushOnce();
+      now = new Date("2026-07-17T12:00:03.000Z");
+      await dispatcher.flushOnce();
+
+      expect(uuids).toHaveLength(2);
+      expect(uuids[0]).toBe(uuids[1]);
+      expect(uuids[0]).toMatch(/^[0-9a-f-]{36}$/);
+    } finally {
+      outbox.close();
+    }
+  });
+
+  it("waits for an in-flight send when stopped", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-outbox-stop-"));
+    temporaryDirectories.push(directory);
+    const outbox = DurableOutbox.open(join(directory, "outbox.db"));
+    outbox.enqueue({
+      id: "delayed",
+      appRole: "hub",
+      receiveId: "chat",
+      payload: { text: "delayed" },
+      idempotencyKey: "delayed",
+    });
+    let sendStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { sendStarted = resolve; });
+    let finishSend: (() => void) | undefined;
+    const finish = new Promise<void>((resolve) => { finishSend = resolve; });
+    const dispatcher = new OutboxDispatcher({
+      outbox,
+      pollIntervalMs: 60_000,
+      sender: {
+        send: async () => {
+          sendStarted?.();
+          await finish;
+        },
+      },
+    });
+    try {
+      dispatcher.start();
+      await started;
+
+      let stopped = false;
+      const stopping = dispatcher.stop();
+      expect(stopping).toBeInstanceOf(Promise);
+      void (stopping as unknown as Promise<void>).then(() => { stopped = true; });
+      await Promise.resolve();
+      expect(stopped).toBe(false);
+      finishSend?.();
+      await (stopping as unknown as Promise<void>);
+
+      expect(outbox.pending()).toEqual([]);
+    } finally {
+      finishSend?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      outbox.close();
+    }
+  });
+
   it("marks successful sends and schedules failed sends for retry", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-outbox-"));
     temporaryDirectories.push(directory);

@@ -20,7 +20,11 @@ import {
 } from "../../../packages/feishu/src/gateway.js";
 import { FeishuLongConnections } from "../../../packages/feishu/src/live.js";
 import { OutboxDispatcher } from "../../../packages/feishu/src/outbox-dispatcher.js";
-import { type AppRegistration } from "../../../packages/feishu/src/registry.js";
+import {
+  APP_ROLES,
+  FeishuAppRegistry,
+  type AppRegistration,
+} from "../../../packages/feishu/src/registry.js";
 import { ResearchOrchestrator } from "../../../packages/orchestrator/src/index.js";
 import { directResearchPrompt } from "../../../packages/orchestrator/src/prompts.js";
 import { SqliteOrchestrationStore } from "../../../packages/storage/src/orchestration.js";
@@ -63,7 +67,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
   readonly #store: EventStore;
   readonly #outbox: DurableOutbox;
   readonly #adapters: AdapterRegistry;
-  readonly #dataDirectory: string;
+  readonly #agentWorkspaceRoot: string;
   readonly #approval: Pick<ApprovalEngine, "request">;
 
   constructor(options: {
@@ -72,7 +76,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
     store: EventStore;
     outbox: DurableOutbox;
     adapters: AdapterRegistry;
-    dataDirectory: string;
+    agentWorkspaceRoot: string;
     approval: Pick<ApprovalEngine, "request">;
   }) {
     this.#orchestrator = options.orchestrator;
@@ -80,7 +84,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
     this.#store = options.store;
     this.#outbox = options.outbox;
     this.#adapters = options.adapters;
-    this.#dataDirectory = options.dataDirectory;
+    this.#agentWorkspaceRoot = options.agentWorkspaceRoot;
     this.#approval = options.approval;
   }
 
@@ -149,6 +153,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
       const result = previous?.externalSessionId === undefined
         ? await adapter.start(task)
         : await adapter.resume({ ...task, externalSessionId: previous.externalSessionId });
+      const text = finalText(result.events);
       this.#store.upsertAgentSession({
         id: previous?.id ?? `direct:${input.topicId}:${input.provider}`,
         topicId: input.topicId,
@@ -158,7 +163,6 @@ export class ChannelDispatcher implements FeishuDispatcher {
         contextWatermark: this.#store.topic(input.topicId)?.lastEventSeq ?? 0,
         status: "active",
       });
-      const text = finalText(result.events);
       this.#store.append({
         topicId: input.topicId,
         type: "agent.direct.completed",
@@ -210,10 +214,10 @@ export class ChannelDispatcher implements FeishuDispatcher {
   }
 
   #workspace(topicId: string): string {
-    const root = resolve(this.#dataDirectory, "topics");
+    const root = resolve(this.#agentWorkspaceRoot);
     const workspace = resolve(root, topicId);
     if (workspace !== root && !workspace.startsWith(`${root}\\`) && !workspace.startsWith(`${root}/`)) {
-      throw new Error("Topic workspace escapes the configured data directory");
+      throw new Error("Topic workspace escapes the configured agent workspace root");
     }
     mkdirSync(workspace, { recursive: true });
     return workspace;
@@ -302,7 +306,7 @@ export async function startControlPlane(config: Config): Promise<ControlPlaneRun
     store,
     outbox,
     adapters,
-    dataDirectory: config.MITISMINE_DATA_DIR,
+    agentWorkspaceRoot: config.MITISMINE_AGENT_WORKSPACE_ROOT,
     approval,
   });
   const gateway = new FeishuGateway({ store, outbox, dispatcher, idFactory: ulid });
@@ -347,20 +351,31 @@ async function main(): Promise<void> {
   process.once("SIGTERM", shutdown);
 }
 
-function registrationsFromConfig(config: Config): AppRegistration[] {
-  return [
+export function registrationsFromConfig(config: Config): AppRegistration[] {
+  const registry = new FeishuAppRegistry([
     { role: "hub", appId: config.FEISHU_HUB_APP_ID, appSecret: config.FEISHU_HUB_APP_SECRET },
     { role: "claude", appId: config.FEISHU_CLAUDE_APP_ID, appSecret: config.FEISHU_CLAUDE_APP_SECRET },
     { role: "codex", appId: config.FEISHU_CODEX_APP_ID, appSecret: config.FEISHU_CODEX_APP_SECRET },
     { role: "copilot", appId: config.FEISHU_COPILOT_APP_ID, appSecret: config.FEISHU_COPILOT_APP_SECRET },
-  ];
+  ]);
+  return APP_ROLES.map((role) => registry.get(role));
 }
 
 function finalText(events: readonly { readonly type: string; readonly [key: string]: unknown }[]): string {
+  const fatal = events.find(
+    (event) => event.type === "error" && event.code !== "process_stderr",
+  );
+  if (fatal !== undefined) {
+    const code = typeof fatal.code === "string" ? fatal.code : "provider_error";
+    throw new Error(`Direct provider failed with ${code}`);
+  }
   const event = [...events].reverse().find(
     (candidate) => candidate.type === "final" && typeof candidate.text === "string",
   );
-  return event !== undefined && typeof event.text === "string" ? event.text : "未收到最终文本";
+  if (event === undefined || typeof event.text !== "string") {
+    throw new Error("Direct provider did not emit a final event");
+  }
+  return event.text;
 }
 
 function renderReport(report: { readonly summary: string; readonly claims: readonly { readonly text: string; readonly status: string }[] }): string {
