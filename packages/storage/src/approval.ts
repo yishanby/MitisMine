@@ -39,6 +39,9 @@ export class SqliteApprovalStore implements ApprovalStore {
     const database = new DatabaseSync(path);
     database.exec("PRAGMA journal_mode = WAL;");
     database.exec(SCHEMA_SQL);
+    database
+      .prepare("UPDATE approval_requests SET status = 'pending' WHERE status = 'executing'")
+      .run();
     return new SqliteApprovalStore(database);
   }
 

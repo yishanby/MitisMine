@@ -151,4 +151,55 @@ describe("ApprovalEngine", () => {
     expect(existsSync(join(directory, "escape.txt"))).toBe(false);
     secondStore.close();
   });
+
+  it("recovers interrupted trusted file execution across restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-approval-recovery-"));
+    temporaryDirectories.push(directory);
+    const root = join(directory, "approved");
+    const database = join(directory, "approval.db");
+    const signingSecret = "d".repeat(64);
+    const eventStore = EventStore.open(database);
+    const topic = createTopic("Approval", "tenant:user:owner", { id: "topic-1" });
+    eventStore.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: { topic },
+    });
+    eventStore.close();
+
+    const firstStore = SqliteApprovalStore.open(database);
+    const executor = new TrustedActionExecutor(root);
+    const firstEngine = new ApprovalEngine({
+      signingSecret,
+      store: firstStore,
+      executor: (approvedAction, idempotencyKey) =>
+        executor.execute(approvedAction, idempotencyKey),
+    });
+    const request = firstEngine.request(action, "tenant:user:owner");
+    expect(firstStore.beginExecution(request.request.id)).toBe(true);
+    await executor.execute(request.request.action, request.request.idempotencyKey);
+    const approvedPath = join(root, "smoke", "approved.txt");
+    expect(readFileSync(approvedPath, "utf8")).toBe("approved");
+    firstStore.close();
+
+    const secondStore = SqliteApprovalStore.open(database);
+    try {
+      expect(secondStore.get(request.request.id)?.status).toBe("pending");
+      const secondEngine = new ApprovalEngine({
+        signingSecret,
+        store: secondStore,
+        executor: (approvedAction, idempotencyKey) =>
+          executor.execute(approvedAction, idempotencyKey),
+      });
+      await expect(secondEngine.approve(request.token, "tenant:user:owner")).resolves.toEqual({
+        idempotencyKey: request.request.idempotencyKey,
+        path: approvedPath,
+        written: true,
+      });
+      expect(readFileSync(approvedPath, "utf8")).toBe("approved");
+    } finally {
+      secondStore.close();
+    }
+  });
 });
