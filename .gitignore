@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.log
+.superpowers/
+feishu-login-qr*.png
+mitismine-feishu-apps.png
