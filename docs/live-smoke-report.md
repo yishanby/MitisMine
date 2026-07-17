@@ -40,6 +40,7 @@ No App Secret, token, Cookie, or authorization value is included in this report.
 | Direct App routing | Feishu events recorded app roles `claude`, `codex`, and `copilot`; corresponding replies returned | Pass |
 | Restart recovery | Service restarted; `/ready` returned 200; `/status` and `/report` cards reloaded | Pass |
 | Session recovery | Post-restart `RESUMED_CLAUDE_OK`, `RESUMED_CODEX_OK`, and `RESUMED_COPILOT_OK` used unchanged session IDs | Pass |
+| Multi-Session migration preflight | Revision `a74ca6d` started against the live database; legacy Claude/Codex/Copilot direct rows migrated to named `main` Sessions without changing their external IDs; `/ready` remained 200 | Pass |
 | Approval before write | Smoke target absent before approval; approval row was pending | Pass |
 | Approval idempotency | First click created one 18-byte file; second click left the same mtime and stored result | Pass |
 | Secret isolation | `.env.local` ignored; tracked-secret scan clean; child environment tests pass | Pass |
@@ -106,3 +107,8 @@ Remove-Item Env:MITISMINE_LIVE_CLI
 At the final recheck Claude and Copilot passed. Codex accepted its strict
 permission profile but the service account's stored API-key login returned 401;
 reauthenticate with `codex login` before treating a fresh 3/3 run as current.
+
+The 2026-07-18 multi-Session recheck did not send new Feishu chat messages or
+consume provider quota. It verified the upgraded schema/migration, four live
+connections, readiness, and existing three-provider direct Session continuity;
+command interaction is covered by deterministic Gateway integration tests.

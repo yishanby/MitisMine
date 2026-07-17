@@ -2,7 +2,7 @@
 
 Audit date: 2026-07-18 (Asia/Shanghai)
 Branch: `feat/multi-agent-feishu-research`
-Audited code revision: `18f31b8` (`fix: harden recovery and operational bootstrap`)
+Audited code revision: `a74ca6d` (`feat: add standalone agent multi-session support`)
 Approval-template hardening revision: `325d305`
 
 The documentation commit follows the audited code revision; the final handoff
@@ -14,6 +14,7 @@ SHA is reported by the agent after commit.
 |---|---|---|---|
 | Four Apps identify one user and share a cursor | Config identity-observation tests; startup verifier ordering; Gateway cross-App tests | Four persisted App observations resolve to one union principal; new preflight startup reached ready=200 | Pass |
 | Topic create/switch/restore/share/archive/history | Topic and Feishu integration suites; durable inbox failure injection | Live Topic survived restarts; `/status` and `/report` reload | Pass |
+| Standalone Agent multi-Session | Parser/Gateway/Store/Dispatcher tests cover create/list/use/show/rename/archive, lazy `main`, per-user/provider cursors, start/resume, isolation, serialization, cross-Session concurrency, restart and legacy migration | Updated control plane loaded the live database, migrated all three legacy provider direct Sessions, reached four-App ready=200, and the read-only live audit retained all three external IDs | Pass; fresh command-card interaction remains optional |
 | Owner/editor/viewer enforcement | `canReadTopic`/`canEditTopic`; viewer command matrix | Viewer rules reflected in deployed command path | Pass |
 | Three CLIs and Topic sessions | Adapter contracts; cross-Run/restart Topic-session tests | Recorded Claude/Codex/Copilot research and direct session IDs persisted | Pass; current Codex login needs renewal for a fresh quota smoke |
 | Context reaches every agent | Context Pack unit test; real Gateway→ChannelDispatcher note/watermark test | Historical Topic/Run remains queryable | Pass |
@@ -27,7 +28,7 @@ SHA is reported by the agent after commit.
 | `/stop` cancels real work | Abort propagation, stale-save guard, process-tree/grandchild test, lease requeue test | Not used on the evidence Run | Pass (automated) |
 | Secrets do not reach Git/logs/children | Synthetic secret isolation; redaction; least-privilege adapter contracts; tracked-value scan | `.env.local` ignored/untracked; no Secret in live report | Pass |
 | Health, safe shutdown, delivery replay | Readiness, all-hook cleanup, startup unwind, pending-call cancel/drain, Outbox stable UUID, active-flush drain, periodic lease recovery tests | New preflight startup: HTTP 200, 4 Apps, 1 Worker | Pass |
-| Deterministic and live verification | 134 deterministic tests pass; 3 live tests opt-in | `pnpm smoke:live` returned `ok:true` | Pass, with Codex reauthentication noted below |
+| Deterministic and live verification | 158 deterministic tests pass; 3 live tests opt-in | `pnpm smoke:live` returned `ok:true` after the multi-Session migration | Pass, with Codex reauthentication noted below |
 
 ## Verification snapshot
 
@@ -35,7 +36,7 @@ Fresh deterministic run on 2026-07-18:
 
 ```text
 Test Files  15 passed | 1 skipped (16)
-Tests       134 passed | 3 skipped (137)
+Tests       158 passed | 3 skipped (161)
 ```
 
 The three skipped cases are the explicit `MITISMINE_LIVE_CLI=1` suite. During
@@ -55,6 +56,7 @@ claims=4 evidence=5 importantCoverage=2/2 approval=completed
 ## Requirement-to-component map
 
 - Topic authorization/history/context: `packages/domain`, `packages/storage/src/store.ts`, `packages/feishu`
+- Direct Session UX/isolation/concurrency: `packages/storage/src/store.ts`, `packages/feishu/src/commands.ts`, `packages/feishu/src/gateway.ts`, `apps/control-plane/src/main.ts`
 - Run workflow and leased local execution: `packages/orchestrator`, `packages/orchestrator/src/worker.ts`, `apps/worker`
 - CLI isolation/adaptation: `packages/agent-protocol`, `packages/agent-adapters`
 - Approvals: `packages/approval`, `packages/storage/src/approval.ts`

@@ -1,5 +1,7 @@
 # Standalone Agent Multi-Session Implementation Plan
 
+**Status:** Completed on 2026-07-18 in revision `a74ca6d`; verification evidence is recorded in `docs/completion-audit.md`.
+
 **Goal:** Let each Feishu provider App run independently with multiple persistent, isolated Sessions inside every shared Topic, without changing group research behavior.
 
 **Architecture:** SQLite owns direct Session records and per-user cursors. The Feishu gateway parses provider-only Session commands and resolves the selected Session before dispatch. The channel dispatcher serializes turns by Session ID, resumes the matching CLI external Session, and builds a Context Pack that includes shared Topic events plus only that Session's direct conversation.
