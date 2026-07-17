@@ -77,6 +77,7 @@ describe("Feishu commands", () => {
     ["/status", "status"],
     ["/stop", "stop"],
     ["/report", "report"],
+    ["/action write smoke/approved.txt hello", "action.write"],
     ["ordinary question", "message"],
   ])("parses %s", (text, kind) => {
     expect(parseCommand(text).kind).toBe(kind);
@@ -113,6 +114,26 @@ describe("FeishuGateway", () => {
       "topic.created",
       "message.added",
     ]);
+    harness.store.close();
+    harness.outbox.close();
+  });
+
+  it("routes a privileged write as an approval action without executing it", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    await harness.gateway.receive(message("hub", "/topic new Approval"));
+    await harness.gateway.receive(
+      message("hub", "/action write smoke/approved.txt approved", "event-action"),
+    );
+
+    expect(harness.dispatches.at(-1)).toMatchObject({
+      mode: "action",
+      action: {
+        kind: "write_file",
+        target: "smoke/approved.txt",
+        parameters: { content: "approved" },
+      },
+    });
     harness.store.close();
     harness.outbox.close();
   });

@@ -179,6 +179,11 @@ describe("ResearchOrchestrator", () => {
         .filter((call) => call.phase === "independent_research")
         .every((call) => !call.prompt.includes("PEER_REPORT")),
     ).toBe(true);
+    expect(
+      harness.calls
+        .filter((call) => call.phase === "independent_research")
+        .every((call) => call.prompt.includes("id, title, and prompt")),
+    ).toBe(true);
     expect(store.records.filter((event) => event.type === "agent.call.started")).toHaveLength(12);
     expect(store.records.filter((event) => event.type === "agent.call.completed")).toHaveLength(12);
   });

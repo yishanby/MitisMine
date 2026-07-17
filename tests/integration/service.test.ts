@@ -24,6 +24,12 @@ afterEach(() => {
 });
 
 describe("control-plane health", () => {
+  it("keeps an in-process worker registered without remote heartbeats", () => {
+    const workers = new WorkerRegistry(1_000);
+    workers.connectPersistent("local");
+    expect(workers.connectedCount(new Date("2099-01-01T00:00:00.000Z"))).toBe(1);
+  });
+
   it("reports not-ready until store, four apps, and a worker are healthy", async () => {
     const apps = new AppConnectionRegistry();
     for (const role of ["hub", "claude", "codex", "copilot"] as const) apps.connect(role);

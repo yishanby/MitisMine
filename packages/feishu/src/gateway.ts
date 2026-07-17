@@ -1,4 +1,5 @@
 import type { ProviderName } from "../../agent-adapters/src/index.js";
+import type { ApprovalAction } from "../../approval/src/index.js";
 import type { Topic, TopicMember } from "../../domain/src/model.js";
 import {
   archiveTopic,
@@ -31,6 +32,15 @@ export type DispatchInput =
       readonly topicTitle: string;
       readonly principalId: string;
       readonly question: string;
+      readonly replyAppRole: AppRole;
+      readonly receiveId: string;
+    }
+  | {
+      readonly mode: "action";
+      readonly action: ApprovalAction;
+      readonly topicId: string;
+      readonly topicTitle: string;
+      readonly principalId: string;
       readonly replyAppRole: AppRole;
       readonly receiveId: string;
     }
@@ -217,6 +227,25 @@ export class FeishuGateway {
         await this.#dispatcher.dispatch({
           mode: "control",
           action: command.kind,
+          topicId: topic.id,
+          topicTitle: topic.title,
+          principalId,
+          replyAppRole: event.appRole,
+          receiveId: event.chatId,
+        });
+        return;
+      }
+      case "action.write": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId);
+        await this.#dispatcher.dispatch({
+          mode: "action",
+          action: {
+            topicId: topic.id,
+            kind: "write_file",
+            target: command.path,
+            risk: "medium",
+            parameters: { content: command.content },
+          },
           topicId: topic.id,
           topicTitle: topic.title,
           principalId,

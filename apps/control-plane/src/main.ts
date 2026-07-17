@@ -7,7 +7,11 @@ import { ulid } from "ulid";
 
 import { createAdapters, type AdapterRegistry } from "../../../packages/agent-adapters/src/index.js";
 import { runJsonl } from "../../../packages/agent-protocol/src/runner.js";
-import { textCard } from "../../../packages/feishu/src/cards.js";
+import {
+  ApprovalEngine,
+  TrustedActionExecutor,
+} from "../../../packages/approval/src/index.js";
+import { approvalCard, textCard } from "../../../packages/feishu/src/cards.js";
 import {
   FeishuGateway,
   type DispatchInput,
@@ -18,6 +22,7 @@ import { OutboxDispatcher } from "../../../packages/feishu/src/outbox-dispatcher
 import { type AppRegistration } from "../../../packages/feishu/src/registry.js";
 import { ResearchOrchestrator } from "../../../packages/orchestrator/src/index.js";
 import { SqliteOrchestrationStore } from "../../../packages/storage/src/orchestration.js";
+import { SqliteApprovalStore } from "../../../packages/storage/src/approval.js";
 import { DurableOutbox } from "../../../packages/storage/src/outbox.js";
 import { EventStore } from "../../../packages/storage/src/store.js";
 import { WorkerLeaseStore } from "../../worker/src/main.js";
@@ -57,6 +62,7 @@ class ChannelDispatcher implements FeishuDispatcher {
   readonly #outbox: DurableOutbox;
   readonly #adapters: AdapterRegistry;
   readonly #dataDirectory: string;
+  readonly #approval: ApprovalEngine;
 
   constructor(options: {
     orchestrator: ResearchOrchestrator;
@@ -65,6 +71,7 @@ class ChannelDispatcher implements FeishuDispatcher {
     outbox: DurableOutbox;
     adapters: AdapterRegistry;
     dataDirectory: string;
+    approval: ApprovalEngine;
   }) {
     this.#orchestrator = options.orchestrator;
     this.#checkpoints = options.checkpoints;
@@ -72,6 +79,7 @@ class ChannelDispatcher implements FeishuDispatcher {
     this.#outbox = options.outbox;
     this.#adapters = options.adapters;
     this.#dataDirectory = options.dataDirectory;
+    this.#approval = options.approval;
   }
 
   async dispatch(input: DispatchInput): Promise<void> {
@@ -135,6 +143,19 @@ class ChannelDispatcher implements FeishuDispatcher {
       this.#enqueue(input, `${input.provider} 回复`, text);
       return;
     }
+    if (input.mode === "action") {
+      const request = this.#approval.request(input.action, input.principalId);
+      this.#enqueuePayload(
+        input,
+        approvalCard({
+          title: "需要批准",
+          preview: `动作: ${input.action.kind}\n目标: ${input.action.target}`,
+          risk: input.action.risk,
+          token: request.token,
+        }),
+      );
+      return;
+    }
     const latest = this.#checkpoints.latestForTopic(input.topicId);
     if (input.action === "status") {
       this.#enqueue(
@@ -168,12 +189,16 @@ class ChannelDispatcher implements FeishuDispatcher {
   }
 
   #enqueue(input: DispatchInput, title: string, content: string): void {
+    this.#enqueuePayload(input, textCard(title, content));
+  }
+
+  #enqueuePayload(input: DispatchInput, payload: unknown): void {
     const id = ulid();
     this.#outbox.enqueue({
       id,
       appRole: input.replyAppRole,
       receiveId: input.receiveId,
-      payload: textCard(title, content),
+      payload,
       idempotencyKey: `dispatch:${input.topicId}:${id}`,
     });
   }
@@ -190,13 +215,20 @@ export async function startControlPlane(config: Config): Promise<ControlPlaneRun
   const store = EventStore.open(config.MITISMINE_DB_PATH);
   const outbox = DurableOutbox.open(config.MITISMINE_DB_PATH);
   const checkpoints = SqliteOrchestrationStore.open(config.MITISMINE_DB_PATH);
+  const approvals = SqliteApprovalStore.open(config.MITISMINE_DB_PATH);
   const leases = WorkerLeaseStore.open(config.MITISMINE_DB_PATH);
   leases.requeueExpired();
   const apps = new AppConnectionRegistry();
   const workers = new WorkerRegistry();
-  workers.connect("local");
+  workers.connectPersistent("local");
   const adapters = createAdapters(runJsonl);
   const orchestrator = new ResearchOrchestrator({ adapters, store: checkpoints, maxConcurrency: 6 });
+  const trustedExecutor = new TrustedActionExecutor(resolve(config.MITISMINE_DATA_DIR, "approved-actions"));
+  const approval = new ApprovalEngine({
+    signingSecret: config.MITISMINE_APPROVAL_KEY,
+    store: approvals,
+    executor: (action, idempotencyKey) => trustedExecutor.execute(action, idempotencyKey),
+  });
   const dispatcher = new ChannelDispatcher({
     orchestrator,
     checkpoints,
@@ -204,10 +236,16 @@ export async function startControlPlane(config: Config): Promise<ControlPlaneRun
     outbox,
     adapters,
     dataDirectory: config.MITISMINE_DATA_DIR,
+    approval,
   });
   const gateway = new FeishuGateway({ store, outbox, dispatcher, idFactory: ulid });
   const registrations = registrationsFromConfig(config);
-  const live = new FeishuLongConnections({ registrations, gateway, connections: apps });
+  const live = new FeishuLongConnections({
+    registrations,
+    gateway,
+    connections: apps,
+    onCardAction: async (_role, raw) => handleApprovalCard(approval, raw),
+  });
   const outboxDispatcher = new OutboxDispatcher({ outbox, sender: live });
   let storeOpen = true;
   const service = await createService({
@@ -217,6 +255,7 @@ export async function startControlPlane(config: Config): Promise<ControlPlaneRun
     shutdown: [
       () => { store.close(); storeOpen = false; },
       () => checkpoints.close(),
+      () => approvals.close(),
       () => leases.close(),
       () => outbox.close(),
       () => live.close(),
@@ -260,6 +299,33 @@ function finalText(events: readonly { readonly type: string; readonly [key: stri
 function renderReport(report: { readonly summary: string; readonly claims: readonly { readonly text: string; readonly status: string }[] }): string {
   const claims = report.claims.map((claim) => `- [${claim.status}] ${claim.text}`).join("\n");
   return `${report.summary}\n\n${claims}`;
+}
+
+async function handleApprovalCard(approval: ApprovalEngine, raw: unknown): Promise<unknown> {
+  const root = asObject(raw, "card action");
+  const action = asObject(root.action, "card action payload");
+  const value = asObject(action.value, "card action value");
+  if (value.action !== "approve" || typeof value.token !== "string") {
+    return { toast: { type: "warning", content: "未执行" } };
+  }
+  const operator = asObject(root.operator, "card action operator");
+  const expectedPrincipal = approval.principalForToken(value.token);
+  const parts = expectedPrincipal.split(":");
+  const identityType = parts.at(-2);
+  const identityValue = parts.at(-1);
+  const actual = identityType === "user" ? operator.user_id : operator.union_id;
+  if (typeof actual !== "string" || actual !== identityValue) {
+    throw new Error("Approval card operator does not match token principal");
+  }
+  await approval.approve(value.token, expectedPrincipal);
+  return { toast: { type: "success", content: "已批准并执行" } };
+}
+
+function asObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value as Record<string, unknown>;
 }
 
 const entry = process.argv[1];

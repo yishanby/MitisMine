@@ -10,6 +10,7 @@ export type FeishuCommand =
   | { readonly kind: "status" }
   | { readonly kind: "stop" }
   | { readonly kind: "report" }
+  | { readonly kind: "action.write"; readonly path: string; readonly content: string }
   | { readonly kind: "message"; readonly text: string };
 
 export function parseCommand(input: string): FeishuCommand {
@@ -36,6 +37,14 @@ export function parseCommand(input: string): FeishuCommand {
   if (/^\/status$/i.test(text)) return { kind: "status" };
   if (/^\/stop$/i.test(text)) return { kind: "stop" };
   if (/^\/report$/i.test(text)) return { kind: "report" };
+  match = /^\/action\s+write\s+(\S+)\s+(.+)$/is.exec(text);
+  if (match) {
+    return {
+      kind: "action.write",
+      path: required(match[1], "write path"),
+      content: required(match[2], "write content"),
+    };
+  }
   if (text.startsWith("/")) throw new Error(`Unknown command: ${text}`);
   return { kind: "message", text: required(text, "message") };
 }

@@ -4,6 +4,8 @@ import {
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -206,6 +208,10 @@ export class ApprovalEngine {
     }
   }
 
+  principalForToken(token: string): string {
+    return this.#verify(token).principalId;
+  }
+
   #sign(payload: TokenPayload): string {
     const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
     return `${encoded}.${this.#signature(encoded)}`;
@@ -236,6 +242,36 @@ export class ApprovalEngine {
 
   #signature(encoded: string): string {
     return createHmac("sha256", this.#secret).update(encoded).digest("base64url");
+  }
+}
+
+export class TrustedActionExecutor {
+  readonly #root: string;
+
+  constructor(root: string) {
+    this.#root = resolve(root);
+  }
+
+  async execute(action: ApprovalAction, idempotencyKey: string): Promise<unknown> {
+    if (action.kind !== "write_file") throw new Error(`Unsupported approved action: ${action.kind}`);
+    const target = resolve(this.#root, action.target);
+    if (target !== this.#root && !target.startsWith(`${this.#root}\\`) && !target.startsWith(`${this.#root}/`)) {
+      throw new Error("Approved action target is outside the trusted root");
+    }
+    if (
+      typeof action.parameters !== "object" ||
+      action.parameters === null ||
+      !("content" in action.parameters) ||
+      typeof action.parameters.content !== "string"
+    ) {
+      throw new Error("write_file action requires string content");
+    }
+    mkdirSync(dirname(target), { recursive: true });
+    if (!existsSync(target)) writeFileSync(target, action.parameters.content, "utf8");
+    else if (readFileSync(target, "utf8") !== action.parameters.content) {
+      throw new Error("Approved target already exists with different content");
+    }
+    return { written: true, path: target, idempotencyKey };
   }
 }
 

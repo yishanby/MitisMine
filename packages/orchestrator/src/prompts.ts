@@ -5,7 +5,8 @@ import type { ResearchReview } from "./index.js";
 const REPORT_CONTRACT = `Return only JSON with: summary, claims, evidence, openQuestions, subtaskProposals.
 Each claim requires id, text, importance (important|supporting), confidence (0..1), and evidenceIds.
 Each evidence item requires id, url, title, publisher, quote, and retrievedAt (ISO-8601).
-Important claims without evidence must use an empty evidenceIds list. Propose at most two subtasks.`;
+Important claims without evidence must use an empty evidenceIds list.
+Each subtaskProposals item requires id, title, and prompt. Propose at most two subtasks.`;
 
 export function independentResearchPrompt(question: string, provider: ProviderName): string {
   return `PHASE: independent_research

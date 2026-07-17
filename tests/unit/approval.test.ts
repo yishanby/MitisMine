@@ -1,10 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   ApprovalEngine,
   InMemoryApprovalStore,
   type ApprovalAction,
+  TrustedActionExecutor,
 } from "../../packages/approval/src/index.js";
+import { SqliteApprovalStore } from "../../packages/storage/src/approval.js";
+import { createTopic } from "../../packages/domain/src/topic.js";
+import { EventStore } from "../../packages/storage/src/store.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 const action: ApprovalAction = {
   topicId: "topic-1",
@@ -83,5 +99,56 @@ describe("ApprovalEngine", () => {
     await expect(engine.approve(request.token, "tenant:user:requester")).rejects.toThrow(/principal/i);
     await engine.approve(request.token, "tenant:user:owner");
     expect(calls).toHaveLength(1);
+  });
+
+  it("persists one trusted file write across restart and blocks path escape", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-approval-"));
+    temporaryDirectories.push(directory);
+    const root = join(directory, "approved");
+    const database = join(directory, "approval.db");
+    const signingSecret = "c".repeat(64);
+    const eventStore = EventStore.open(database);
+    const topic = createTopic("Approval", "tenant:user:owner", { id: "topic-1" });
+    eventStore.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: { topic },
+    });
+    eventStore.close();
+    const firstStore = SqliteApprovalStore.open(database);
+    const executor = new TrustedActionExecutor(root);
+    const firstEngine = new ApprovalEngine({
+      signingSecret,
+      store: firstStore,
+      executor: (approvedAction, idempotencyKey) =>
+        executor.execute(approvedAction, idempotencyKey),
+    });
+    const approvedPath = join(root, "smoke", "approved.txt");
+    const request = firstEngine.request(action, "tenant:user:owner");
+    expect(existsSync(approvedPath)).toBe(false);
+    await firstEngine.approve(request.token, "tenant:user:owner");
+    expect(readFileSync(approvedPath, "utf8")).toBe("approved");
+    firstStore.close();
+
+    const secondStore = SqliteApprovalStore.open(database);
+    const secondEngine = new ApprovalEngine({
+      signingSecret,
+      store: secondStore,
+      executor: (approvedAction, idempotencyKey) =>
+        executor.execute(approvedAction, idempotencyKey),
+    });
+    await expect(secondEngine.approve(request.token, "tenant:user:owner")).resolves.toEqual({
+      idempotencyKey: expect.any(String),
+      path: approvedPath,
+      written: true,
+    });
+    const escaping = secondEngine.request(
+      { ...action, target: "../escape.txt" },
+      "tenant:user:owner",
+    );
+    await expect(secondEngine.approve(escaping.token, "tenant:user:owner")).rejects.toThrow(/outside/i);
+    expect(existsSync(join(directory, "escape.txt"))).toBe(false);
+    secondStore.close();
   });
 });

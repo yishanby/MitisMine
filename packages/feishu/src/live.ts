@@ -71,7 +71,7 @@ export class FeishuLongConnections implements OutboxSender {
     }
     const client = this.#clients.get(message.appRole as AppRole);
     if (client === undefined) throw new Error(`Feishu client not ready: ${message.appRole}`);
-    await client.im.v1.message.create({
+    const response = await client.im.v1.message.create({
       params: { receive_id_type: "chat_id" },
       data: {
         receive_id: message.receiveId,
@@ -79,5 +79,8 @@ export class FeishuLongConnections implements OutboxSender {
         content: JSON.stringify(message.payload),
       },
     });
+    if (response.code !== undefined && response.code !== 0) {
+      throw new Error(`Feishu message API failed with code ${response.code}: ${response.msg ?? "unknown"}`);
+    }
   }
 }

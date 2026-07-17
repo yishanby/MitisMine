@@ -24,6 +24,7 @@ export class AppConnectionRegistry {
 
 export class WorkerRegistry {
   readonly #workers = new Map<string, number>();
+  readonly #persistent = new Set<string>();
   readonly #staleAfterMs: number;
 
   constructor(staleAfterMs = 30_000) {
@@ -35,6 +36,11 @@ export class WorkerRegistry {
     this.#workers.set(workerId, now.getTime());
   }
 
+  connectPersistent(workerId: string): void {
+    if (!workerId.trim()) throw new Error("Worker ID is required");
+    this.#persistent.add(workerId);
+  }
+
   heartbeat(workerId: string, now = new Date()): void {
     if (!this.#workers.has(workerId)) throw new Error(`Worker not connected: ${workerId}`);
     this.#workers.set(workerId, now.getTime());
@@ -42,11 +48,14 @@ export class WorkerRegistry {
 
   disconnect(workerId: string): void {
     this.#workers.delete(workerId);
+    this.#persistent.delete(workerId);
   }
 
   connectedCount(now = new Date()): number {
     const oldest = now.getTime() - this.#staleAfterMs;
-    return [...this.#workers.values()].filter((lastSeen) => lastSeen >= oldest).length;
+    return this.#persistent.size + [...this.#workers.entries()].filter(
+      ([workerId, lastSeen]) => !this.#persistent.has(workerId) && lastSeen >= oldest,
+    ).length;
   }
 }
 
