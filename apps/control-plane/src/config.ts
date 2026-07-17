@@ -4,13 +4,18 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 
 const nonEmpty = z.string().trim().min(1);
-const knownApprovalKeyDefaults = new Set(["development-only-approval-key-change-me"]);
+const knownApprovalKeyDefaults = new Set([
+  "development-only-approval-key-change-me",
+  "<generate-a-random-32-byte-secret>",
+]);
 const approvalKey = z.string()
   .trim()
   .min(32, "MITISMINE_APPROVAL_KEY must contain at least 32 characters")
   .refine(
-    (value) => !knownApprovalKeyDefaults.has(value) && !/(?:example|placeholder)/i.test(value),
-    "MITISMINE_APPROVAL_KEY must not be an example or placeholder value",
+    (value) => !knownApprovalKeyDefaults.has(value)
+      && !/[<>]/.test(value)
+      && !/(?:example|placeholder|template)/i.test(value),
+    "MITISMINE_APPROVAL_KEY must not be an example, placeholder, or template value",
   );
 const defaultAgentWorkspaceRoot = resolve(homedir(), ".mitismine", "agent-workspaces");
 

@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
-import { isAbsolute, relative } from "node:path";
 
 import { loadConfig } from "../../apps/control-plane/src/config.js";
 import { registrationsFromConfig } from "../../apps/control-plane/src/main.js";
@@ -16,6 +18,18 @@ const validEnvironment = {
   FEISHU_COPILOT_APP_ID: "copilot-app",
   FEISHU_COPILOT_APP_SECRET: "copilot-secret",
 } as const;
+
+function exampleEnvironment(): Record<string, string> {
+  return Object.fromEntries(
+    readFileSync(resolve(".env.example"), "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0 && !line.startsWith("#"))
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+}
 
 describe("loadConfig", () => {
   it("requires all four Feishu credentials", () => {
@@ -34,6 +48,21 @@ describe("loadConfig", () => {
     expect(() => loadConfig({
       ...validEnvironment,
       MITISMINE_APPROVAL_KEY: "development-only-approval-key-change-me",
+    })).toThrow(/MITISMINE_APPROVAL_KEY/);
+  });
+
+  it("rejects approval key templates from the example environment", () => {
+    const environment = exampleEnvironment();
+
+    expect(environment.MITISMINE_APPROVAL_KEY).toBe("<generate-a-random-32-byte-secret>");
+    expect(() => loadConfig(environment)).toThrow(/MITISMINE_APPROVAL_KEY/);
+    expect(() => loadConfig({
+      ...validEnvironment,
+      MITISMINE_APPROVAL_KEY: "<custom-generated-secret-that-is-long-enough>",
+    })).toThrow(/MITISMINE_APPROVAL_KEY/);
+    expect(() => loadConfig({
+      ...validEnvironment,
+      MITISMINE_APPROVAL_KEY: "template-approval-signing-key-with-32-characters",
     })).toThrow(/MITISMINE_APPROVAL_KEY/);
   });
 
