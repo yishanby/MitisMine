@@ -1,0 +1,226 @@
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+import type { Topic } from "../../domain/src/model.js";
+import { SCHEMA_SQL } from "./schema.js";
+
+export interface AppendEventInput {
+  readonly topicId: string;
+  readonly type: string;
+  readonly actorPrincipalId?: string;
+  readonly payload: unknown;
+  readonly createdAt?: string;
+}
+
+export interface TopicEvent {
+  readonly topicId: string;
+  readonly seq: number;
+  readonly type: string;
+  readonly actorPrincipalId?: string;
+  readonly payload: unknown;
+  readonly createdAt: string;
+}
+
+interface TopicRow {
+  id: string;
+  tenant_key: string;
+  title: string;
+  owner_principal_id: string;
+  status: "active" | "archived";
+  created_at: string;
+  updated_at: string;
+  last_event_seq: number;
+}
+
+interface EventRow {
+  topic_id: string;
+  seq: number;
+  type: string;
+  actor_principal_id: string | null;
+  payload_json: string;
+  created_at: string;
+}
+
+export class EventStore {
+  readonly #database: DatabaseSync;
+
+  private constructor(database: DatabaseSync) {
+    this.#database = database;
+  }
+
+  static open(path: string): EventStore {
+    if (path !== ":memory:") {
+      mkdirSync(dirname(path), { recursive: true });
+    }
+    const database = new DatabaseSync(path);
+    database.exec("PRAGMA journal_mode = WAL;");
+    database.exec(SCHEMA_SQL);
+    return new EventStore(database);
+  }
+
+  close(): void {
+    this.#database.close();
+  }
+
+  append(input: AppendEventInput): TopicEvent {
+    const createdAt = input.createdAt ?? new Date().toISOString();
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const seqRow = this.#database
+        .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM topic_events WHERE topic_id = ?")
+        .get(input.topicId) as { seq: number };
+      const seq = Number(seqRow.seq);
+
+      if (input.type === "topic.created") {
+        const topic = this.#topicFromCreatedPayload(input.payload, input.topicId);
+        this.#database
+          .prepare(`
+            INSERT INTO topics (
+              id, tenant_key, title, owner_principal_id, status,
+              created_at, updated_at, last_event_seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `)
+          .run(
+            topic.id,
+            topic.tenantKey,
+            topic.title,
+            topic.ownerPrincipalId,
+            topic.status,
+            topic.createdAt,
+            topic.updatedAt,
+            seq,
+          );
+      } else {
+        const result = this.#database
+          .prepare("UPDATE topics SET last_event_seq = ?, updated_at = ? WHERE id = ?")
+          .run(seq, createdAt, input.topicId);
+        if (Number(result.changes) !== 1) {
+          throw new Error(`Topic not found: ${input.topicId}`);
+        }
+      }
+
+      this.#database
+        .prepare(`
+          INSERT INTO topic_events (
+            topic_id, seq, type, actor_principal_id, payload_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          input.topicId,
+          seq,
+          input.type,
+          input.actorPrincipalId ?? null,
+          JSON.stringify(input.payload),
+          createdAt,
+        );
+      this.#database.exec("COMMIT");
+      const event: TopicEvent = {
+        topicId: input.topicId,
+        seq,
+        type: input.type,
+        payload: input.payload,
+        createdAt,
+        ...(input.actorPrincipalId === undefined
+          ? {}
+          : { actorPrincipalId: input.actorPrincipalId }),
+      };
+      return event;
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  events(topicId: string): TopicEvent[] {
+    const rows = this.#database
+      .prepare(`
+        SELECT topic_id, seq, type, actor_principal_id, payload_json, created_at
+        FROM topic_events WHERE topic_id = ? ORDER BY seq ASC
+      `)
+      .all(topicId) as unknown as EventRow[];
+    return rows.map((row) => ({
+      topicId: row.topic_id,
+      seq: Number(row.seq),
+      type: row.type,
+      payload: JSON.parse(row.payload_json) as unknown,
+      createdAt: row.created_at,
+      ...(row.actor_principal_id === null
+        ? {}
+        : { actorPrincipalId: row.actor_principal_id }),
+    }));
+  }
+
+  topic(topicId: string): Topic | undefined {
+    const row = this.#database
+      .prepare(`
+        SELECT id, tenant_key, title, owner_principal_id, status,
+               created_at, updated_at, last_event_seq
+        FROM topics WHERE id = ?
+      `)
+      .get(topicId) as TopicRow | undefined;
+    return row === undefined ? undefined : this.#mapTopic(row);
+  }
+
+  setCurrentTopic(tenantKey: string, principalId: string, topicId: string): void {
+    this.#database
+      .prepare(`
+        INSERT INTO user_topic_cursors (tenant_key, principal_id, topic_id, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (tenant_key, principal_id) DO UPDATE SET
+          topic_id = excluded.topic_id,
+          updated_at = excluded.updated_at
+      `)
+      .run(tenantKey, principalId, topicId, new Date().toISOString());
+  }
+
+  currentTopic(tenantKey: string, principalId: string): string | undefined {
+    const row = this.#database
+      .prepare(`
+        SELECT topic_id FROM user_topic_cursors
+        WHERE tenant_key = ? AND principal_id = ?
+      `)
+      .get(tenantKey, principalId) as { topic_id: string } | undefined;
+    return row?.topic_id;
+  }
+
+  recordFeishuEvent(appRole: string, eventId: string): boolean {
+    const result = this.#database
+      .prepare(`
+        INSERT OR IGNORE INTO processed_feishu_events (app_role, event_id, processed_at)
+        VALUES (?, ?, ?)
+      `)
+      .run(appRole, eventId, new Date().toISOString());
+    return Number(result.changes) === 1;
+  }
+
+  #topicFromCreatedPayload(payload: unknown, topicId: string): Topic {
+    if (
+      typeof payload !== "object" ||
+      payload === null ||
+      !("topic" in payload) ||
+      typeof payload.topic !== "object" ||
+      payload.topic === null
+    ) {
+      throw new Error("topic.created payload is invalid");
+    }
+    const topic = payload.topic as Topic;
+    if (topic.id !== topicId) {
+      throw new Error("topic.created ID does not match event Topic");
+    }
+    return topic;
+  }
+
+  #mapTopic(row: TopicRow): Topic {
+    return {
+      id: row.id,
+      tenantKey: row.tenant_key,
+      title: row.title,
+      ownerPrincipalId: row.owner_principal_id,
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastEventSeq: Number(row.last_event_seq),
+    };
+  }
+}

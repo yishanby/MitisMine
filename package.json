@@ -8,8 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx apps/control-plane/src/main.ts",
     "start": "node --env-file=.env.local dist/apps/control-plane/src/main.js",
-    "test": "vitest",
-    "test:run": "vitest run",
+    "test": "node --disable-warning=ExperimentalWarning ./node_modules/vitest/vitest.mjs",
+    "test:run": "node --disable-warning=ExperimentalWarning ./node_modules/vitest/vitest.mjs run",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit"
   },
