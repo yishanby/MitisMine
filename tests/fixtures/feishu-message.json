@@ -1,0 +1,23 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "event-fixture-1",
+    "tenant_key": "tenant-1",
+    "event_type": "im.message.receive_v1"
+  },
+  "event": {
+    "sender": {
+      "sender_id": {
+        "user_id": "user-1",
+        "union_id": "union-1",
+        "open_id": "open-app-specific"
+      }
+    },
+    "message": {
+      "message_id": "message-1",
+      "chat_id": "chat-1",
+      "message_type": "text",
+      "content": "{\"text\":\"/topic new Fixture Research\"}"
+    }
+  }
+}

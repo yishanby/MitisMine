@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import type { Topic } from "../../domain/src/model.js";
+import type { Topic, TopicMember } from "../../domain/src/model.js";
 import { SCHEMA_SQL } from "./schema.js";
 
 export interface AppendEventInput {
@@ -98,6 +98,22 @@ export class EventStore {
         if (Number(result.changes) !== 1) {
           throw new Error(`Topic not found: ${input.topicId}`);
         }
+        if (input.type === "topic.archived") {
+          const topic = this.#topicFromPayload(input.payload, input.topicId);
+          this.#database
+            .prepare("UPDATE topics SET status = ?, updated_at = ? WHERE id = ?")
+            .run(topic.status, topic.updatedAt, input.topicId);
+        }
+        if (input.type === "topic.shared") {
+          const member = this.#memberFromPayload(input.payload);
+          this.#database
+            .prepare(`
+              INSERT INTO topic_members (topic_id, principal_id, role)
+              VALUES (?, ?, ?)
+              ON CONFLICT (topic_id, principal_id) DO UPDATE SET role = excluded.role
+            `)
+            .run(input.topicId, member.principalId, member.role);
+        }
       }
 
       this.#database
@@ -162,6 +178,30 @@ export class EventStore {
     return row === undefined ? undefined : this.#mapTopic(row);
   }
 
+  listTopics(tenantKey: string, principalId: string): Topic[] {
+    const rows = this.#database
+      .prepare(`
+        SELECT DISTINCT t.id, t.tenant_key, t.title, t.owner_principal_id,
+               t.status, t.created_at, t.updated_at, t.last_event_seq
+        FROM topics t
+        LEFT JOIN topic_members m ON m.topic_id = t.id
+        WHERE t.tenant_key = ? AND (t.owner_principal_id = ? OR m.principal_id = ?)
+        ORDER BY t.updated_at DESC, t.id DESC
+      `)
+      .all(tenantKey, principalId, principalId) as unknown as TopicRow[];
+    return rows.map((row) => this.#mapTopic(row));
+  }
+
+  members(topicId: string): TopicMember[] {
+    return this.#database
+      .prepare("SELECT principal_id, role FROM topic_members WHERE topic_id = ? ORDER BY principal_id")
+      .all(topicId)
+      .map((row) => {
+        const member = row as { principal_id: string; role: "editor" | "viewer" };
+        return { principalId: member.principal_id, role: member.role };
+      });
+  }
+
   setCurrentTopic(tenantKey: string, principalId: string, topicId: string): void {
     this.#database
       .prepare(`
@@ -209,6 +249,38 @@ export class EventStore {
       throw new Error("topic.created ID does not match event Topic");
     }
     return topic;
+  }
+
+  #topicFromPayload(payload: unknown, topicId: string): Topic {
+    if (
+      typeof payload !== "object" ||
+      payload === null ||
+      !("topic" in payload) ||
+      typeof payload.topic !== "object" ||
+      payload.topic === null
+    ) {
+      throw new Error("Topic event payload is invalid");
+    }
+    const topic = payload.topic as Topic;
+    if (topic.id !== topicId) throw new Error("Topic event ID does not match event Topic");
+    return topic;
+  }
+
+  #memberFromPayload(payload: unknown): TopicMember {
+    if (
+      typeof payload !== "object" ||
+      payload === null ||
+      !("member" in payload) ||
+      typeof payload.member !== "object" ||
+      payload.member === null
+    ) {
+      throw new Error("topic.shared payload is invalid");
+    }
+    const member = payload.member as TopicMember;
+    if (!member.principalId || (member.role !== "editor" && member.role !== "viewer")) {
+      throw new Error("topic.shared member is invalid");
+    }
+    return member;
   }
 
   #mapTopic(row: TopicRow): Topic {
