@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
+
 import type { AgentEvent, RunJsonlOptions } from "../../agent-protocol/src/types.js";
 import {
   collectNormalized,
@@ -10,7 +13,7 @@ import {
 
 const CODEX_AUTH_ENV = ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] as const;
 
-function argumentsFor(task: AgentTask, sessionId?: string): string[] {
+function argumentsFor(sessionId?: string): string[] {
   if (sessionId !== undefined) {
     return [
       "exec",
@@ -19,7 +22,7 @@ function argumentsFor(task: AgentTask, sessionId?: string): string[] {
       "resume",
       "--json",
       sessionId,
-      task.prompt,
+      "-",
     ];
   }
   return [
@@ -29,8 +32,18 @@ function argumentsFor(task: AgentTask, sessionId?: string): string[] {
     "read-only",
     "--color",
     "never",
-    task.prompt,
+    "-",
   ];
+}
+
+function executable(): { command: string; prefixArgs: string[] } {
+  if (process.platform !== "win32") return { command: "codex", prefixArgs: [] };
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    if (!directory) continue;
+    const entry = join(directory, "node_modules", "@openai", "codex", "bin", "codex.js");
+    if (existsSync(entry)) return { command: process.execPath, prefixArgs: [entry] };
+  }
+  return { command: "codex", prefixArgs: [] };
 }
 
 function normalizeCodex(event: AgentEvent): readonly AgentEvent[] {
@@ -52,9 +65,11 @@ function normalizeCodex(event: AgentEvent): readonly AgentEvent[] {
 }
 
 function optionsFor(task: AgentTask, sessionId?: string): RunJsonlOptions {
+  const invocation = executable();
   return {
-    command: "codex",
-    args: argumentsFor(task, sessionId),
+    command: invocation.command,
+    args: [...invocation.prefixArgs, ...argumentsFor(sessionId)],
+    stdin: task.prompt,
     cwd: task.cwd,
     providerAuthEnv: CODEX_AUTH_ENV,
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),

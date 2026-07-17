@@ -22,7 +22,7 @@ function fakeRunner(calls: RunJsonlOptions[]): AgentRunner {
       yield { type: "result", result: "claude answer", session_id: resumed ?? "claude-session" };
       return;
     }
-    if (options.command === "codex") {
+    if (args.includes("exec")) {
       const resumeIndex = args.indexOf("resume");
       const sessionId = resumeIndex < 0 ? "codex-session" : args[resumeIndex + 2];
       yield { type: "thread.started", thread_id: sessionId };
@@ -94,10 +94,17 @@ describe("CLI adapters", () => {
       providerAuthEnv: expect.arrayContaining(["ANTHROPIC_API_KEY"]),
     });
     expect(calls[1]).toMatchObject({
-      command: "codex",
       args: expect.arrayContaining(["exec", "--json", "--sandbox", "read-only"]),
+      stdin: "Question",
       providerAuthEnv: expect.arrayContaining(["CODEX_API_KEY"]),
     });
+    expect(calls[1]?.args?.at(-1)).toBe("-");
+    if (process.platform === "win32") {
+      expect(calls[1]?.command).toBe(process.execPath);
+      expect(calls[1]?.args?.[0]).toMatch(/@openai[\\/]codex[\\/]bin[\\/]codex\.js$/);
+    } else {
+      expect(calls[1]?.command).toBe("codex");
+    }
     expect(calls[2]).toMatchObject({
       command: "copilot",
       args: expect.arrayContaining([

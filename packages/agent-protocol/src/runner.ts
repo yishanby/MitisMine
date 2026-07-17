@@ -18,6 +18,9 @@ const BASE_ENV = new Set([
   "LC_CTYPE",
   "TERM",
   "COLORTERM",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "XDG_CONFIG_HOME",
 ]);
 
 const DEFAULT_MAX_LINE_BYTES = 1024 * 1024;
@@ -90,6 +93,8 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
     [...(options.args ?? [])],
     spawnOptions,
   );
+  if (options.stdin === undefined) child.stdin.end();
+  else child.stdin.end(options.stdin, "utf8");
   const queue: AgentEvent[] = [];
   let wake: (() => void) | undefined;
   let done = false;

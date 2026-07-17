@@ -25,6 +25,7 @@ export interface RunJsonlOptions {
   readonly args?: readonly string[];
   readonly cwd?: string;
   readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly stdin?: string;
   readonly allowEnv?: readonly string[];
   readonly providerAuthEnv?: readonly string[];
   readonly timeoutMs?: number;

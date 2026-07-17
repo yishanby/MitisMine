@@ -2,7 +2,10 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { runJsonl } from "../../packages/agent-protocol/src/runner.js";
+import {
+  curateChildEnvironment,
+  runJsonl,
+} from "../../packages/agent-protocol/src/runner.js";
 import type { AgentEvent } from "../../packages/agent-protocol/src/types.js";
 
 const fake = resolve("tests/fixtures/fake-agent.mjs");
@@ -45,6 +48,20 @@ describe("runJsonl", () => {
       safe: "yes",
       providerAuth: "provider-only",
       leaked: false,
+    });
+  });
+
+  it("preserves platform configuration directories needed for persisted CLI login", () => {
+    const environment = curateChildEnvironment({
+      APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+      LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local",
+      XDG_CONFIG_HOME: "/home/test/.config",
+    });
+
+    expect(environment).toMatchObject({
+      APPDATA: "C:\\Users\\test\\AppData\\Roaming",
+      LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local",
+      XDG_CONFIG_HOME: "/home/test/.config",
     });
   });
 
