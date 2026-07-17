@@ -63,6 +63,48 @@ interface AgentSessionRow {
   status: string;
 }
 
+export type DirectSessionStatus = "active" | "running" | "archived";
+
+export interface StoredDirectSession {
+  readonly id: string;
+  readonly topicId: string;
+  readonly provider: string;
+  readonly title: string;
+  readonly externalSessionId?: string;
+  readonly contextWatermark: number;
+  readonly status: DirectSessionStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface CreateDirectSessionInput {
+  readonly id: string;
+  readonly topicId: string;
+  readonly provider: string;
+  readonly title: string;
+  readonly now?: string;
+  readonly idempotencyKey?: string;
+}
+
+export interface UpdateDirectSessionInput {
+  readonly externalSessionId?: string;
+  readonly contextWatermark?: number;
+  readonly status?: DirectSessionStatus;
+  readonly now?: string;
+}
+
+interface DirectSessionRow {
+  id: string;
+  topic_id: string;
+  provider: string;
+  title: string;
+  external_session_id: string | null;
+  context_watermark: number;
+  status: DirectSessionStatus;
+  created_at: string;
+  updated_at: string;
+}
+
 export class EventStore {
   readonly #database: DatabaseSync;
 
@@ -84,6 +126,22 @@ export class EventStore {
       database.exec("ALTER TABLE processed_feishu_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'");
     }
     database.prepare("UPDATE processed_feishu_events SET status = 'pending' WHERE status = 'processing'").run();
+    const migratedAt = new Date().toISOString();
+    database.prepare(`
+      INSERT OR IGNORE INTO direct_sessions (
+        id, topic_id, provider, title, external_session_id,
+        context_watermark, status, created_at, updated_at
+      )
+      SELECT id, topic_id, provider, 'main', external_session_id,
+             context_watermark,
+             CASE WHEN status = 'archived' THEN 'archived' ELSE 'active' END,
+             ?, ?
+      FROM agent_sessions
+      WHERE role = 'direct'
+    `).run(migratedAt, migratedAt);
+    database.prepare(`
+      UPDATE direct_sessions SET status = 'active', updated_at = ? WHERE status = 'running'
+    `).run(migratedAt);
     return new EventStore(database);
   }
 
@@ -359,6 +417,202 @@ export class EventStore {
       );
   }
 
+  createDirectSession(input: CreateDirectSessionInput): StoredDirectSession {
+    const title = normalizeDirectSessionTitle(input.title);
+    const now = input.now ?? new Date().toISOString();
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      if (input.idempotencyKey !== undefined) {
+        const prior = this.#database.prepare(`
+          SELECT session_id FROM direct_session_effects WHERE effect_key = ?
+        `).get(input.idempotencyKey) as { session_id: string } | undefined;
+        if (prior !== undefined) {
+          const existing = this.directSession(prior.session_id);
+          if (existing === undefined) throw new Error("Idempotent direct Session effect is missing");
+          this.#database.exec("COMMIT");
+          return existing;
+        }
+      }
+      this.#database.prepare(`
+        INSERT INTO direct_sessions (
+          id, topic_id, provider, title, external_session_id,
+          context_watermark, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, NULL, 0, 'active', ?, ?)
+      `).run(input.id, input.topicId, input.provider, title, now, now);
+      if (input.idempotencyKey !== undefined) {
+        this.#database.prepare(`
+          INSERT INTO direct_session_effects (effect_key, session_id) VALUES (?, ?)
+        `).run(input.idempotencyKey, input.id);
+      }
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      if (isSqliteConstraint(error)) {
+        throw new Error(`Direct Session '${title}' already exists for this Topic and provider`);
+      }
+      throw error;
+    }
+    const session = this.directSession(input.id);
+    if (session === undefined) throw new Error("Created direct Session is missing");
+    return session;
+  }
+
+  directSession(id: string): StoredDirectSession | undefined {
+    const row = this.#database.prepare(`
+      SELECT id, topic_id, provider, title, external_session_id,
+             context_watermark, status, created_at, updated_at
+      FROM direct_sessions WHERE id = ?
+    `).get(id) as DirectSessionRow | undefined;
+    return row === undefined ? undefined : mapDirectSession(row);
+  }
+
+  directSessionEffect(idempotencyKey: string): StoredDirectSession | undefined {
+    const row = this.#database.prepare(`
+      SELECT s.id, s.topic_id, s.provider, s.title, s.external_session_id,
+             s.context_watermark, s.status, s.created_at, s.updated_at
+      FROM direct_session_effects e
+      JOIN direct_sessions s ON s.id = e.session_id
+      WHERE e.effect_key = ?
+    `).get(idempotencyKey) as DirectSessionRow | undefined;
+    return row === undefined ? undefined : mapDirectSession(row);
+  }
+
+  listDirectSessions(topicId: string, provider: string): StoredDirectSession[] {
+    const rows = this.#database.prepare(`
+      SELECT id, topic_id, provider, title, external_session_id,
+             context_watermark, status, created_at, updated_at
+      FROM direct_sessions
+      WHERE topic_id = ? AND provider = ?
+      ORDER BY updated_at DESC, id DESC
+    `).all(topicId, provider) as unknown as DirectSessionRow[];
+    return rows.map(mapDirectSession);
+  }
+
+  resolveDirectSession(
+    topicId: string,
+    provider: string,
+    selector: string,
+  ): StoredDirectSession | undefined {
+    const normalized = normalizeDirectSessionTitle(selector);
+    const sessions = this.listDirectSessions(topicId, provider)
+      .filter((session) => session.status !== "archived");
+    const titleMatches = sessions.filter(
+      (session) => session.title.toLocaleLowerCase() === normalized.toLocaleLowerCase(),
+    );
+    if (titleMatches.length === 1) return titleMatches[0];
+    const idMatches = sessions.filter(
+      (session) => session.id.toLocaleLowerCase().startsWith(normalized.toLocaleLowerCase()),
+    );
+    if (idMatches.length > 1) throw new Error("Direct Session selector is ambiguous");
+    return idMatches[0];
+  }
+
+  renameDirectSession(id: string, title: string, now = new Date().toISOString()): StoredDirectSession {
+    const normalized = normalizeDirectSessionTitle(title);
+    try {
+      const result = this.#database.prepare(`
+        UPDATE direct_sessions SET title = ?, updated_at = ? WHERE id = ? AND status != 'archived'
+      `).run(normalized, now, id);
+      if (Number(result.changes) !== 1) throw new Error(`Active direct Session not found: ${id}`);
+    } catch (error) {
+      if (isSqliteConstraint(error)) {
+        throw new Error(`Direct Session '${normalized}' already exists for this Topic and provider`);
+      }
+      throw error;
+    }
+    return this.directSession(id) as StoredDirectSession;
+  }
+
+  updateDirectSession(id: string, input: UpdateDirectSessionInput): StoredDirectSession {
+    const current = this.directSession(id);
+    if (current === undefined) throw new Error(`Direct Session not found: ${id}`);
+    const now = input.now ?? new Date().toISOString();
+    this.#database.prepare(`
+      UPDATE direct_sessions SET
+        external_session_id = ?, context_watermark = ?, status = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.externalSessionId ?? current.externalSessionId ?? null,
+      input.contextWatermark ?? current.contextWatermark,
+      input.status ?? current.status,
+      now,
+      id,
+    );
+    return this.directSession(id) as StoredDirectSession;
+  }
+
+  archiveDirectSession(
+    id: string,
+    now = new Date().toISOString(),
+    idempotencyKey?: string,
+  ): StoredDirectSession {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      if (idempotencyKey !== undefined) {
+        const prior = this.directSessionEffect(idempotencyKey);
+        if (prior !== undefined) {
+          this.#database.exec("COMMIT");
+          return prior;
+        }
+      }
+      const result = this.#database.prepare(`
+        UPDATE direct_sessions SET status = 'archived', updated_at = ?
+        WHERE id = ? AND status != 'archived'
+      `).run(now, id);
+      if (Number(result.changes) !== 1) throw new Error(`Active direct Session not found: ${id}`);
+      this.#database.prepare("DELETE FROM direct_session_cursors WHERE session_id = ?").run(id);
+      if (idempotencyKey !== undefined) {
+        this.#database.prepare(`
+          INSERT INTO direct_session_effects (effect_key, session_id) VALUES (?, ?)
+        `).run(idempotencyKey, id);
+      }
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.directSession(id) as StoredDirectSession;
+  }
+
+  setCurrentDirectSession(
+    tenantKey: string,
+    principalId: string,
+    topicId: string,
+    provider: string,
+    sessionId: string,
+  ): void {
+    const session = this.directSession(sessionId);
+    if (session === undefined || session.topicId !== topicId || session.provider !== provider) {
+      throw new Error("Direct Session does not belong to this Topic and provider");
+    }
+    if (session.status === "archived") throw new Error("Direct Session is archived");
+    this.#database.prepare(`
+      INSERT INTO direct_session_cursors (
+        tenant_key, principal_id, topic_id, provider, session_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (tenant_key, principal_id, topic_id, provider) DO UPDATE SET
+        session_id = excluded.session_id,
+        updated_at = excluded.updated_at
+    `).run(tenantKey, principalId, topicId, provider, sessionId, new Date().toISOString());
+  }
+
+  currentDirectSession(
+    tenantKey: string,
+    principalId: string,
+    topicId: string,
+    provider: string,
+  ): StoredDirectSession | undefined {
+    const row = this.#database.prepare(`
+      SELECT s.id, s.topic_id, s.provider, s.title, s.external_session_id,
+             s.context_watermark, s.status, s.created_at, s.updated_at
+      FROM direct_session_cursors c
+      JOIN direct_sessions s ON s.id = c.session_id
+      WHERE c.tenant_key = ? AND c.principal_id = ?
+        AND c.topic_id = ? AND c.provider = ? AND s.status != 'archived'
+    `).get(tenantKey, principalId, topicId, provider) as DirectSessionRow | undefined;
+    return row === undefined ? undefined : mapDirectSession(row);
+  }
+
   #topicFromCreatedPayload(payload: unknown, topicId: string): Topic {
     if (
       typeof payload !== "object" ||
@@ -431,4 +685,29 @@ function mapEvent(row: EventRow): TopicEvent {
     createdAt: row.created_at,
     ...(row.actor_principal_id === null ? {} : { actorPrincipalId: row.actor_principal_id }),
   };
+}
+
+function mapDirectSession(row: DirectSessionRow): StoredDirectSession {
+  return {
+    id: row.id,
+    topicId: row.topic_id,
+    provider: row.provider,
+    title: row.title,
+    contextWatermark: Number(row.context_watermark),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.external_session_id === null ? {} : { externalSessionId: row.external_session_id }),
+  };
+}
+
+function normalizeDirectSessionTitle(title: string): string {
+  const normalized = title.trim().replace(/\s+/g, " ");
+  if (!normalized) throw new Error("Direct Session title is required");
+  if (normalized.length > 120) throw new Error("Direct Session title must not exceed 120 characters");
+  return normalized;
+}
+
+function isSqliteConstraint(error: unknown): boolean {
+  return error instanceof Error && /constraint|unique/i.test(error.message);
 }

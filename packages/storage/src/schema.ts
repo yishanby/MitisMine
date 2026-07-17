@@ -75,6 +75,37 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   UNIQUE (topic_id, provider, role)
 );
 
+CREATE TABLE IF NOT EXISTS direct_sessions (
+  id TEXT PRIMARY KEY,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  title TEXT NOT NULL COLLATE NOCASE,
+  external_session_id TEXT,
+  context_watermark INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('active', 'running', 'archived')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (topic_id, provider, title)
+);
+
+CREATE TABLE IF NOT EXISTS direct_session_effects (
+  effect_key TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES direct_sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS direct_session_cursors (
+  tenant_key TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  session_id TEXT NOT NULL REFERENCES direct_sessions(id) ON DELETE CASCADE,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_key, principal_id, topic_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS direct_sessions_topic_provider_updated_idx
+  ON direct_sessions (topic_id, provider, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS claims (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,

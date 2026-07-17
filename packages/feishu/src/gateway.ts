@@ -9,7 +9,7 @@ import {
   resolvePrincipal,
 } from "../../domain/src/topic.js";
 import type { OutboxPort } from "../../storage/src/outbox.js";
-import type { EventStore } from "../../storage/src/store.js";
+import type { EventStore, StoredDirectSession } from "../../storage/src/store.js";
 import { textCard } from "./cards.js";
 import { parseCommand, type FeishuCommand } from "./commands.js";
 import type { AppRole, ProviderAppRole } from "./registry.js";
@@ -55,6 +55,7 @@ export type DispatchInput =
   | {
       readonly mode: "direct";
       readonly provider: ProviderName;
+      readonly directSessionId: string;
       readonly topicId: string;
       readonly topicTitle: string;
       readonly principalId: string;
@@ -130,6 +131,13 @@ export class FeishuGateway {
     command: FeishuCommand,
     routeKey: string,
   ): Promise<void> {
+    if (event.appRole === "hub" && isSessionCommand(command)) {
+      this.#respond(
+        event,
+        textCard("请使用 Agent App", "请在 Claude、Codex 或 Copilot App 中管理对应 Agent 的 Session。"),
+      );
+      return;
+    }
     if (event.appRole !== "hub" && isHubOnly(command)) {
       this.#respond(
         event,
@@ -230,8 +238,8 @@ export class FeishuGateway {
       }
       case "message": {
         const topic = this.#currentOrCreate(event, principalId, command.text, routeKey);
-        this.#appendMessage(topic, event, principalId, command.text, false, routeKey);
         if (event.appRole === "hub") {
+          this.#appendMessage(topic, event, principalId, command.text, false, routeKey);
           await this.#dispatcher.dispatch({
             mode: "research",
             topicId: topic.id,
@@ -243,9 +251,27 @@ export class FeishuGateway {
             receiveId: event.chatId,
           });
         } else {
+          const provider = providerFromRole(event.appRole);
+          const session = this.#ensureCurrentDirectSession(
+            event.tenantKey,
+            principalId,
+            topic.id,
+            provider,
+            `${routeKey}:lazy-session`,
+          );
+          this.#appendDirectMessage(
+            topic,
+            event,
+            principalId,
+            provider,
+            session.id,
+            command.text,
+            routeKey,
+          );
           await this.#dispatcher.dispatch({
             mode: "direct",
-            provider: providerFromRole(event.appRole),
+            provider,
+            directSessionId: session.id,
             topicId: topic.id,
             topicTitle: topic.title,
             principalId,
@@ -255,6 +281,107 @@ export class FeishuGateway {
             receiveId: event.chatId,
           });
         }
+        return;
+      }
+      case "session.new": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "edit");
+        const provider = providerForSessionRole(event.appRole);
+        const session = this.#store.createDirectSession({
+          id: this.#idFactory(),
+          topicId: topic.id,
+          provider,
+          title: command.title,
+          idempotencyKey: `${routeKey}:session-new`,
+        });
+        this.#store.setCurrentDirectSession(
+          event.tenantKey, principalId, topic.id, provider, session.id,
+        );
+        this.#respond(
+          event,
+          textCard("Session 已创建", `${session.title}\nID: ${shortSessionId(session.id)}`),
+        );
+        return;
+      }
+      case "session.list": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "read");
+        const provider = providerForSessionRole(event.appRole);
+        const current = this.#store.currentDirectSession(
+          event.tenantKey, principalId, topic.id, provider,
+        );
+        const sessions = this.#store.listDirectSessions(topic.id, provider);
+        const body = sessions.length === 0
+          ? "暂无 Session；发送普通消息将自动创建 main。"
+          : sessions.map((session) => {
+              const marker = session.id === current?.id ? "→" : " ";
+              return `${marker} ${shortSessionId(session.id)} · ${session.title} · ${session.status} · ${session.updatedAt}`;
+            }).join("\n");
+        this.#respond(event, textCard(`${provider} Sessions`, body));
+        return;
+      }
+      case "session.use": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "read");
+        const provider = providerForSessionRole(event.appRole);
+        const session = this.#store.resolveDirectSession(topic.id, provider, command.selector);
+        if (session === undefined) throw new Error("Active direct Session not found");
+        this.#store.setCurrentDirectSession(
+          event.tenantKey, principalId, topic.id, provider, session.id,
+        );
+        this.#respond(
+          event,
+          textCard("已切换 Session", `${session.title}\nID: ${shortSessionId(session.id)}`),
+        );
+        return;
+      }
+      case "session.show": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "read");
+        const provider = providerForSessionRole(event.appRole);
+        const session = this.#store.currentDirectSession(
+          event.tenantKey, principalId, topic.id, provider,
+        );
+        this.#respond(
+          event,
+          session === undefined
+            ? textCard("当前 Session", "尚未选择；发送普通消息将自动创建 main。")
+            : textCard(
+                session.title,
+                `Provider: ${provider}\nID: ${session.id}\n状态: ${session.status}\n外部 Session: ${session.externalSessionId === undefined ? "尚未建立" : "已建立"}\n上下文水位: ${session.contextWatermark}`,
+              ),
+        );
+        return;
+      }
+      case "session.rename": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "edit");
+        const provider = providerForSessionRole(event.appRole);
+        const current = this.#requireCurrentDirectSession(
+          event.tenantKey, principalId, topic.id, provider,
+        );
+        const renamed = this.#store.renameDirectSession(current.id, command.title);
+        this.#respond(event, textCard("Session 已重命名", renamed.title));
+        return;
+      }
+      case "session.archive": {
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "edit");
+        const provider = providerForSessionRole(event.appRole);
+        const effectKey = `${routeKey}:session-archive`;
+        const current = this.#store.directSessionEffect(effectKey)
+          ?? this.#requireCurrentDirectSession(
+            event.tenantKey, principalId, topic.id, provider,
+          );
+        this.#store.archiveDirectSession(current.id, undefined, effectKey);
+        const fallback = this.#store.listDirectSessions(topic.id, provider)
+          .find((session) => session.status !== "archived");
+        if (fallback !== undefined) {
+          this.#store.setCurrentDirectSession(
+            event.tenantKey, principalId, topic.id, provider, fallback.id,
+          );
+        }
+        this.#respond(
+          event,
+          textCard(
+            "Session 已归档",
+            fallback === undefined ? current.title : `${current.title}\n当前: ${fallback.title}`,
+          ),
+        );
         return;
       }
       case "status":
@@ -382,6 +509,67 @@ export class FeishuGateway {
     });
   }
 
+  #appendDirectMessage(
+    topic: Topic,
+    event: FeishuMessageEvent,
+    principalId: string,
+    provider: ProviderName,
+    directSessionId: string,
+    text: string,
+    routeKey: string,
+  ): void {
+    this.#store.append({
+      topicId: topic.id,
+      type: "agent.direct.message",
+      actorPrincipalId: principalId,
+      payload: {
+        provider,
+        directSessionId,
+        text,
+        appRole: event.appRole,
+        messageId: event.messageId,
+        openId: event.openId,
+      },
+      idempotencyKey: `${routeKey}:direct-message`,
+    });
+  }
+
+  #ensureCurrentDirectSession(
+    tenantKey: string,
+    principalId: string,
+    topicId: string,
+    provider: ProviderName,
+    idempotencyKey: string,
+  ): StoredDirectSession {
+    const current = this.#store.currentDirectSession(
+      tenantKey, principalId, topicId, provider,
+    );
+    if (current !== undefined) return current;
+    const existingMain = this.#store.resolveDirectSession(topicId, provider, "main");
+    const session = existingMain ?? this.#store.createDirectSession({
+      id: this.#idFactory(),
+      topicId,
+      provider,
+      title: nextDefaultSessionTitle(this.#store.listDirectSessions(topicId, provider)),
+      idempotencyKey,
+    });
+    this.#store.setCurrentDirectSession(tenantKey, principalId, topicId, provider, session.id);
+    return session;
+  }
+
+  #requireCurrentDirectSession(
+    tenantKey: string,
+    principalId: string,
+    topicId: string,
+    provider: ProviderName,
+  ): StoredDirectSession {
+    const current = this.#store.currentDirectSession(
+      tenantKey, principalId, topicId, provider,
+    );
+    if (current === undefined) throw new Error("No current Session; use /session new first");
+    return current;
+  }
+
   #respond(event: FeishuMessageEvent, payload: unknown): void {
     this.#outbox.enqueue({
       id: `outbox:${event.appRole}:${event.eventId}`,
@@ -394,11 +582,44 @@ export class FeishuGateway {
 }
 
 function isHubOnly(command: FeishuCommand): boolean {
-  return !["topic.use", "topic.show", "status", "report", "message"].includes(command.kind);
+  return ![
+    "topic.use",
+    "topic.show",
+    "status",
+    "report",
+    "message",
+    "session.new",
+    "session.list",
+    "session.use",
+    "session.show",
+    "session.rename",
+    "session.archive",
+  ].includes(command.kind);
+}
+
+function isSessionCommand(command: FeishuCommand): boolean {
+  return command.kind.startsWith("session.");
 }
 
 function providerFromRole(role: ProviderAppRole): ProviderName {
   return role;
+}
+
+function providerForSessionRole(role: AppRole): ProviderName {
+  if (role === "hub") throw new Error("Session commands require a provider App");
+  return providerFromRole(role);
+}
+
+function shortSessionId(id: string): string {
+  return id.slice(0, 8);
+}
+
+function nextDefaultSessionTitle(sessions: readonly StoredDirectSession[]): string {
+  const titles = new Set(sessions.map((session) => session.title.toLocaleLowerCase()));
+  if (!titles.has("main")) return "main";
+  let suffix = 2;
+  while (titles.has(`main ${suffix}`)) suffix += 1;
+  return `main ${suffix}`;
 }
 
 function eventKey(event: FeishuMessageEvent): string {

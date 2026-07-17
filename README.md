@@ -3,8 +3,8 @@
 MitisMine turns four Feishu bots into one persistent research workspace. A
 question sent to the Hub is researched independently by Claude Code, Codex, and
 GitHub Copilot CLI, cross-reviewed, resolved for at most three rounds, and
-returned as an evidence-backed report. Each provider bot can also continue its
-own durable Topic session.
+returned as an evidence-backed report. Each provider bot can also run multiple
+named, durable Sessions inside the same Topic.
 
 ## Implemented
 
@@ -15,7 +15,8 @@ own durable Topic session.
   all-pairs review, dispute repair, signoff, rotating synthesis, and explicit
   unresolved status after round three.
 - SQLite WAL checkpoints, durable inbox/effect keys, Outbox, approval state,
-  Agent sessions, and local Worker leases with heartbeat and restart requeue.
+  Agent sessions, per-user/provider Session cursors, and local Worker leases
+  with heartbeat and restart requeue.
 - AbortSignal propagation, bounded/redacted JSONL, process-tree termination,
   repository-external Topic workspaces, and provider-specific tool restrictions.
 - HMAC approval cards with principal/Topic/action binding, crash recovery, and
@@ -103,7 +104,7 @@ and one healthy Worker.
 
 Topic/read/control commands are handled by the Hub App. Ordinary Hub text and
 `/research` run all three providers. Ordinary text sent to a provider App only
-continues that provider's direct Topic session.
+continues that provider's currently selected Session in the current Topic.
 
 | Command | App | Purpose |
 |---|---|---|
@@ -118,12 +119,26 @@ continues that provider's direct Topic session.
 | `/status`, `/report` | Any | Read latest Run/report |
 | `/stop` | Hub | Cancel the active Run and process trees |
 | `/action write <relative-path> <content>` | Hub | Create an approval card for a trusted write |
+| `/session new <title>` | Provider | Create and select a named Session |
+| `/session list` | Provider | List this Agent's Sessions in the current Topic |
+| `/session use <ID-or-title>` | Provider | Select and implicitly resume a Session |
+| `/session resume <ID-or-title>` | Provider | Alias of `/session use` |
+| `/session show` | Provider | Show the current Session and recovery state |
+| `/session rename <title>` | Provider | Rename the current Session |
+| `/session archive` | Provider | Archive the current Session and select a fallback |
 
 `/topic use` has no fixed prefix length; zero or multiple matches are rejected.
 For automation, `/topic share` also accepts the canonical
 `tenant:user:<user_id>` or `tenant:union:<union_id>`, but an @mention is safer.
 Viewers may read Topic/report state but cannot mutate, start/stop Runs, or
-request actions.
+request actions. They may list/show/select an existing Session but cannot create,
+rename, archive, or send a provider message.
+
+A provider message with no selected Session lazily creates `main`. Session
+cursors are independent per user, Topic, and provider, so switching Topics or
+Agent Apps restores the relevant last selection. Shared Topic notes remain
+visible, while direct messages and replies from other Sessions are excluded.
+Turns in one Session run in order; different Sessions may run concurrently.
 
 ## Verify
 

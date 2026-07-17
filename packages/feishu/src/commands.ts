@@ -10,6 +10,12 @@ export type FeishuCommand =
   | { readonly kind: "status" }
   | { readonly kind: "stop" }
   | { readonly kind: "report" }
+  | { readonly kind: "session.new"; readonly title: string }
+  | { readonly kind: "session.list" }
+  | { readonly kind: "session.use"; readonly selector: string }
+  | { readonly kind: "session.show" }
+  | { readonly kind: "session.rename"; readonly title: string }
+  | { readonly kind: "session.archive" }
   | { readonly kind: "action.write"; readonly path: string; readonly content: string }
   | { readonly kind: "message"; readonly text: string };
 
@@ -37,6 +43,15 @@ export function parseCommand(input: string): FeishuCommand {
   if (/^\/status$/i.test(text)) return { kind: "status" };
   if (/^\/stop$/i.test(text)) return { kind: "stop" };
   if (/^\/report$/i.test(text)) return { kind: "report" };
+  match = /^\/session\s+new(?:\s+(.+))?$/is.exec(text);
+  if (match) return { kind: "session.new", title: required(match[1], "Session title") };
+  if (/^\/session\s+list$/i.test(text)) return { kind: "session.list" };
+  match = /^\/session\s+(?:use|resume)(?:\s+(.+))?$/is.exec(text);
+  if (match) return { kind: "session.use", selector: required(match[1], "Session selector") };
+  if (/^\/session\s+show$/i.test(text)) return { kind: "session.show" };
+  match = /^\/session\s+rename(?:\s+(.+))?$/is.exec(text);
+  if (match) return { kind: "session.rename", title: required(match[1], "Session title") };
+  if (/^\/session\s+archive$/i.test(text)) return { kind: "session.archive" };
   match = /^\/action\s+write\s+(\S+)\s+(.+)$/is.exec(text);
   if (match) {
     return {

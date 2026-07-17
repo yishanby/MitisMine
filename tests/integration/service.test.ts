@@ -51,6 +51,14 @@ afterEach(() => {
   }
 });
 
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 describe("control-plane health", () => {
   it("keeps an in-process worker registered without remote heartbeats", () => {
     const workers = new WorkerRegistry(1_000);
@@ -246,6 +254,12 @@ describe("ChannelDispatcher Context Pack", () => {
       actorPrincipalId: topic.ownerPrincipalId,
       payload: { topic },
     });
+    const directSession = store.createDirectSession({
+      id: "direct-session-shutdown",
+      topicId: topic.id,
+      provider: "claude",
+      title: "main",
+    });
     let started: (() => void) | undefined;
     const providerStarted = new Promise<void>((resolve) => { started = resolve; });
     let aborted = false;
@@ -284,6 +298,7 @@ describe("ChannelDispatcher Context Pack", () => {
       await dispatcher.dispatch({
         mode: "direct",
         provider: "claude",
+        directSessionId: directSession.id,
         topicId: topic.id,
         topicTitle: topic.title,
         principalId: topic.ownerPrincipalId,
@@ -304,7 +319,7 @@ describe("ChannelDispatcher Context Pack", () => {
     }
   });
 
-  it("does not record an error-only direct result as active or completed", async () => {
+  it("restores a direct Session after an error-only result without recording completion", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-error-"));
     temporaryDirectories.push(directory);
     const path = join(directory, "direct.db");
@@ -316,6 +331,12 @@ describe("ChannelDispatcher Context Pack", () => {
       type: "topic.created",
       actorPrincipalId: topic.ownerPrincipalId,
       payload: { topic },
+    });
+    const directSession = store.createDirectSession({
+      id: "direct-session-error",
+      topicId: topic.id,
+      provider: "claude",
+      title: "main",
     });
     const failedAdapter = (provider: ProviderName): AgentAdapter => ({
       provider,
@@ -348,6 +369,7 @@ describe("ChannelDispatcher Context Pack", () => {
       await dispatcher.dispatch({
         mode: "direct",
         provider: "claude",
+        directSessionId: directSession.id,
         topicId: topic.id,
         topicTitle: topic.title,
         principalId: topic.ownerPrincipalId,
@@ -358,10 +380,270 @@ describe("ChannelDispatcher Context Pack", () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 10));
 
-      expect(store.agentSession(topic.id, "claude", "direct")).toBeUndefined();
+      expect(store.directSession(directSession.id)?.status).toBe("active");
+      expect(store.directSession(directSession.id)?.externalSessionId).toBeUndefined();
       expect(store.events(topic.id).some((event) => event.type === "agent.direct.completed"))
         .toBe(false);
     } finally {
+      store.close();
+      outbox.close();
+    }
+  });
+
+  it("starts and resumes the selected direct Session without crossing external IDs", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-selection-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "direct.db");
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    const topic = createTopic("Direct selection", "tenant:user:owner", { id: "topic-selection" });
+    store.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    const one = store.createDirectSession({
+      id: "direct-one", topicId: topic.id, provider: "claude", title: "One",
+    });
+    const two = store.createDirectSession({
+      id: "direct-two", topicId: topic.id, provider: "claude", title: "Two",
+    });
+    const starts: string[] = [];
+    const resumes: string[] = [];
+    const adapter: AgentAdapter = {
+      provider: "claude",
+      start: async () => {
+        const externalSessionId = `external-${starts.length + 1}`;
+        starts.push(externalSessionId);
+        return {
+          provider: "claude",
+          externalSessionId,
+          events: [{ type: "final", text: `started ${externalSessionId}` }],
+        };
+      },
+      resume: async (task) => {
+        resumes.push(task.externalSessionId);
+        return {
+          provider: "claude",
+          externalSessionId: task.externalSessionId,
+          events: [{ type: "final", text: `resumed ${task.externalSessionId}` }],
+        };
+      },
+    };
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected research resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: { claude: adapter, codex: adapter, copilot: adapter },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+    const direct = (directSessionId: string, question: string, key: string) => dispatcher.dispatch({
+      mode: "direct" as const,
+      provider: "claude" as const,
+      directSessionId,
+      topicId: topic.id,
+      topicTitle: topic.title,
+      principalId: topic.ownerPrincipalId,
+      question,
+      idempotencyKey: key,
+      replyAppRole: "claude" as const,
+      receiveId: "chat",
+    });
+
+    try {
+      await direct(one.id, "first one", "selection-one-first");
+      await waitUntil(() => starts.length === 1, "first direct start");
+      await direct(two.id, "first two", "selection-two-first");
+      await waitUntil(() => starts.length === 2, "second direct start");
+      await direct(one.id, "second one", "selection-one-second");
+      await waitUntil(() => resumes.length === 1, "direct resume");
+
+      expect(resumes).toEqual(["external-1"]);
+      expect(store.directSession(one.id)?.externalSessionId).toBe("external-1");
+      expect(store.directSession(two.id)?.externalSessionId).toBe("external-2");
+      expect(store.events(topic.id)
+        .filter((event) => event.type === "agent.direct.completed")
+        .map((event) => (event.payload as { directSessionId?: string }).directSessionId))
+        .toEqual([one.id, two.id, one.id]);
+    } finally {
+      await dispatcher.shutdown();
+      store.close();
+      outbox.close();
+    }
+  });
+
+  it("serializes turns within one direct Session while different Sessions run concurrently", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-concurrency-"));
+    temporaryDirectories.push(directory);
+    const store = EventStore.open(join(directory, "direct.db"));
+    const outbox = DurableOutbox.open(join(directory, "direct.db"));
+    const topic = createTopic("Direct concurrency", "tenant:user:owner", { id: "topic-concurrency" });
+    store.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    const same = store.createDirectSession({
+      id: "session-same", topicId: topic.id, provider: "claude", title: "Same",
+    });
+    const other = store.createDirectSession({
+      id: "session-other", topicId: topic.id, provider: "claude", title: "Other",
+    });
+    let releaseFirst: (() => void) | undefined;
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let releaseOther: (() => void) | undefined;
+    const otherBlocked = new Promise<void>((resolve) => { releaseOther = resolve; });
+    const calls: string[] = [];
+    const invoke = async (task: AgentTask | ResumeAgentTask) => {
+      const label = task.prompt.includes("same second")
+        ? "same second"
+        : task.prompt.includes("same first")
+          ? "same first"
+          : "other";
+      calls.push(label);
+      if (label === "same first") await firstBlocked;
+      if (label === "other") await otherBlocked;
+      return {
+        provider: "claude" as const,
+        externalSessionId: label === "other" ? "external-other" : "external-same",
+        events: [{ type: "final" as const, text: label }],
+      };
+    };
+    const adapter: AgentAdapter = { provider: "claude", start: invoke, resume: invoke };
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected research resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: { claude: adapter, codex: adapter, copilot: adapter },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+    const direct = (directSessionId: string, question: string, key: string) => dispatcher.dispatch({
+      mode: "direct" as const,
+      provider: "claude" as const,
+      directSessionId,
+      topicId: topic.id,
+      topicTitle: topic.title,
+      principalId: topic.ownerPrincipalId,
+      question,
+      idempotencyKey: key,
+      replyAppRole: "claude" as const,
+      receiveId: "chat",
+    });
+
+    try {
+      await direct(same.id, "same first", "concurrency-first");
+      await waitUntil(() => calls.includes("same first"), "blocked first turn");
+      await direct(same.id, "same second", "concurrency-second");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(calls).not.toContain("same second");
+
+      await direct(other.id, "other turn", "concurrency-other");
+      await waitUntil(() => calls.includes("other"), "parallel other Session");
+      store.archiveDirectSession(other.id);
+      releaseOther?.();
+      await waitUntil(
+        () => store.events(topic.id).some((event) =>
+          event.type === "agent.direct.completed"
+          && (event.payload as { directSessionId?: string }).directSessionId === other.id),
+        "archived in-flight completion",
+      );
+      expect(store.directSession(other.id)?.status).toBe("archived");
+      releaseFirst?.();
+      await waitUntil(() => calls.includes("same second"), "serialized second turn");
+      expect(calls.indexOf("other")).toBeLessThan(calls.indexOf("same second"));
+    } finally {
+      releaseFirst?.();
+      releaseOther?.();
+      await dispatcher.shutdown();
+      store.close();
+      outbox.close();
+    }
+  });
+
+  it("includes shared Topic context but excludes other direct Session conversations", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-isolation-"));
+    temporaryDirectories.push(directory);
+    const store = EventStore.open(join(directory, "direct.db"));
+    const outbox = DurableOutbox.open(join(directory, "direct.db"));
+    const topic = createTopic("Direct isolation", "tenant:user:owner", { id: "topic-isolation" });
+    store.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    store.append({
+      topicId: topic.id,
+      type: "message.added",
+      payload: { text: "shared launch note", note: true },
+    });
+    const alpha = store.createDirectSession({
+      id: "session-alpha", topicId: topic.id, provider: "claude", title: "Alpha",
+    });
+    const beta = store.createDirectSession({
+      id: "session-beta", topicId: topic.id, provider: "claude", title: "Beta",
+    });
+    store.append({
+      topicId: topic.id,
+      type: "agent.direct.message",
+      payload: { directSessionId: alpha.id, provider: "claude", text: "alpha private question" },
+    });
+    store.append({
+      topicId: topic.id,
+      type: "agent.direct.completed",
+      payload: { directSessionId: alpha.id, provider: "claude", text: "alpha private answer" },
+    });
+    store.append({
+      topicId: topic.id,
+      type: "agent.direct.message",
+      payload: { directSessionId: beta.id, provider: "claude", text: "beta own history" },
+    });
+    let prompt = "";
+    const adapter: AgentAdapter = {
+      provider: "claude",
+      start: async (task) => {
+        prompt = task.prompt;
+        return {
+          provider: "claude",
+          externalSessionId: "external-beta",
+          events: [{ type: "final", text: "beta answer" }],
+        };
+      },
+      resume: async () => { throw new Error("unexpected resume"); },
+    };
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected research resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: { claude: adapter, codex: adapter, copilot: adapter },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+
+    try {
+      await dispatcher.dispatch({
+        mode: "direct",
+        provider: "claude",
+        directSessionId: beta.id,
+        topicId: topic.id,
+        topicTitle: topic.title,
+        principalId: topic.ownerPrincipalId,
+        question: "beta current question",
+        idempotencyKey: "isolation-beta",
+        replyAppRole: "claude",
+        receiveId: "chat",
+      });
+      await waitUntil(() => prompt.length > 0, "isolated direct prompt");
+      expect(prompt).toContain("shared launch note");
+      expect(prompt).toContain("beta own history");
+      expect(prompt).not.toContain("alpha private question");
+      expect(prompt).not.toContain("alpha private answer");
+    } finally {
+      await dispatcher.shutdown();
       store.close();
       outbox.close();
     }

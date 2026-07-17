@@ -95,10 +95,26 @@ describe("Feishu commands", () => {
     ["/status", "status"],
     ["/stop", "stop"],
     ["/report", "report"],
+    ["/session new architecture", "session.new"],
+    ["/session list", "session.list"],
+    ["/session use 01ABC", "session.use"],
+    ["/session resume 01ABC", "session.use"],
+    ["/session show", "session.show"],
+    ["/session rename evidence review", "session.rename"],
+    ["/session archive", "session.archive"],
     ["/action write smoke/approved.txt hello", "action.write"],
     ["ordinary question", "message"],
   ])("parses %s", (text, kind) => {
     expect(parseCommand(text).kind).toBe(kind);
+  });
+
+  it.each([
+    "/session new",
+    "/session use",
+    "/session resume",
+    "/session rename",
+  ])("rejects missing arguments in %s", (text) => {
+    expect(() => parseCommand(text)).toThrow(/required/i);
   });
 });
 
@@ -115,10 +131,171 @@ describe("FeishuGateway", () => {
       provider: "claude",
       topicTitle: "Research",
       question: "continue",
+      directSessionId: expect.any(String),
     });
     expect(harness.store.currentTopic("tenant-1", "tenant-1:user:user-1")).toBe("topic-1");
     harness.store.close();
     harness.outbox.close();
+  });
+
+  it("manages and routes multiple independent Sessions in a provider App", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    try {
+      await harness.gateway.receive(message("hub", "/topic new Multi-session", "sessions-topic"));
+      await harness.gateway.receive(message("claude", "/session new Architecture", "session-new-a"));
+      const architecture = harness.store.currentDirectSession(
+        "tenant-1", "tenant-1:user:user-1", "topic-1", "claude",
+      );
+      await harness.gateway.receive(message("claude", "/session new Evidence", "session-new-b"));
+      const evidence = harness.store.currentDirectSession(
+        "tenant-1", "tenant-1:user:user-1", "topic-1", "claude",
+      );
+      expect([architecture?.title, evidence?.title]).toEqual(["Architecture", "Evidence"]);
+
+      await harness.gateway.receive(message("claude", "check sources", "session-message-b"));
+      expect(harness.dispatches.at(-1)).toMatchObject({
+        mode: "direct",
+        provider: "claude",
+        directSessionId: evidence?.id,
+      });
+      await harness.gateway.receive(message(
+        "claude", `/session use ${architecture?.id.slice(0, 8)}`, "session-use-a",
+      ));
+      await harness.gateway.receive(message("claude", "/session rename System design", "session-rename"));
+      await harness.gateway.receive(message("claude", "/session show", "session-show"));
+      await harness.gateway.receive(message("claude", "/session list", "session-list"));
+      expect(harness.store.currentDirectSession(
+        "tenant-1", "tenant-1:user:user-1", "topic-1", "claude",
+      )?.title).toBe("System design");
+
+      await harness.gateway.receive(message("claude", "/session archive", "session-archive"));
+      expect(harness.store.directSession(architecture?.id ?? "")?.status).toBe("archived");
+      expect(harness.store.currentDirectSession(
+        "tenant-1", "tenant-1:user:user-1", "topic-1", "claude",
+      )?.id).toBe(evidence?.id);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it("keeps current Session cursors independent by provider and lazily creates main", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    try {
+      await harness.gateway.receive(message("hub", "/topic new Cursor scopes", "cursor-topic"));
+      await harness.gateway.receive(message("claude", "claude turn", "cursor-claude"));
+      await harness.gateway.receive(message("codex", "codex turn", "cursor-codex"));
+      const principal = "tenant-1:user:user-1";
+      const claude = harness.store.currentDirectSession("tenant-1", principal, "topic-1", "claude");
+      const codex = harness.store.currentDirectSession("tenant-1", principal, "topic-1", "codex");
+      expect(claude).toMatchObject({ title: "main", provider: "claude" });
+      expect(codex).toMatchObject({ title: "main", provider: "codex" });
+      expect(claude?.id).not.toBe(codex?.id);
+      expect(harness.dispatches.map((dispatch) => dispatch.mode === "direct"
+        ? dispatch.directSessionId
+        : undefined)).toEqual([claude?.id, codex?.id]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it("guides Hub users to a provider App for Session commands", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    try {
+      await harness.gateway.receive(message("hub", "/topic new Hub boundary", "hub-session-topic"));
+      await harness.gateway.receive(message("hub", "/session new Wrong place", "hub-session-command"));
+      expect(harness.store.listDirectSessions("topic-1", "claude")).toEqual([]);
+      expect(harness.dispatches).toEqual([]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it("lets viewers list and select Sessions but blocks Session mutations and messages", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    try {
+      await harness.gateway.receive(message("hub", "/topic new Shared Sessions", "session-view-topic"));
+      await harness.gateway.receive(message("claude", "/session new Readable", "session-view-create"));
+      await harness.gateway.receive({
+        ...message("hub", "/topic share @_viewer viewer", "session-view-share"),
+        mentions: [{ key: "@_viewer", userId: "viewer", unionId: "union-viewer" }],
+      });
+      await harness.gateway.receive(messageFrom(
+        "viewer", "claude", "/topic use topic-1", "session-view-use-topic",
+      ));
+      await expect(harness.gateway.receive(messageFrom(
+        "viewer", "claude", "/session list", "session-view-list",
+      ))).resolves.toEqual({ duplicate: false });
+      await expect(harness.gateway.receive(messageFrom(
+        "viewer", "claude", "/session use Readable", "session-view-use",
+      ))).resolves.toEqual({ duplicate: false });
+
+      for (const [index, text] of [
+        "/session new Blocked",
+        "/session rename Blocked",
+        "/session archive",
+        "viewer cannot invoke the agent",
+      ].entries()) {
+        await expect(harness.gateway.receive(messageFrom(
+          "viewer", "claude", text, `session-view-blocked-${index}`,
+        ))).rejects.toThrow(/not allowed/i);
+      }
+      expect(harness.store.listDirectSessions("topic-1", "claude")).toHaveLength(1);
+      expect(harness.dispatches).toEqual([]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it("replays Session creation idempotently after a response crash", async () => {
+    const { path } = temporaryDatabase();
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    let failSessionResponse = false;
+    let nextId = 0;
+    const gateway = new FeishuGateway({
+      store,
+      outbox: {
+        enqueue: (input) => {
+          const inserted = outbox.enqueue(input);
+          if (failSessionResponse) {
+            failSessionResponse = false;
+            throw new Error("crash after Session response");
+          }
+          return inserted;
+        },
+      },
+      dispatcher: { dispatch: async () => {} },
+      idFactory: () => `id-${++nextId}`,
+    });
+    try {
+      await gateway.receive(message("hub", "/topic new Durable Session", "durable-session-topic"));
+      failSessionResponse = true;
+      const event = message("claude", "/session new Durable", "durable-session-new");
+      await expect(gateway.receive(event)).rejects.toThrow("crash after Session response");
+      await expect(gateway.receive(event)).resolves.toEqual({ duplicate: false });
+      await expect(gateway.receive(event)).resolves.toEqual({ duplicate: true });
+      expect(store.listDirectSessions("id-1", "claude")).toHaveLength(1);
+
+      failSessionResponse = true;
+      const archive = message("claude", "/session archive", "durable-session-archive");
+      await expect(gateway.receive(archive)).rejects.toThrow("crash after Session response");
+      await expect(gateway.receive(archive)).resolves.toEqual({ duplicate: false });
+      await expect(gateway.receive(archive)).resolves.toEqual({ duplicate: true });
+      expect(store.listDirectSessions("id-1", "claude")).toEqual([
+        expect.objectContaining({ title: "Durable", status: "archived" }),
+      ]);
+    } finally {
+      store.close();
+      outbox.close();
+    }
   });
 
   it.each(["claude", "codex", "copilot"] as const)(

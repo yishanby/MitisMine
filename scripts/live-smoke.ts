@@ -107,8 +107,10 @@ export function runLiveSmokeAudit(
 
     const directSessions = database
       .prepare(`
-        SELECT provider, external_session_id FROM agent_sessions
-        WHERE topic_id = ? AND role = 'direct' ORDER BY provider
+        SELECT provider, MAX(external_session_id) AS external_session_id
+        FROM direct_sessions
+        WHERE topic_id = ? AND external_session_id IS NOT NULL
+        GROUP BY provider ORDER BY provider
       `)
       .all(topic.id) as unknown as SessionRow[];
     if (

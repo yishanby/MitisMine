@@ -73,7 +73,8 @@ const db = new DatabaseSync(process.env.MITISMINE_DB_PATH ?? "data/mitismine.db"
 const rows = db.prepare(`SELECT json_extract(e.payload_json,'$.appRole') appRole,
  e.actor_principal_id principal, t.tenant_key tenantKey, MAX(e.seq) seq
  FROM topic_events e JOIN topics t ON t.id=e.topic_id
- WHERE e.type='message.added' GROUP BY appRole,principal,tenantKey ORDER BY appRole,seq DESC`).all();
+ WHERE e.type IN ('message.added','agent.direct.message')
+ GROUP BY appRole,principal,tenantKey ORDER BY appRole,seq DESC`).all();
 const roles = ["hub","claude","codex","copilot"];
 const observations = roles.map(appRole => {
   const r = rows.find(x => x.appRole === appRole); if (!r) throw new Error(`missing ${appRole}`);
@@ -211,6 +212,33 @@ Use `/status`, `/report`, and `/stop`. A stop aborts queued/active calls, kills
 their process trees, requeues their leases, and persists `cancelled` with
 terminal-state precedence.
 
+### Standalone Agent Sessions
+
+In the Claude, Codex, or Copilot App, ordinary text goes to that provider's
+current Session. Each Topic may contain multiple Sessions per provider:
+
+```text
+/session new <title>
+/session list
+/session use <short-ID-or-unique-title>
+/session resume <short-ID-or-unique-title>
+/session show
+/session rename <title>
+/session archive
+```
+
+The external CLI Session is created lazily on the first ordinary message and
+resumed thereafter. With no selection, that message creates `main`. The current
+selection is saved per user, Topic, and provider; switching Topics or Apps does
+not overwrite the other cursors. Shared Topic notes remain in every Context
+Pack, but direct conversation events from other Sessions are filtered out.
+Calls in one Session are serialized; different Sessions can execute in
+parallel. Titles are case-insensitively unique within a Topic/provider.
+
+Owners and editors may perform all operations. Viewers may list, show, and
+select Sessions for inspection, but cannot create, rename, archive, or invoke
+an Agent. Session commands sent to Hub return guidance instead of mutating data.
+
 ## 6. Approvals
 
 `/action write <relative-path> <content>` creates a medium-risk approval whose
@@ -257,7 +285,10 @@ approval result and non-database target files may describe different moments.
 - Duplicate/retried Feishu events use a durable inbox plus deterministic Topic,
   message, Run, history, and Outbox effect keys.
 - Service restart resets inbox `processing` to `pending`, approval `executing`
-  to `pending`, and expired Worker leases to `queued`.
+  to `pending`, interrupted direct Sessions from `running` to `active`, and
+  expired Worker leases to `queued`.
+- Legacy `agent_sessions` rows with role `direct` are migrated idempotently to
+  a `main` direct Session while retaining the external Session ID and watermark.
 - Provider failure gets one report-repair attempt; two providers may complete a
   degraded Run, while fewer than two pauses it.
 - Outbox retries with exponential backoff to 60 seconds and sends a stable
@@ -282,12 +313,17 @@ In Feishu, use these exact inputs when creating fresh audit evidence:
 
 1. In Hub, send `/topic new Live smoke`.
 2. In Hub, send `/research Verify RFC 2606 reserved DNS names using RFC Editor, IETF, and IANA primary sources.` and wait for the final report.
-3. Send `Continue this Topic and summarize your strongest RFC 2606 evidence.` as ordinary text once to each of the Claude, Codex, and Copilot Apps. This creates all three direct sessions.
-4. Stop Terminal A with Ctrl+C, start it again with `pnpm start`, wait for
+3. In each provider App, send `/session new RFC evidence`, followed by
+   `Continue this Topic and summarize your strongest RFC 2606 evidence.`. This
+   creates three independent external Sessions.
+4. In Claude, additionally create `/session new Counterarguments`, send one
+   ordinary message, switch back with `/session use RFC evidence`, and verify
+   `/session show` reports the first Session.
+5. Stop Terminal A with Ctrl+C, start it again with `pnpm start`, wait for
    `/ready` HTTP 200, then send `Resume this Topic after restart.` once to each
-   provider App. This proves the same direct sessions resume.
-5. In Hub, send `/status` and `/report`.
-6. In Hub, send `/action write smoke/approved.txt approved-by-feishu`. Verify
+   provider App. This proves the selected Sessions and external IDs resume.
+6. In Hub, send `/status` and `/report`.
+7. In Hub, send `/action write smoke/approved.txt approved-by-feishu`. Verify
    the file did not appear before approval, click **Approve**, then click the
    same approval button again to exercise idempotency.
 
@@ -331,9 +367,10 @@ and tests pass.
 - The normalized `claims`, `evidence`, and `critiques` tables are reserved;
   current durable report/ledger content is checkpoint JSON. Context Packs carry
   Topic metadata/history/watermark but not a separate Artifact index.
-- Direct provider calls are read-only and their local completion effects are
-  idempotent, but a crash during an external direct turn may require the user to
-  resend it.
+- Direct provider calls are read-only; Session metadata, cursor, external ID,
+  and event effects are durable. A crash during an external CLI turn may still
+  require the user to resend that final message because provider-side commit
+  state cannot be atomically committed with SQLite.
 - The Worker transport is local only. Remote Workers, leader election, and
   multi-control-plane high availability are not shipped.
 - Provider CLIs use the service OS account's persistent credential stores; use

@@ -81,6 +81,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
     readonly controller: AbortController;
     readonly runId?: string;
   }>();
+  readonly #directQueues = new Map<string, Promise<void>>();
   #shuttingDown = false;
 
   constructor(options: {
@@ -110,7 +111,9 @@ export class ChannelDispatcher implements FeishuDispatcher {
       "accepted",
     );
     const controller = new AbortController();
-    const handling = this.#handle(input, controller.signal);
+    const handling = input.mode === "direct"
+      ? this.#serializeDirect(input.directSessionId, () => this.#handle(input, controller.signal))
+      : this.#handle(input, controller.signal);
     this.#pending.set(handling, {
       controller,
       ...(input.mode === "research"
@@ -181,35 +184,59 @@ export class ChannelDispatcher implements FeishuDispatcher {
     }
     if (input.mode === "direct") {
       const adapter = this.#adapters[input.provider];
-      const previous = this.#store.agentSession(input.topicId, input.provider, "direct");
-      const task = {
-        topicId: input.topicId,
-        runId: `direct-${ulid()}`,
-        prompt: directResearchPrompt(input.question, this.#contextPack(input.topicId)),
-        cwd: this.#workspace(input.topicId),
-        signal,
-      };
-      const result = previous?.externalSessionId === undefined
-        ? await adapter.start(task)
-        : await adapter.resume({ ...task, externalSessionId: previous.externalSessionId });
-      const text = finalText(result.events);
-      this.#store.upsertAgentSession({
-        id: previous?.id ?? `direct:${input.topicId}:${input.provider}`,
-        topicId: input.topicId,
-        provider: input.provider,
-        role: "direct",
-        externalSessionId: result.externalSessionId,
-        contextWatermark: this.#store.topic(input.topicId)?.lastEventSeq ?? 0,
-        status: "active",
-      });
-      this.#store.append({
-        topicId: input.topicId,
-        type: "agent.direct.completed",
-        actorPrincipalId: input.principalId,
-        payload: { provider: input.provider, externalSessionId: result.externalSessionId, text },
-        idempotencyKey: `${input.idempotencyKey}:direct-completed`,
-      });
-      this.#enqueue(input, `${input.provider} 回复`, text);
+      const session = this.#store.directSession(input.directSessionId);
+      if (
+        session === undefined
+        || session.topicId !== input.topicId
+        || session.provider !== input.provider
+        || session.status === "archived"
+      ) {
+        throw new Error("Direct Session does not belong to this Topic and provider");
+      }
+      if (signal.aborted) throw signal.reason ?? new Error("Direct turn aborted");
+      this.#store.updateDirectSession(session.id, { status: "running" });
+      try {
+        const task = {
+          topicId: input.topicId,
+          runId: `direct-${ulid()}`,
+          prompt: directResearchPrompt(
+            input.question,
+            this.#contextPack(input.topicId, input.directSessionId),
+          ),
+          cwd: this.#workspace(input.topicId),
+          signal,
+        };
+        const result = session.externalSessionId === undefined
+          ? await adapter.start(task)
+          : await adapter.resume({ ...task, externalSessionId: session.externalSessionId });
+        const text = finalText(result.events);
+        const contextWatermark = this.#store.topic(input.topicId)?.lastEventSeq ?? 0;
+        const latest = this.#store.directSession(session.id);
+        this.#store.updateDirectSession(session.id, {
+          externalSessionId: result.externalSessionId,
+          contextWatermark,
+          status: latest?.status === "archived" ? "archived" : "active",
+        });
+        this.#store.append({
+          topicId: input.topicId,
+          type: "agent.direct.completed",
+          actorPrincipalId: input.principalId,
+          payload: {
+            provider: input.provider,
+            directSessionId: input.directSessionId,
+            externalSessionId: result.externalSessionId,
+            text,
+          },
+          idempotencyKey: `${input.idempotencyKey}:direct-completed`,
+        });
+        this.#enqueue(input, `${input.provider} 回复`, text);
+      } catch (error) {
+        const current = this.#store.directSession(session.id);
+        if (current !== undefined && current.status !== "archived") {
+          this.#store.updateDirectSession(session.id, { status: "active" });
+        }
+        throw error;
+      }
       return;
     }
     if (input.mode === "action") {
@@ -262,10 +289,17 @@ export class ChannelDispatcher implements FeishuDispatcher {
     return workspace;
   }
 
-  #contextPack(topicId: string): string {
+  #contextPack(topicId: string, directSessionId?: string): string {
     const topic = this.#store.topic(topicId);
     if (topic === undefined) throw new Error(`Topic not found: ${topicId}`);
-    const events = this.#store.events(topicId).map((event) => {
+    const events = this.#store.events(topicId).filter((event) => {
+      if (!event.type.startsWith("agent.direct.")) return true;
+      if (directSessionId === undefined) return true;
+      const payload = typeof event.payload === "object" && event.payload !== null
+        ? event.payload as Record<string, unknown>
+        : {};
+      return payload.directSessionId === directSessionId;
+    }).map((event) => {
       const payload = typeof event.payload === "object" && event.payload !== null
         ? event.payload as Record<string, unknown>
         : {};
@@ -296,6 +330,16 @@ export class ChannelDispatcher implements FeishuDispatcher {
       evidence: [],
       watermark: topic.lastEventSeq,
     }).serialized;
+  }
+
+  #serializeDirect(sessionId: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.#directQueues.get(sessionId) ?? Promise.resolve();
+    const handling = previous.catch(() => {}).then(task);
+    this.#directQueues.set(sessionId, handling);
+    void handling.finally(() => {
+      if (this.#directQueues.get(sessionId) === handling) this.#directQueues.delete(sessionId);
+    }).catch(() => {});
+    return handling;
   }
 
   #enqueue(input: DispatchInput, title: string, content: string, effect = "result"): void {
