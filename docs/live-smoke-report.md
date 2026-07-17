@@ -1,7 +1,14 @@
 # MitisMine live four-App smoke report
 
-Date: 2026-07-17 (Asia/Shanghai)  
-Environment: Windows, Node 24, Feishu long connection, local SQLite WAL worker
+Date: 2026-07-17; preflight recheck 2026-07-18 (Asia/Shanghai)
+Environment: Windows, Node 24.12.0, Feishu persistent connection, local SQLite WAL Worker
+
+CLI versions at final recheck:
+
+- Claude Code `2.1.212`
+- Codex CLI `0.143.0`
+- GitHub Copilot CLI `1.0.72-0`
+- pnpm `11.9.0`
 
 ## Identities
 
@@ -23,9 +30,10 @@ No App Secret, token, Cookie, or authorization value is included in this report.
 | Check | Evidence | Result |
 |---|---|---|
 | Four long connections | Four SDK `client ready` events; `/ready` returned store=true, apps=4, workers=1 | Pass |
+| Identity preflight | Four persisted App observations resolved to one stable principal before startup side effects | Pass |
 | Topic over Feishu | `/topic new Live smoke`; Topic ID persisted and reply card visible | Pass |
 | Three-provider research | Claude, Codex, Copilot reports present; no degraded provider | Pass |
-| Cross-review | 18 directed reviews over three rounds; 31 started and completed provider calls | Pass |
+| Cross-review | 18 directed cross-reviews over three rounds; signoff reviews are counted separately by the current audit; 31 started and completed provider calls | Pass |
 | Evidence report | 4 claims, 5 evidence items; important coverage 2/2 | Pass |
 | Primary sources | RFC Editor HTML/TXT, IETF Datatracker, and IANA URLs with SHA-256 evidence hashes | Pass |
 | Explicit disagreement | Run completed at round 3 with `unresolved=true`; report card says unresolved disputes remain | Pass |
@@ -35,6 +43,7 @@ No App Secret, token, Cookie, or authorization value is included in this report.
 | Approval before write | Smoke target absent before approval; approval row was pending | Pass |
 | Approval idempotency | First click created one 18-byte file; second click left the same mtime and stored result | Pass |
 | Secret isolation | `.env.local` ignored; tracked-secret scan clean; child environment tests pass | Pass |
+| Worker lease execution | Deterministic task IDs, heartbeat, terminal state, and expired same-task resume verified automatically | Pass |
 
 ## Redacted excerpts
 
@@ -43,7 +52,7 @@ status=200 ready=True apps=4 workers=1
 ```
 
 ```text
-state=completed round=3 reviews=18 reports=[claude,codex,copilot]
+state=completed round=3 reviews=18 crossReviews=18 reports=[claude,codex,copilot]
 claims=4 evidence=5 importantCovered=2/2 unresolved=true
 ```
 
@@ -62,8 +71,38 @@ file_exists=true content_matches=true
 
 ## Reproduction
 
+The commands below audit the already-recorded Topic/Run. They do not create
+Feishu messages, run a new research workflow, or click an approval card. Perform
+the interaction sequence in the operator guide first when creating fresh evidence.
+
+Terminal A:
+
 ```powershell
 pnpm build
 pnpm start
-pnpm exec tsx scripts/live-smoke.ts
 ```
+
+Terminal B:
+
+```powershell
+pnpm smoke:live
+```
+
+For fresh evidence, the exact Feishu inputs are `/topic new Live smoke`, a
+`/research` question containing `RFC 2606`, ordinary follow-ups in all three
+provider Apps before and after restart, and
+`/action write smoke/approved.txt approved-by-feishu` followed by two clicks on
+the same approval button. Section 10 of the operator guide is the copyable
+sequence.
+
+Real provider start+resume is separate and quota-consuming:
+
+```powershell
+$env:MITISMINE_LIVE_CLI="1"
+pnpm exec vitest run tests/live/cli-smoke.test.ts
+Remove-Item Env:MITISMINE_LIVE_CLI
+```
+
+At the final recheck Claude and Copilot passed. Codex accepted its strict
+permission profile but the service account's stored API-key login returned 401;
+reauthenticate with `codex login` before treating a fresh 3/3 run as current.

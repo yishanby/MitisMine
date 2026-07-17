@@ -1,0 +1,168 @@
+# MitisMine
+
+MitisMine turns four Feishu bots into one persistent research workspace. A
+question sent to the Hub is researched independently by Claude Code, Codex, and
+GitHub Copilot CLI, cross-reviewed, resolved for at most three rounds, and
+returned as an evidence-backed report. Each provider bot can also continue its
+own durable Topic session.
+
+## Implemented
+
+- Four Feishu Apps over SDK persistent connections: Hub, Claude, Codex, Copilot.
+- Shared Topic lifecycle, owner/editor/viewer authorization, global user cursor,
+  bounded Context Packs, full immutable history, and cross-Run provider sessions.
+- Three-provider fan-out, up to two isolated child sessions per provider,
+  all-pairs review, dispute repair, signoff, rotating synthesis, and explicit
+  unresolved status after round three.
+- SQLite WAL checkpoints, durable inbox/effect keys, Outbox, approval state,
+  Agent sessions, and local Worker leases with heartbeat and restart requeue.
+- AbortSignal propagation, bounded/redacted JSONL, process-tree termination,
+  repository-external Topic workspaces, and provider-specific tool restrictions.
+- HMAC approval cards with principal/Topic/action binding, crash recovery, and
+  idempotent trusted writes.
+
+This release uses one control-plane process and one in-process local Worker. The
+Worker executes through the same lease port intended for a later remote
+transport; a remote listener and multi-control-plane leader election are not
+included.
+
+## Prerequisites
+
+- Node.js 24+ and pnpm 11.9+
+- Claude Code, Codex CLI, and GitHub Copilot CLI installed and persistently authenticated
+- Four published Feishu custom Apps installed in the same tenant
+
+Versions used for the final verification:
+
+- Claude Code `2.1.212`
+- Codex CLI `0.143.0`
+- GitHub Copilot CLI `1.0.72-0`
+- Node.js `24.12.0`; pnpm `11.9.0`
+
+### Configure every Feishu App
+
+For each of the four Apps:
+
+1. Enable the **Bot** feature.
+2. Add `im:message:send_as_bot`.
+3. Add `im:message.p2p_msg:readonly`; for group use also add
+   `im:message.group_at_msg:readonly`. The deployed Apps additionally have
+   `im:message.group_at_msg.include_bot:readonly` and `im:message:readonly`.
+4. Under **Events & Callbacks**, select **persistent connection**, add event
+   `im.message.receive_v1`, and add callback `card.action.trigger`.
+5. Create and publish a version, obtain tenant-admin approval, then install the
+   bot. Open a direct chat with each bot; in a group, add and @mention it.
+
+The callback is required for approval buttons. Configure the four Apps
+identically; only their App IDs, Secrets, display names, and MitisMine roles differ.
+
+## Install and run
+
+```powershell
+pnpm install --frozen-lockfile
+Copy-Item .env.example .env.local
+```
+
+Before startup, replace every angle-bracket value. Generate a distinct approval
+key and capture one real event from the same test user in every App:
+
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+`MITISMINE_IDENTITY_PROBES_JSON` must contain exactly `hub`, `claude`, `codex`,
+and `copilot`, with the real `tenantKey` plus exactly one `userId` or `unionId`
+from each App's event. Startup rejects missing, placeholder, duplicate, or
+mismatched observations. Before filling that variable, run the bootstrap probe
+and send one message from the same user to each bot:
+
+```powershell
+pnpm identity:probe
+```
+
+Copy its single standard-output line into `.env.local`. The probe never prints
+App Secrets; progress appears on standard error. See
+[the operator guide](docs/operator-guide.md) for the full first-install and
+existing-database procedures.
+
+```powershell
+pnpm build
+pnpm start
+```
+
+Readiness:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4317/ready
+```
+
+HTTP 200 requires SQLite, four connected Apps, verified identity observations,
+and one healthy Worker.
+
+## Commands and routing
+
+Topic/read/control commands are handled by the Hub App. Ordinary Hub text and
+`/research` run all three providers. Ordinary text sent to a provider App only
+continues that provider's direct Topic session.
+
+| Command | App | Purpose |
+|---|---|---|
+| `/topic new <title>` | Hub | Create and select a Topic |
+| `/topic list` | Hub | List accessible Topics |
+| `/topic use <prefix>` | Any | Select the one accessible Topic whose ID has that unambiguous prefix |
+| `/topic show` | Any | Show current Topic and watermark |
+| `/topic share @user <editor\|viewer>` | Hub | Share using a Feishu @mention |
+| `/topic archive` | Hub | Archive without deleting history |
+| `/note <text>` | Hub | Add Context Pack history without starting agents |
+| `/research <question>` | Hub | Run the complete three-provider workflow |
+| `/status`, `/report` | Any | Read latest Run/report |
+| `/stop` | Hub | Cancel the active Run and process trees |
+| `/action write <relative-path> <content>` | Hub | Create an approval card for a trusted write |
+
+`/topic use` has no fixed prefix length; zero or multiple matches are rejected.
+For automation, `/topic share` also accepts the canonical
+`tenant:user:<user_id>` or `tenant:union:<union_id>`, but an @mention is safer.
+Viewers may read Topic/report state but cannot mutate, start/stop Runs, or
+request actions.
+
+## Verify
+
+```powershell
+pnpm lint
+pnpm typecheck
+pnpm test --run
+pnpm build
+```
+
+Real CLI start+resume tests consume provider quota:
+
+```powershell
+$env:MITISMINE_LIVE_CLI = "1"
+pnpm exec vitest run tests/live/cli-smoke.test.ts
+Remove-Item Env:MITISMINE_LIVE_CLI
+```
+
+With the service running in another terminal, audit the recorded four-App flow.
+This command loads `.env.local` and honors independent DB/Data paths:
+
+```powershell
+pnpm smoke:live
+pnpm scan:secrets
+```
+
+The script audits existing live data; it does not send Feishu messages or click
+approval cards.
+
+## Security boundary
+
+Feishu App Secrets stay in the control plane. Children receive neither Feishu
+Secrets nor raw provider API/OAuth token environment variables. Claude and
+Copilot use explicit research-tool lists; Codex uses its current workspace
+permission profile with `.env` reads denied. Topic workspaces are outside the
+repository, stderr is redacted, and cancellation kills process trees.
+
+Provider CLIs still run under the service OS account and use that account's
+persisted login. Treat the host account as trusted and isolate it at the OS or
+container layer for hostile workloads. See [operator-guide.md](docs/operator-guide.md)
+for Secret Manager startup, backup/recovery, and known boundaries, and
+[completion-audit.md](docs/completion-audit.md) for acceptance evidence.
