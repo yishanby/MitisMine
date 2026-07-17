@@ -41,11 +41,74 @@ export class FeishuAppRegistry {
   }
 }
 
+export function identityProbeRegistrationsFromEnv(
+  env: Record<string, string | undefined>,
+): AppRegistration[] {
+  const required = (name: string): string => {
+    const value = env[name]?.trim();
+    if (!value) throw new Error(`${name} is required for identity bootstrap`);
+    return value;
+  };
+  const registry = new FeishuAppRegistry([
+    { role: "hub", appId: required("FEISHU_HUB_APP_ID"), appSecret: required("FEISHU_HUB_APP_SECRET") },
+    { role: "claude", appId: required("FEISHU_CLAUDE_APP_ID"), appSecret: required("FEISHU_CLAUDE_APP_SECRET") },
+    { role: "codex", appId: required("FEISHU_CODEX_APP_ID"), appSecret: required("FEISHU_CODEX_APP_SECRET") },
+    { role: "copilot", appId: required("FEISHU_COPILOT_APP_ID"), appSecret: required("FEISHU_COPILOT_APP_SECRET") },
+  ]);
+  return APP_ROLES.map((role) => registry.get(role));
+}
+
 export interface IdentityProbe {
   readonly appRole: AppRole;
   readonly tenantKey: string;
   readonly userId?: string;
   readonly unionId?: string;
+}
+
+export interface IdentityProbeDocument {
+  readonly observations: readonly IdentityProbe[];
+}
+
+export class IdentityProbeCollector {
+  readonly #observations = new Map<AppRole, IdentityProbe>();
+
+  observe(input: IdentityProbe): void {
+    const observation: IdentityProbe = input.unionId === undefined
+      ? {
+          appRole: input.appRole,
+          tenantKey: input.tenantKey,
+          ...(input.userId === undefined ? {} : { userId: input.userId }),
+        }
+      : {
+          appRole: input.appRole,
+          tenantKey: input.tenantKey,
+          unionId: input.unionId,
+        };
+    resolvePrincipal(observation);
+    const previous = this.#observations.get(input.appRole);
+    if (previous !== undefined) {
+      if (JSON.stringify(previous) !== JSON.stringify(observation)) {
+        throw new Error(`Identity probe changed for App role: ${input.appRole}`);
+      }
+      return;
+    }
+    this.#observations.set(input.appRole, observation);
+  }
+
+  get complete(): boolean {
+    return APP_ROLES.every((role) => this.#observations.has(role));
+  }
+
+  get count(): number {
+    return this.#observations.size;
+  }
+
+  document(): IdentityProbeDocument {
+    if (!this.complete) throw new Error("Identity probe collection is incomplete");
+    const observations = APP_ROLES.map((role) => this.#observations.get(role) as IdentityProbe);
+    verifyCrossAppIdentity(observations);
+    return { observations };
+  }
 }
 
 export function verifyCrossAppIdentity(probes: readonly IdentityProbe[]): string {

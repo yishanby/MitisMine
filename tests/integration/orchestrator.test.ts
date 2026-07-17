@@ -513,6 +513,60 @@ describe("ResearchOrchestrator", () => {
     ));
   });
 
+  it("coalesces recovery with an already-running Run", async () => {
+    const store = new MemoryOrchestrationStore();
+    let startedCount = 0;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const calls: Parameters<typeof fakeAdapters>[0] = [];
+    const baseAdapters = fakeAdapters(calls, { active: 0, maximum: 0 });
+    const waiting = (provider: ProviderName): AgentAdapter => {
+      const invoke = async (
+        task: AgentTask | ResumeAgentTask,
+        method: "start" | "resume",
+      ): Promise<AdapterResult> => {
+        if (phaseOf(task.prompt) === "independent_research") {
+          startedCount += 1;
+          if (startedCount === providers.length) markStarted?.();
+          await blocked;
+        }
+        return baseAdapters[provider][method](task as never);
+      };
+      return {
+        provider,
+        start: (task) => invoke(task, "start"),
+        resume: (task) => invoke(task, "resume"),
+      };
+    };
+    const orchestrator = new ResearchOrchestrator({
+      store,
+      adapters: {
+        claude: waiting("claude"),
+        codex: waiting("codex"),
+        copilot: waiting("copilot"),
+      },
+      worker: new LocalWorkerTaskExecutor({ leases: new RecordingLeasePort() }),
+    });
+
+    const running = orchestrator.start({
+      runId: "run-coalesced",
+      topicId: "topic-coalesced",
+      question: "question",
+      cwd: process.cwd(),
+    });
+    await started;
+    const recovered = orchestrator.resume("run-coalesced");
+    await Promise.resolve();
+    expect(startedCount).toBe(3);
+
+    release?.();
+    const [first, second] = await Promise.all([running, recovered]);
+    expect(first).toEqual(second);
+    expect(first.run.state).toBe("completed");
+  });
+
   it("keeps cancellation terminal when providers ignore abort and return late", async () => {
     const store = new MemoryOrchestrationStore();
     let startedCount = 0;

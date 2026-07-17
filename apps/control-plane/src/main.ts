@@ -19,7 +19,10 @@ import {
   type FeishuDispatcher,
 } from "../../../packages/feishu/src/gateway.js";
 import { FeishuLongConnections } from "../../../packages/feishu/src/live.js";
-import { OutboxDispatcher } from "../../../packages/feishu/src/outbox-dispatcher.js";
+import {
+  OutboxDispatcher,
+  type OutboxSender,
+} from "../../../packages/feishu/src/outbox-dispatcher.js";
 import {
   APP_ROLES,
   FeishuAppRegistry,
@@ -36,6 +39,8 @@ import { DurableOutbox } from "../../../packages/storage/src/outbox.js";
 import { EventStore } from "../../../packages/storage/src/store.js";
 import { WorkerLeaseStore } from "../../worker/src/main.js";
 import { loadConfig, type Config } from "./config.js";
+import { RecoverySupervisor } from "./recovery.js";
+export { RecoverySupervisor } from "./recovery.js";
 
 import {
   AppConnectionRegistry,
@@ -58,7 +63,7 @@ export async function createService(deps: ServiceDependencies): Promise<ControlP
   app.addHook("onClose", async () => {
     if (shutDown) return;
     shutDown = true;
-    for (const stop of [...(deps.shutdown ?? [])].reverse()) await stop();
+    await runCleanups(deps.shutdown ?? []);
   });
   await app.ready();
   return app;
@@ -72,6 +77,11 @@ export class ChannelDispatcher implements FeishuDispatcher {
   readonly #adapters: AdapterRegistry;
   readonly #agentWorkspaceRoot: string;
   readonly #approval: Pick<ApprovalEngine, "request">;
+  readonly #pending = new Map<Promise<void>, {
+    readonly controller: AbortController;
+    readonly runId?: string;
+  }>();
+  #shuttingDown = false;
 
   constructor(options: {
     orchestrator: Pick<ResearchOrchestrator, "start" | "resume" | "cancel">;
@@ -92,13 +102,25 @@ export class ChannelDispatcher implements FeishuDispatcher {
   }
 
   async dispatch(input: DispatchInput): Promise<void> {
+    if (this.#shuttingDown) throw new Error("Channel dispatcher is shutting down");
     this.#enqueue(
       input,
       "已接收",
       input.mode === "control" ? input.action : "任务已进入队列",
       "accepted",
     );
-    const handling = this.#handle(input);
+    const controller = new AbortController();
+    const handling = this.#handle(input, controller.signal);
+    this.#pending.set(handling, {
+      controller,
+      ...(input.mode === "research"
+        ? { runId: `research:${input.idempotencyKey}` }
+        : {}),
+    });
+    void handling.then(
+      () => { this.#pending.delete(handling); },
+      () => { this.#pending.delete(handling); },
+    );
     if (
       input.mode === "research"
       && this.#checkpoints.load(`research:${input.idempotencyKey}`) === undefined
@@ -112,7 +134,20 @@ export class ChannelDispatcher implements FeishuDispatcher {
     });
   }
 
-  async #handle(input: DispatchInput): Promise<void> {
+  async shutdown(): Promise<void> {
+    this.#shuttingDown = true;
+    const pending = [...this.#pending.entries()];
+    for (const [, { controller }] of pending) {
+      controller.abort(new Error("Control plane is shutting down"));
+    }
+    const runIds = new Set(
+      pending.flatMap(([, entry]) => entry.runId === undefined ? [] : [entry.runId]),
+    );
+    await Promise.allSettled([...runIds].map(async (runId) => this.#orchestrator.cancel(runId)));
+    await Promise.allSettled(pending.map(([handling]) => handling));
+  }
+
+  async #handle(input: DispatchInput, signal: AbortSignal): Promise<void> {
     if (input.mode === "research") {
       const runId = `research:${input.idempotencyKey}`;
       const result = this.#checkpoints.load(runId) === undefined
@@ -152,6 +187,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
         runId: `direct-${ulid()}`,
         prompt: directResearchPrompt(input.question, this.#contextPack(input.topicId)),
         cwd: this.#workspace(input.topicId),
+        signal,
       };
       const result = previous?.externalSessionId === undefined
         ? await adapter.start(task)
@@ -285,6 +321,13 @@ export interface ControlPlaneRuntime {
 
 export interface ControlPlaneStartupOptions {
   readonly identityVerifier?: (observations: readonly IdentityProbe[]) => string;
+  readonly serviceFactory?: (deps: ServiceDependencies) => Promise<ControlPlaneService>;
+  readonly liveFactory?: (options: {
+    readonly registrations: readonly AppRegistration[];
+    readonly gateway: FeishuGateway;
+    readonly connections: AppConnectionRegistry;
+    readonly onCardAction: (role: AppRegistration["role"], data: unknown) => Promise<unknown>;
+  }) => OutboxSender & { ready(): Promise<void>; close(): void };
 }
 
 export async function startControlPlane(
@@ -296,78 +339,123 @@ export async function startControlPlane(
   );
   mkdirSync(config.MITISMINE_DATA_DIR, { recursive: true });
   mkdirSync(dirname(config.MITISMINE_DB_PATH), { recursive: true });
-  const store = EventStore.open(config.MITISMINE_DB_PATH);
-  const outbox = DurableOutbox.open(config.MITISMINE_DB_PATH);
-  const checkpoints = SqliteOrchestrationStore.open(config.MITISMINE_DB_PATH);
-  const approvals = SqliteApprovalStore.open(config.MITISMINE_DB_PATH);
-  const leases = WorkerLeaseStore.open(config.MITISMINE_DB_PATH);
-  leases.requeueExpired();
-  const apps = new AppConnectionRegistry();
-  const workers = new WorkerRegistry();
-  workers.connectPersistent("local");
-  const adapters = createAdapters(runJsonl);
-  const worker = new LocalWorkerTaskExecutor({ leases });
-  const orchestrator = new ResearchOrchestrator({
-    adapters,
-    store: checkpoints,
-    worker,
-    maxConcurrency: 6,
-  });
-  const trustedExecutor = new TrustedActionExecutor(resolve(config.MITISMINE_DATA_DIR, "approved-actions"));
-  const approval = new ApprovalEngine({
-    signingSecret: config.MITISMINE_APPROVAL_KEY,
-    store: approvals,
-    executor: (action, idempotencyKey) => trustedExecutor.execute(action, idempotencyKey),
-  });
-  const dispatcher = new ChannelDispatcher({
-    orchestrator,
-    checkpoints,
-    store,
-    outbox,
-    adapters,
-    agentWorkspaceRoot: config.MITISMINE_AGENT_WORKSPACE_ROOT,
-    approval,
-  });
-  const gateway = new FeishuGateway({ store, outbox, dispatcher, idFactory: ulid });
-  const registrations = registrationsFromConfig(config);
-  const live = new FeishuLongConnections({
-    registrations,
-    gateway,
-    connections: apps,
-    onCardAction: async (_role, raw) => handleApprovalCard(approval, raw),
-  });
-  const outboxDispatcher = new OutboxDispatcher({ outbox, sender: live });
-  let storeOpen = true;
-  const service = await createService({
-    storeHealthy: () => storeOpen,
-    apps,
-    workers,
-    shutdown: [
-      () => { store.close(); storeOpen = false; },
-      () => checkpoints.close(),
-      () => approvals.close(),
-      () => leases.close(),
-      () => outbox.close(),
-      () => live.close(),
-      () => outboxDispatcher.stop(),
-    ],
-  });
-  await service.listen({ host: config.MITISMINE_HTTP_HOST, port: config.MITISMINE_HTTP_PORT });
-  await live.ready();
-  outboxDispatcher.start();
-  for (const runId of checkpoints.nonTerminalRunIds()) {
-    void orchestrator.resume(runId).catch(() => undefined);
+  const shutdown: Array<() => Promise<void> | void> = [];
+  let service: ControlPlaneService | undefined;
+  try {
+    const store = EventStore.open(config.MITISMINE_DB_PATH);
+    let storeOpen = true;
+    shutdown.push(() => { storeOpen = false; store.close(); });
+    const outbox = DurableOutbox.open(config.MITISMINE_DB_PATH);
+    shutdown.push(() => outbox.close());
+    const checkpoints = SqliteOrchestrationStore.open(config.MITISMINE_DB_PATH);
+    shutdown.push(() => checkpoints.close());
+    const approvals = SqliteApprovalStore.open(config.MITISMINE_DB_PATH);
+    shutdown.push(() => approvals.close());
+    const leases = WorkerLeaseStore.open(config.MITISMINE_DB_PATH);
+    shutdown.push(() => leases.close());
+    leases.requeueExpired();
+
+    const apps = new AppConnectionRegistry();
+    const workers = new WorkerRegistry();
+    workers.connectPersistent("local");
+    const adapters = createAdapters(runJsonl);
+    const worker = new LocalWorkerTaskExecutor({ leases });
+    const orchestrator = new ResearchOrchestrator({
+      adapters,
+      store: checkpoints,
+      worker,
+      maxConcurrency: 6,
+    });
+    const recovery = new RecoverySupervisor({ leases, checkpoints, orchestrator });
+    shutdown.push(() => recovery.stop());
+    const trustedExecutor = new TrustedActionExecutor(resolve(config.MITISMINE_DATA_DIR, "approved-actions"));
+    const approval = new ApprovalEngine({
+      signingSecret: config.MITISMINE_APPROVAL_KEY,
+      store: approvals,
+      executor: (action, idempotencyKey) => trustedExecutor.execute(action, idempotencyKey),
+    });
+    shutdown.push(() => dispatcher.shutdown());
+    const dispatcher = new ChannelDispatcher({
+      orchestrator,
+      checkpoints,
+      store,
+      outbox,
+      adapters,
+      agentWorkspaceRoot: config.MITISMINE_AGENT_WORKSPACE_ROOT,
+      approval,
+    });
+    const gateway = new FeishuGateway({ store, outbox, dispatcher, idFactory: ulid });
+    const registrations = registrationsFromConfig(config);
+    const live = (options.liveFactory ?? ((input) => new FeishuLongConnections(input)))({
+      registrations,
+      gateway,
+      connections: apps,
+      onCardAction: async (_role, raw) => handleApprovalCard(approval, raw),
+    });
+    shutdown.push(() => live.close());
+    const outboxDispatcher = new OutboxDispatcher({ outbox, sender: live });
+    shutdown.push(() => outboxDispatcher.stop());
+
+    service = await (options.serviceFactory ?? createService)({
+      storeHealthy: () => storeOpen,
+      apps,
+      workers,
+      shutdown,
+    });
+    outboxDispatcher.start();
+    recovery.start();
+    void recovery.runOnce();
+    await service.listen({ host: config.MITISMINE_HTTP_HOST, port: config.MITISMINE_HTTP_PORT });
+    await live.ready();
+    return { service, close: () => service?.close() ?? Promise.resolve() };
+  } catch (startupError) {
+    try {
+      if (service === undefined) await runCleanups(shutdown);
+      else await service.close();
+    } catch (cleanupError) {
+      throw new AggregateError([startupError, cleanupError], "Control plane startup and cleanup failed");
+    }
+    throw startupError;
   }
-  return { service, close: () => service.close() };
+}
+
+async function runCleanups(
+  shutdown: readonly (() => Promise<void> | void)[],
+): Promise<void> {
+  const errors: unknown[] = [];
+  for (const stop of [...shutdown].reverse()) {
+    try {
+      await stop();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "Multiple control plane cleanups failed");
 }
 
 async function main(): Promise<void> {
   const runtime = await startControlPlane(loadConfig(process.env));
   const shutdown = (): void => {
-    void runtime.close().finally(() => process.exit(0));
+    void shutdownControlPlane(runtime);
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+}
+
+export async function shutdownControlPlane(
+  runtime: ControlPlaneRuntime,
+  exit: (code: number) => void = (code) => process.exit(code),
+  reportError: (message: string) => void = (message) => console.error(message),
+): Promise<void> {
+  try {
+    await runtime.close();
+    exit(0);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown cleanup failure";
+    reportError(`Control plane shutdown failed: ${message}`);
+    exit(1);
+  }
 }
 
 export function registrationsFromConfig(config: Config): AppRegistration[] {

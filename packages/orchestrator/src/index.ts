@@ -149,6 +149,7 @@ export class ResearchOrchestrator {
   readonly #worker: WorkerTaskExecutorPort;
   readonly #semaphore: Semaphore;
   readonly #controllers = new Map<string, AbortController>();
+  readonly #executions = new Map<string, Promise<ResearchResult>>();
   readonly #cancelled = new Set<string>();
 
   constructor(options: OrchestratorOptions) {
@@ -206,6 +207,20 @@ export class ResearchOrchestrator {
   }
 
   async #run(checkpoint: OrchestrationCheckpoint): Promise<ResearchResult> {
+    const existing = this.#executions.get(checkpoint.run.id);
+    if (existing !== undefined) return existing;
+    const execution = this.#runOwned(checkpoint);
+    this.#executions.set(checkpoint.run.id, execution);
+    try {
+      return await execution;
+    } finally {
+      if (this.#executions.get(checkpoint.run.id) === execution) {
+        this.#executions.delete(checkpoint.run.id);
+      }
+    }
+  }
+
+  async #runOwned(checkpoint: OrchestrationCheckpoint): Promise<ResearchResult> {
     const controller = new AbortController();
     this.#controllers.set(checkpoint.run.id, controller);
     try {
@@ -495,7 +510,7 @@ export class ResearchOrchestrator {
       const result = await this.#semaphore.run(() => this.#worker.execute({
         taskId,
         ...(activeSignal === undefined ? {} : { signal: activeSignal }),
-        operation: () => {
+        operation: (workerSignal) => {
         const externalSessionId = subtaskId === undefined
           ? checkpoint.sessions[provider]
           : checkpoint.subtaskSessions?.[provider]?.[subtaskId];
@@ -504,7 +519,7 @@ export class ResearchOrchestrator {
           runId: checkpoint.run.id,
           prompt,
           cwd: checkpoint.cwd,
-          ...(activeSignal === undefined ? {} : { signal: activeSignal }),
+          signal: workerSignal,
         };
         return externalSessionId === undefined
           ? this.#adapters[provider].start(task)

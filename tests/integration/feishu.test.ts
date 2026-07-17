@@ -121,6 +121,66 @@ describe("FeishuGateway", () => {
     harness.outbox.close();
   });
 
+  it.each(["claude", "codex", "copilot"] as const)(
+    "allows only read/navigation commands and ordinary direct messages in the %s App",
+    async (appRole) => {
+      const { path } = temporaryDatabase();
+      const harness = gatewayHarness(path);
+      try {
+        await harness.gateway.receive(message("hub", "/topic new Routing", `${appRole}-setup`));
+        await harness.gateway.receive(message(appRole, "/topic use topic-1", `${appRole}-use`));
+        await harness.gateway.receive(message(appRole, "/topic show", `${appRole}-show`));
+        await harness.gateway.receive(message(appRole, "/status", `${appRole}-status`));
+        await harness.gateway.receive(message(appRole, "/report", `${appRole}-report`));
+        await harness.gateway.receive(message(appRole, "continue directly", `${appRole}-direct`));
+
+        expect(harness.dispatches).toEqual([
+          expect.objectContaining({ mode: "control", action: "status", replyAppRole: appRole }),
+          expect.objectContaining({ mode: "control", action: "report", replyAppRole: appRole }),
+          expect.objectContaining({ mode: "direct", provider: appRole, replyAppRole: appRole }),
+        ]);
+      } finally {
+        harness.store.close();
+        harness.outbox.close();
+      }
+    },
+  );
+
+  it.each(["claude", "codex", "copilot"] as const)(
+    "blocks every Hub-only command in the %s App without mutating the Topic",
+    async (appRole) => {
+      const { path } = temporaryDatabase();
+      const harness = gatewayHarness(path);
+      try {
+        await harness.gateway.receive(message("hub", "/topic new Routing", `${appRole}-setup`));
+        const watermark = harness.store.topic("topic-1")?.lastEventSeq;
+        const forbidden = [
+          "/topic new Forbidden",
+          "/topic list",
+          "/topic share tenant-1:user:other editor",
+          "/topic archive",
+          "/note forbidden",
+          "/research forbidden",
+          "/stop",
+          "/action write forbidden.txt no",
+        ];
+        for (const [index, text] of forbidden.entries()) {
+          await expect(harness.gateway.receive(
+            message(appRole, text, `${appRole}-forbidden-${index}`),
+          )).resolves.toEqual({ duplicate: false });
+        }
+
+        expect(harness.store.listTopics("tenant-1", "tenant-1:user:user-1")).toHaveLength(1);
+        expect(harness.store.topic("topic-1")?.status).toBe("active");
+        expect(harness.store.topic("topic-1")?.lastEventSeq).toBe(watermark);
+        expect(harness.dispatches).toEqual([]);
+      } finally {
+        harness.store.close();
+        harness.outbox.close();
+      }
+    },
+  );
+
   it("routes ordinary hub messages to full research and persists before dispatch", async () => {
     const { path } = temporaryDatabase();
     const harness = gatewayHarness(path);
@@ -371,5 +431,69 @@ describe("cross-App identity verification", () => {
         { appRole: "copilot", tenantKey: "t", userId: "u" },
       ]),
     ).toThrow(/identity mismatch/i);
+  });
+
+  it("collects exactly one union identity observation from each App", async () => {
+    const module = await import("../../packages/feishu/src/registry.js") as Record<string, unknown>;
+    expect(typeof module.IdentityProbeCollector).toBe("function");
+    const IdentityProbeCollector = module.IdentityProbeCollector as new () => {
+      observe(input: {
+        appRole: "hub" | "claude" | "codex" | "copilot";
+        tenantKey: string;
+        userId?: string;
+        unionId?: string;
+      }): void;
+      readonly complete: boolean;
+      document(): {
+        observations: Array<{
+          appRole: string;
+          tenantKey: string;
+          userId?: string;
+          unionId?: string;
+        }>;
+      };
+    };
+    const collector = new IdentityProbeCollector();
+    for (const appRole of ["hub", "claude", "codex", "copilot"] as const) {
+      collector.observe({
+        appRole,
+        tenantKey: "tenant-1",
+        userId: "app-visible-user",
+        unionId: "on_same-user-across-apps",
+      });
+    }
+
+    expect(collector.complete).toBe(true);
+    expect(collector.document()).toEqual({
+      observations: ["hub", "claude", "codex", "copilot"].map((appRole) => ({
+        appRole,
+        tenantKey: "tenant-1",
+        unionId: "on_same-user-across-apps",
+      })),
+    });
+  });
+
+  it("builds bootstrap registrations without requiring existing identity observations", async () => {
+    const module = await import("../../packages/feishu/src/registry.js") as Record<string, unknown>;
+    expect(typeof module.identityProbeRegistrationsFromEnv).toBe("function");
+    const fromEnv = module.identityProbeRegistrationsFromEnv as (
+      env: Record<string, string | undefined>,
+    ) => Array<{ role: string; appId: string; appSecret: string }>;
+
+    expect(fromEnv({
+      FEISHU_HUB_APP_ID: "hub-id",
+      FEISHU_HUB_APP_SECRET: "hub-secret",
+      FEISHU_CLAUDE_APP_ID: "claude-id",
+      FEISHU_CLAUDE_APP_SECRET: "claude-secret",
+      FEISHU_CODEX_APP_ID: "codex-id",
+      FEISHU_CODEX_APP_SECRET: "codex-secret",
+      FEISHU_COPILOT_APP_ID: "copilot-id",
+      FEISHU_COPILOT_APP_SECRET: "copilot-secret",
+    }).map(({ role, appId }) => ({ role, appId }))).toEqual([
+      { role: "hub", appId: "hub-id" },
+      { role: "claude", appId: "claude-id" },
+      { role: "codex", appId: "codex-id" },
+      { role: "copilot", appId: "copilot-id" },
+    ]);
   });
 });

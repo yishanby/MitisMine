@@ -3,15 +3,18 @@ export type WorkerLeaseStatus = "queued" | "leased" | "completed" | "failed";
 export interface WorkerLeasePort {
   lease(taskId: string, workerId: string, now: Date, durationMs: number): void;
   heartbeat(taskId: string, workerId: string, now: Date, durationMs: number): void;
-  complete(taskId: string, workerId: string, now: Date): void;
+  complete(taskId: string, workerId: string, now: Date, result?: unknown): void;
   requeue(taskId: string, workerId: string, now: Date): void;
   fail(taskId: string, workerId: string, now: Date): void;
+  completedResult?(taskId: string):
+    | { readonly found: false }
+    | { readonly found: true; readonly result: unknown };
 }
 
 export interface WorkerTaskExecution<T> {
   readonly taskId: string;
   readonly signal?: AbortSignal;
-  readonly operation: () => Promise<T>;
+  readonly operation: (signal: AbortSignal) => Promise<T>;
 }
 
 export interface WorkerTaskExecutorPort {
@@ -69,44 +72,75 @@ export class LocalWorkerTaskExecutor implements WorkerTaskExecutorPort {
     if (!input.taskId.trim()) throw new Error("Worker task ID is required");
     const isAborted = (): boolean => input.signal?.aborted === true;
     if (isAborted()) throw cancellationError();
-    this.#leases.lease(
-      input.taskId,
-      this.#workerId,
-      this.#now(),
-      this.#leaseDurationMs,
-    );
-    let active = true;
-    const requeue = (): void => {
-      if (!active) return;
-      this.#leases.requeue(input.taskId, this.#workerId, this.#now());
-      active = false;
-    };
-    const onAbort = (): void => requeue();
-    input.signal?.addEventListener("abort", onAbort, { once: true });
-    const heartbeat = this.#scheduler.setInterval(() => {
-      if (!active) return;
-      this.#leases.heartbeat(
+    const cached = this.#leases.completedResult?.(input.taskId);
+    if (cached?.found === true) return cached.result as T;
+    try {
+      this.#leases.lease(
         input.taskId,
         this.#workerId,
         this.#now(),
         this.#leaseDurationMs,
       );
+    } catch (error) {
+      const racedResult = this.#leases.completedResult?.(input.taskId);
+      if (racedResult?.found === true) return racedResult.result as T;
+      throw error;
+    }
+    let active = true;
+    const operationController = new AbortController();
+    let rejectInterruption: (reason: unknown) => void = () => undefined;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      rejectInterruption = reject;
+    });
+    const transition = (kind: "requeue" | "fail"): unknown | undefined => {
+      if (!active) return undefined;
+      try {
+        this.#leases[kind](input.taskId, this.#workerId, this.#now());
+        return undefined;
+      } catch (error) {
+        return error;
+      } finally {
+        active = false;
+      }
+    };
+    const interrupt = (error: unknown, kind: "requeue" | "fail"): void => {
+      if (!active) return;
+      const transitionError = transition(kind);
+      const propagated = transitionError === undefined
+        ? error
+        : new AggregateError([error, transitionError], errorMessage(error));
+      rejectInterruption(propagated);
+      operationController.abort(propagated);
+    };
+    const onAbort = (): void => interrupt(cancellationError(), "requeue");
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    const heartbeat = this.#scheduler.setInterval(() => {
+      if (!active) return;
+      try {
+        this.#leases.heartbeat(
+          input.taskId,
+          this.#workerId,
+          this.#now(),
+          this.#leaseDurationMs,
+        );
+      } catch (error) {
+        interrupt(error, "requeue");
+      }
     }, this.#heartbeatIntervalMs);
     try {
-      const result = await input.operation();
+      const result = await Promise.race([input.operation(operationController.signal), interrupted]);
       if (isAborted()) {
-        requeue();
+        interrupt(cancellationError(), "requeue");
         throw cancellationError();
       }
-      this.#leases.complete(input.taskId, this.#workerId, this.#now());
+      this.#leases.complete(input.taskId, this.#workerId, this.#now(), result);
       active = false;
       return result;
     } catch (error) {
       if (active) {
-        if (isAborted()) requeue();
-        else {
-          this.#leases.fail(input.taskId, this.#workerId, this.#now());
-          active = false;
+        const transitionError = transition(isAborted() ? "requeue" : "fail");
+        if (transitionError !== undefined) {
+          throw new AggregateError([error, transitionError], errorMessage(error));
         }
       }
       throw error;
@@ -115,6 +149,10 @@ export class LocalWorkerTaskExecutor implements WorkerTaskExecutorPort {
       input.signal?.removeEventListener("abort", onAbort);
     }
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Worker task interrupted";
 }
 
 function cancellationError(): Error {

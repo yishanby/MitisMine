@@ -130,6 +130,13 @@ export class FeishuGateway {
     command: FeishuCommand,
     routeKey: string,
   ): Promise<void> {
+    if (event.appRole !== "hub" && isHubOnly(command)) {
+      this.#respond(
+        event,
+        textCard("请使用 Hub App", "该命令会修改 Topic 或启动/��止任务，只能在 Hub App 中执行。"),
+      );
+      return;
+    }
     switch (command.kind) {
       case "topic.new": {
         const topic = this.#createTopic(event.tenantKey, principalId, command.title, `${routeKey}:topic`);
@@ -384,6 +391,10 @@ export class FeishuGateway {
       idempotencyKey: `feishu-response:${event.appRole}:${event.eventId}`,
     });
   }
+}
+
+function isHubOnly(command: FeishuCommand): boolean {
+  return !["topic.use", "topic.show", "status", "report", "message"].includes(command.kind);
 }
 
 function providerFromRole(role: ProviderAppRole): ProviderName {

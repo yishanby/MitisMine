@@ -28,6 +28,23 @@ import { EventStore } from "../../packages/storage/src/store.js";
 
 const temporaryDirectories: string[] = [];
 
+class ManualRecoveryScheduler {
+  readonly callbacks = new Set<() => void>();
+
+  setInterval(callback: () => void): object {
+    this.callbacks.add(callback);
+    return callback;
+  }
+
+  clearInterval(handle: unknown): void {
+    this.callbacks.delete(handle as () => void);
+  }
+
+  tick(): void {
+    for (const callback of [...this.callbacks]) callback();
+  }
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -80,9 +97,213 @@ describe("control-plane health", () => {
     await service.close();
     expect(order).toEqual(["outbox", "store"]);
   });
+
+  it("attempts every shutdown hook even when one cleanup fails", async () => {
+    const order: string[] = [];
+    const service = await createService({
+      storeHealthy: () => true,
+      apps: new AppConnectionRegistry(),
+      workers: new WorkerRegistry(),
+      shutdown: [
+        () => { order.push("store"); },
+        () => { order.push("broken"); throw new Error("cleanup failed"); },
+        () => { order.push("socket"); },
+      ],
+    });
+
+    await expect(service.close()).rejects.toThrow("cleanup failed");
+    expect(order).toEqual(["socket", "broken", "store"]);
+  });
+});
+
+describe("control-plane recovery", () => {
+  it("periodically reaps leases, reports resume failures, and retries non-terminal Runs", async () => {
+    const module = await import("../../apps/control-plane/src/main.js") as Record<string, unknown>;
+    expect(typeof module.RecoverySupervisor).toBe("function");
+    const RecoverySupervisor = module.RecoverySupervisor as new (options: {
+      leases: { requeueExpired(now?: Date): string[] };
+      checkpoints: { nonTerminalRunIds(): string[] };
+      orchestrator: { resume(runId: string): Promise<unknown> };
+      scheduler: ManualRecoveryScheduler;
+      intervalMs: number;
+      onError(runId: string | undefined, error: unknown): void;
+    }) => {
+      runOnce(): Promise<void>;
+      start(): void;
+      stop(): Promise<void>;
+    };
+    const scheduler = new ManualRecoveryScheduler();
+    const errors: Array<{ runId: string | undefined; error: unknown }> = [];
+    let reapCount = 0;
+    let resumeAttempts = 0;
+    let nonTerminal = ["run-retry"];
+    const recovery = new RecoverySupervisor({
+      leases: { requeueExpired: () => { reapCount += 1; return []; } },
+      checkpoints: { nonTerminalRunIds: () => nonTerminal },
+      orchestrator: {
+        resume: async () => {
+          resumeAttempts += 1;
+          if (resumeAttempts === 1) throw new Error("resume failed once");
+          nonTerminal = [];
+        },
+      },
+      scheduler,
+      intervalMs: 100,
+      onError: (runId, error) => { errors.push({ runId, error }); },
+    });
+
+    await recovery.runOnce();
+    expect({ reapCount, resumeAttempts }).toEqual({ reapCount: 1, resumeAttempts: 1 });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.runId).toBe("run-retry");
+
+    recovery.start();
+    scheduler.tick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect({ reapCount, resumeAttempts }).toEqual({ reapCount: 2, resumeAttempts: 2 });
+    await recovery.stop();
+    expect(scheduler.callbacks.size).toBe(0);
+  });
+
+  it("never resumes the same Run concurrently", async () => {
+    const module = await import("../../apps/control-plane/src/main.js") as Record<string, unknown>;
+    const RecoverySupervisor = module.RecoverySupervisor as new (options: {
+      leases: { requeueExpired(now?: Date): string[] };
+      checkpoints: { nonTerminalRunIds(): string[] };
+      orchestrator: { resume(runId: string): Promise<unknown> };
+      scheduler: ManualRecoveryScheduler;
+      intervalMs: number;
+    }) => { runOnce(): Promise<void>; stop(): Promise<void> };
+    const scheduler = new ManualRecoveryScheduler();
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let resumeAttempts = 0;
+    const recovery = new RecoverySupervisor({
+      leases: { requeueExpired: () => [] },
+      checkpoints: { nonTerminalRunIds: () => ["run-active"] },
+      orchestrator: { resume: async () => { resumeAttempts += 1; await blocked; } },
+      scheduler,
+      intervalMs: 100,
+    });
+
+    const first = recovery.runOnce();
+    const second = recovery.runOnce();
+    await Promise.resolve();
+    expect(resumeAttempts).toBe(1);
+    release?.();
+    await Promise.all([first, second]);
+    await recovery.stop();
+  });
+
+  it("cancels an in-flight recovery before stop waits for it", async () => {
+    const module = await import("../../apps/control-plane/src/main.js") as Record<string, unknown>;
+    const RecoverySupervisor = module.RecoverySupervisor as new (options: {
+      leases: { requeueExpired(now?: Date): string[] };
+      checkpoints: { nonTerminalRunIds(): string[] };
+      orchestrator: {
+        resume(runId: string): Promise<unknown>;
+        cancel(runId: string): Promise<void>;
+      };
+      scheduler: ManualRecoveryScheduler;
+      intervalMs: number;
+    }) => { runOnce(): Promise<void>; stop(): Promise<void> };
+    const scheduler = new ManualRecoveryScheduler();
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const cancelled: string[] = [];
+    const recovery = new RecoverySupervisor({
+      leases: { requeueExpired: () => [] },
+      checkpoints: { nonTerminalRunIds: () => ["run-shutdown"] },
+      orchestrator: {
+        resume: async () => { await blocked; },
+        cancel: async (runId) => { cancelled.push(runId); release?.(); },
+      },
+      scheduler,
+      intervalMs: 100,
+    });
+
+    const running = recovery.runOnce();
+    await Promise.resolve();
+    const stopping = recovery.stop();
+    await Promise.resolve();
+    expect(cancelled).toEqual(["run-shutdown"]);
+    release?.();
+    await Promise.all([running, stopping]);
+  });
 });
 
 describe("ChannelDispatcher Context Pack", () => {
+  it("aborts and drains a pending direct provider call before shutdown returns", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-shutdown-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "direct.db");
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    const topic = createTopic("Direct shutdown", "tenant:user:owner", { id: "topic-direct-shutdown" });
+    store.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: { topic },
+    });
+    let started: (() => void) | undefined;
+    const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+    let aborted = false;
+    const waitingAdapter = (provider: ProviderName): AgentAdapter => ({
+      provider,
+      start: async (task) => {
+        started?.();
+        return new Promise<never>((_resolve, reject) => {
+          task.signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(task.signal?.reason ?? new Error("aborted"));
+          }, { once: true });
+        });
+      },
+      resume: async () => { throw new Error("unexpected resume"); },
+    });
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: {
+        claude: waitingAdapter("claude"),
+        codex: waitingAdapter("codex"),
+        copilot: waitingAdapter("copilot"),
+      },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+
+    try {
+      await dispatcher.dispatch({
+        mode: "direct",
+        provider: "claude",
+        topicId: topic.id,
+        topicTitle: topic.title,
+        principalId: topic.ownerPrincipalId,
+        question: "wait",
+        idempotencyKey: "direct-shutdown",
+        replyAppRole: "claude",
+        receiveId: "chat",
+      });
+      await providerStarted;
+      await dispatcher.shutdown();
+
+      expect(aborted).toBe(true);
+      expect(store.events(topic.id).some((event) => event.type === "agent.direct.completed"))
+        .toBe(false);
+    } finally {
+      store.close();
+      outbox.close();
+    }
+  });
+
   it("does not record an error-only direct result as active or completed", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-error-"));
     temporaryDirectories.push(directory);
@@ -309,6 +530,52 @@ describe("WorkerLeaseStore", () => {
       store.close();
     }
   });
+
+  it("does not let the same worker reacquire an unexpired lease", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));
+    temporaryDirectories.push(directory);
+    const store = WorkerLeaseStore.open(join(directory, "leases.db"));
+    try {
+      store.lease("task-1", "worker-1", new Date("2026-07-17T12:00:00.000Z"), 1_000);
+
+      expect(() => store.lease(
+        "task-1",
+        "worker-1",
+        new Date("2026-07-17T12:00:00.100Z"),
+        1_000,
+      )).toThrow(/already leased/i);
+      expect(store.history("task-1")).toEqual(["leased"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each(["completed", "failed"] as const)(
+    "does not reacquire a %s task",
+    (terminalStatus) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));
+      temporaryDirectories.push(directory);
+      const store = WorkerLeaseStore.open(join(directory, "leases.db"));
+      try {
+        store.lease("task-1", "worker-1", new Date("2026-07-17T12:00:00.000Z"), 1_000);
+        if (terminalStatus === "completed") {
+          store.complete("task-1", "worker-1", new Date("2026-07-17T12:00:00.100Z"));
+        } else {
+          store.fail("task-1", "worker-1", new Date("2026-07-17T12:00:00.100Z"));
+        }
+
+        expect(() => store.lease(
+          "task-1",
+          "worker-2",
+          new Date("2026-07-17T12:00:02.000Z"),
+          1_000,
+        )).toThrow(/not available|terminal/i);
+        expect(store.status("task-1")).toBe(terminalStatus);
+      } finally {
+        store.close();
+      }
+    },
+  );
 
   it("requeues expired leases across process restart", () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));

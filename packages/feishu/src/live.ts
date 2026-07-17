@@ -22,7 +22,8 @@ interface LongConnectionOptions {
 export class FeishuLongConnections implements OutboxSender {
   readonly #clients = new Map<AppRole, Lark.Client>();
   readonly #sockets = new Map<AppRole, Lark.WSClient>();
-  readonly #startTasks: Promise<void>[] = [];
+  readonly #starters: Array<() => Promise<void>> = [];
+  #startTasks: Promise<void>[] | undefined;
 
   constructor(options: LongConnectionOptions) {
     for (const registration of options.registrations) {
@@ -52,11 +53,12 @@ export class FeishuLongConnections implements OutboxSender {
           options.onCardAction?.(registration.role, data),
       });
       this.#sockets.set(registration.role, socket);
-      this.#startTasks.push(socket.start({ eventDispatcher: dispatcher }));
+      this.#starters.push(async () => socket.start({ eventDispatcher: dispatcher }));
     }
   }
 
   async ready(): Promise<void> {
+    this.#startTasks ??= this.#starters.map(async (start) => start());
     await Promise.all(this.#startTasks);
   }
 

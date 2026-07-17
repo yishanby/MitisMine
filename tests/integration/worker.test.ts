@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { WorkerLeaseStore } from "../../apps/worker/src/main.js";
+import type { WorkerLeasePort } from "../../packages/orchestrator/src/worker.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -18,7 +19,7 @@ interface WorkerTaskExecutor {
   execute<T>(input: {
     readonly taskId: string;
     readonly signal?: AbortSignal;
-    readonly operation: () => Promise<T>;
+    readonly operation: (signal: AbortSignal) => Promise<T>;
   }): Promise<T>;
 }
 
@@ -44,7 +45,7 @@ class ManualIntervalScheduler {
 }
 
 type ExecutorConstructor = new (options: {
-  readonly leases: WorkerLeaseStore;
+  readonly leases: WorkerLeasePort;
   readonly workerId: string;
   readonly leaseDurationMs: number;
   readonly heartbeatIntervalMs: number;
@@ -93,6 +94,43 @@ describe("LocalWorkerTaskExecutor", () => {
     }
   });
 
+  it("returns a durable completed result without running the same task twice", async () => {
+    const LocalWorkerTaskExecutor = await executorConstructor();
+    const { leases } = leaseHarness();
+    const scheduler = new ManualIntervalScheduler();
+    const executor = new LocalWorkerTaskExecutor({
+      leases,
+      workerId: "local",
+      leaseDurationMs: 1_000,
+      heartbeatIntervalMs: 250,
+      now: () => new Date("2026-07-17T12:00:00.000Z"),
+      scheduler,
+    });
+    let executions = 0;
+
+    try {
+      await expect(executor.execute({
+        taskId: "task-cached",
+        operation: async () => {
+          executions += 1;
+          return { answer: "durable" };
+        },
+      })).resolves.toEqual({ answer: "durable" });
+      await expect(executor.execute({
+        taskId: "task-cached",
+        operation: async () => {
+          executions += 1;
+          throw new Error("duplicate operation ran");
+        },
+      })).resolves.toEqual({ answer: "durable" });
+
+      expect(executions).toBe(1);
+      expect(leases.history("task-cached")).toEqual(["leased", "completed"]);
+    } finally {
+      leases.close();
+    }
+  });
+
   it("heartbeats long operations with a controllable clock", async () => {
     const LocalWorkerTaskExecutor = await executorConstructor();
     const { leases } = leaseHarness();
@@ -125,6 +163,51 @@ describe("LocalWorkerTaskExecutor", () => {
       expect(leases.status("task-heartbeat")).toBe("completed");
     } finally {
       finish?.();
+      leases.close();
+    }
+  });
+
+  it("propagates a heartbeat failure, aborts the operation, and requeues the lease", async () => {
+    const LocalWorkerTaskExecutor = await executorConstructor();
+    const { leases } = leaseHarness();
+    const scheduler = new ManualIntervalScheduler();
+    const leasePort: WorkerLeasePort = {
+      lease: (...args) => leases.lease(...args),
+      heartbeat: () => { throw new Error("heartbeat storage unavailable"); },
+      complete: (...args) => leases.complete(...args),
+      requeue: (...args) => leases.requeue(...args),
+      fail: (...args) => leases.fail(...args),
+      completedResult: (taskId) => leases.completedResult(taskId),
+    };
+    const executor = new LocalWorkerTaskExecutor({
+      leases: leasePort,
+      workerId: "local",
+      leaseDurationMs: 1_000,
+      heartbeatIntervalMs: 250,
+      now: () => new Date("2026-07-17T12:00:00.000Z"),
+      scheduler,
+    });
+    let operationAborted = false;
+
+    try {
+      const running = executor.execute({
+        taskId: "task-heartbeat-failure",
+        operation: (signal) => new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            operationAborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        }),
+      });
+      await Promise.resolve();
+
+      expect(() => scheduler.tick()).not.toThrow();
+      await expect(running).rejects.toThrow("heartbeat storage unavailable");
+      expect(operationAborted).toBe(true);
+      expect(leases.status("task-heartbeat-failure")).toBe("queued");
+      expect(leases.history("task-heartbeat-failure")).toEqual(["leased", "queued"]);
+      expect(scheduler.size).toBe(0);
+    } finally {
       leases.close();
     }
   });

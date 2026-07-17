@@ -5,6 +5,9 @@ import { DatabaseSync } from "node:sqlite";
 import { SCHEMA_SQL } from "../../../packages/storage/src/schema.js";
 
 export type WorkerLeaseStatus = "queued" | "leased" | "completed" | "failed";
+export type CompletedWorkerResult =
+  | { readonly found: false }
+  | { readonly found: true; readonly result: unknown };
 
 export class WorkerLeaseStore {
   readonly #database: DatabaseSync;
@@ -18,6 +21,12 @@ export class WorkerLeaseStore {
     const database = new DatabaseSync(path);
     database.exec("PRAGMA journal_mode = WAL;");
     database.exec(SCHEMA_SQL);
+    const leaseColumns = database
+      .prepare("PRAGMA table_info(worker_leases)")
+      .all() as unknown as Array<{ name: string }>;
+    if (!leaseColumns.some((column) => column.name === "result_json")) {
+      database.exec("ALTER TABLE worker_leases ADD COLUMN result_json TEXT");
+    }
     return new WorkerLeaseStore(database);
   }
 
@@ -31,19 +40,30 @@ export class WorkerLeaseStore {
     const result = this.#database
       .prepare(`
         INSERT INTO worker_leases (
-          task_id, worker_id, lease_expires_at, last_heartbeat_at, status
-        ) VALUES (?, ?, ?, ?, 'leased')
+          task_id, worker_id, lease_expires_at, last_heartbeat_at, status, result_json
+        ) VALUES (?, ?, ?, ?, 'leased', NULL)
         ON CONFLICT (task_id) DO UPDATE SET
           worker_id = excluded.worker_id,
           lease_expires_at = excluded.lease_expires_at,
           last_heartbeat_at = excluded.last_heartbeat_at,
-          status = 'leased'
-        WHERE worker_leases.status != 'leased'
-          OR worker_leases.worker_id = excluded.worker_id
-          OR worker_leases.lease_expires_at <= excluded.last_heartbeat_at
+          status = 'leased',
+          result_json = NULL
+        WHERE worker_leases.status = 'queued'
+          OR (
+            worker_leases.status = 'leased'
+            AND worker_leases.lease_expires_at <= excluded.last_heartbeat_at
+          )
       `)
       .run(taskId, workerId, expiresAt, now.toISOString());
-    if (Number(result.changes) !== 1) throw new Error("Task is already leased by another worker");
+    if (Number(result.changes) !== 1) {
+      const current = this.#database
+        .prepare("SELECT status FROM worker_leases WHERE task_id = ?")
+        .get(taskId) as { status: WorkerLeaseStatus } | undefined;
+      if (current?.status === "completed" || current?.status === "failed") {
+        throw new Error(`Task is terminal and not available for leasing: ${current.status}`);
+      }
+      throw new Error("Task is already leased");
+    }
     this.#record(taskId, workerId, "leased", now);
   }
 
@@ -78,8 +98,16 @@ export class WorkerLeaseStore {
     return rows.map((row) => row.task_id);
   }
 
-  complete(taskId: string, workerId: string, now = new Date()): void {
-    this.#transition(taskId, workerId, "completed", now);
+  complete(taskId: string, workerId: string, now = new Date(), result?: unknown): void {
+    const encoded = JSON.stringify({ result });
+    const updated = this.#database
+      .prepare(`
+        UPDATE worker_leases SET status = 'completed', result_json = ?
+        WHERE task_id = ? AND worker_id = ? AND status = 'leased'
+      `)
+      .run(encoded, taskId, workerId);
+    if (Number(updated.changes) !== 1) throw new Error("Active worker lease not found");
+    this.#record(taskId, workerId, "completed", now);
   }
 
   requeue(taskId: string, workerId: string, now = new Date()): void {
@@ -95,6 +123,15 @@ export class WorkerLeaseStore {
       .prepare("SELECT status FROM worker_leases WHERE task_id = ?")
       .get(taskId) as { status: WorkerLeaseStatus } | undefined;
     return row?.status;
+  }
+
+  completedResult(taskId: string): CompletedWorkerResult {
+    const row = this.#database
+      .prepare("SELECT status, result_json FROM worker_leases WHERE task_id = ?")
+      .get(taskId) as { status: WorkerLeaseStatus; result_json: string | null } | undefined;
+    if (row?.status !== "completed" || row.result_json === null) return { found: false };
+    const decoded = JSON.parse(row.result_json) as { result?: unknown };
+    return { found: true, result: decoded.result };
   }
 
   history(taskId: string): WorkerLeaseStatus[] {

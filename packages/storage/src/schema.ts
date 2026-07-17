@@ -142,7 +142,8 @@ CREATE TABLE IF NOT EXISTS worker_leases (
   worker_id TEXT NOT NULL,
   lease_expires_at TEXT NOT NULL,
   last_heartbeat_at TEXT NOT NULL,
-  status TEXT NOT NULL
+  status TEXT NOT NULL,
+  result_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS worker_lease_events (

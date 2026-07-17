@@ -6,22 +6,20 @@ import { z } from "zod";
 import { APP_ROLES } from "../../../packages/feishu/src/registry.js";
 
 const nonEmpty = z.string().trim().min(1);
-const knownApprovalKeyDefaults = new Set([
-  "development-only-approval-key-change-me",
-  "<generate-a-random-32-byte-secret>",
-]);
 const approvalKey = z.string()
   .trim()
-  .min(32, "MITISMINE_APPROVAL_KEY must contain at least 32 characters")
+  .regex(
+    /^[0-9a-f]{64}$/i,
+    "MITISMINE_APPROVAL_KEY must be a generated 32-byte hexadecimal value",
+  )
   .refine(
-    (value) => !knownApprovalKeyDefaults.has(value)
-      && !/[<>]/.test(value)
-      && !/(?:example|placeholder|template)/i.test(value),
-    "MITISMINE_APPROVAL_KEY must not be an example, placeholder, or template value",
+    (value) => new Set(value.match(/../g) ?? []).size >= 16,
+    "MITISMINE_APPROVAL_KEY does not have enough byte diversity",
   );
 const identityObservationValue = nonEmpty.refine(
   (value) => !/[<>]/.test(value)
-    && !/(?:example|placeholder|template|observed|change-me)/i.test(value),
+    && !/(?:example|placeholder|template|observed|change[-_ ]?me)/i.test(value)
+    && !/(?:^|[-_])here(?:$|[-_])/i.test(value),
   "Identity observation must be a real value captured from a Feishu App event",
 );
 const identityObservationSchema = z.object({
