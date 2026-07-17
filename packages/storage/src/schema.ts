@@ -37,10 +37,18 @@ CREATE TABLE IF NOT EXISTS topic_events (
   PRIMARY KEY (topic_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS topic_event_effects (
+  effect_key TEXT PRIMARY KEY,
+  topic_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  FOREIGN KEY (topic_id, seq) REFERENCES topic_events(topic_id, seq) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS processed_feishu_events (
   app_role TEXT NOT NULL,
   event_id TEXT NOT NULL,
   processed_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'processing', 'completed')),
   PRIMARY KEY (app_role, event_id)
 );
 

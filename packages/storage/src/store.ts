@@ -11,6 +11,7 @@ export interface AppendEventInput {
   readonly actorPrincipalId?: string;
   readonly payload: unknown;
   readonly createdAt?: string;
+  readonly idempotencyKey?: string;
 }
 
 export interface TopicEvent {
@@ -76,6 +77,13 @@ export class EventStore {
     const database = new DatabaseSync(path);
     database.exec("PRAGMA journal_mode = WAL;");
     database.exec(SCHEMA_SQL);
+    const inboxColumns = database
+      .prepare("PRAGMA table_info(processed_feishu_events)")
+      .all() as unknown as Array<{ name: string }>;
+    if (!inboxColumns.some((column) => column.name === "status")) {
+      database.exec("ALTER TABLE processed_feishu_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'");
+    }
+    database.prepare("UPDATE processed_feishu_events SET status = 'pending' WHERE status = 'processing'").run();
     return new EventStore(database);
   }
 
@@ -87,6 +95,20 @@ export class EventStore {
     const createdAt = input.createdAt ?? new Date().toISOString();
     this.#database.exec("BEGIN IMMEDIATE");
     try {
+      if (input.idempotencyKey !== undefined) {
+        const existing = this.#database
+          .prepare(`
+            SELECT e.topic_id, e.seq, e.type, e.actor_principal_id, e.payload_json, e.created_at
+            FROM topic_event_effects i
+            JOIN topic_events e ON e.topic_id = i.topic_id AND e.seq = i.seq
+            WHERE i.effect_key = ?
+          `)
+          .get(input.idempotencyKey) as EventRow | undefined;
+        if (existing !== undefined) {
+          this.#database.exec("COMMIT");
+          return mapEvent(existing);
+        }
+      }
       const seqRow = this.#database
         .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM topic_events WHERE topic_id = ?")
         .get(input.topicId) as { seq: number };
@@ -150,6 +172,11 @@ export class EventStore {
           JSON.stringify(input.payload),
           createdAt,
         );
+      if (input.idempotencyKey !== undefined) {
+        this.#database
+          .prepare("INSERT INTO topic_event_effects (effect_key, topic_id, seq) VALUES (?, ?, ?)")
+          .run(input.idempotencyKey, input.topicId, seq);
+      }
       this.#database.exec("COMMIT");
       const event: TopicEvent = {
         topicId: input.topicId,
@@ -244,13 +271,45 @@ export class EventStore {
     return row?.topic_id;
   }
 
-  recordFeishuEvent(appRole: string, eventId: string): boolean {
+  claimFeishuEvent(appRole: string, eventId: string): "claimed" | "processing" | "completed" {
     const result = this.#database
       .prepare(`
-        INSERT OR IGNORE INTO processed_feishu_events (app_role, event_id, processed_at)
-        VALUES (?, ?, ?)
+        INSERT INTO processed_feishu_events (app_role, event_id, processed_at, status)
+        VALUES (?, ?, ?, 'processing')
+        ON CONFLICT (app_role, event_id) DO UPDATE SET
+          processed_at = excluded.processed_at,
+          status = 'processing'
+        WHERE processed_feishu_events.status = 'pending'
       `)
       .run(appRole, eventId, new Date().toISOString());
+    if (Number(result.changes) === 1) return "claimed";
+    const row = this.#database
+      .prepare("SELECT status FROM processed_feishu_events WHERE app_role = ? AND event_id = ?")
+      .get(appRole, eventId) as { status: "processing" | "completed" };
+    return row.status;
+  }
+
+  recordFeishuEvent(appRole: string, eventId: string): boolean {
+    return this.claimFeishuEvent(appRole, eventId) === "claimed";
+  }
+
+  completeFeishuEvent(appRole: string, eventId: string): boolean {
+    const result = this.#database
+      .prepare(`
+        UPDATE processed_feishu_events SET status = 'completed', processed_at = ?
+        WHERE app_role = ? AND event_id = ? AND status = 'processing'
+      `)
+      .run(new Date().toISOString(), appRole, eventId);
+    return Number(result.changes) === 1;
+  }
+
+  releaseFeishuEventClaim(appRole: string, eventId: string): boolean {
+    const result = this.#database
+      .prepare(`
+        UPDATE processed_feishu_events SET status = 'pending', processed_at = ?
+        WHERE app_role = ? AND event_id = ? AND status = 'processing'
+      `)
+      .run(new Date().toISOString(), appRole, eventId);
     return Number(result.changes) === 1;
   }
 
@@ -361,4 +420,15 @@ export class EventStore {
       lastEventSeq: Number(row.last_event_seq),
     };
   }
+}
+
+function mapEvent(row: EventRow): TopicEvent {
+  return {
+    topicId: row.topic_id,
+    seq: Number(row.seq),
+    type: row.type,
+    payload: JSON.parse(row.payload_json) as unknown,
+    createdAt: row.created_at,
+    ...(row.actor_principal_id === null ? {} : { actorPrincipalId: row.actor_principal_id }),
+  };
 }

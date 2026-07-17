@@ -23,6 +23,11 @@ export interface FeishuMessageEvent {
   readonly messageId: string;
   readonly chatId: string;
   readonly text: string;
+  readonly mentions?: readonly {
+    readonly key: string;
+    readonly userId?: string;
+    readonly unionId?: string;
+  }[];
 }
 
 export type DispatchInput =
@@ -32,6 +37,7 @@ export type DispatchInput =
       readonly topicTitle: string;
       readonly principalId: string;
       readonly question: string;
+      readonly idempotencyKey: string;
       readonly replyAppRole: AppRole;
       readonly receiveId: string;
     }
@@ -41,6 +47,7 @@ export type DispatchInput =
       readonly topicId: string;
       readonly topicTitle: string;
       readonly principalId: string;
+      readonly idempotencyKey: string;
       readonly replyAppRole: AppRole;
       readonly receiveId: string;
     }
@@ -51,6 +58,7 @@ export type DispatchInput =
       readonly topicTitle: string;
       readonly principalId: string;
       readonly question: string;
+      readonly idempotencyKey: string;
       readonly replyAppRole: AppRole;
       readonly receiveId: string;
     }
@@ -60,6 +68,7 @@ export type DispatchInput =
       readonly topicId: string;
       readonly topicTitle: string;
       readonly principalId: string;
+      readonly idempotencyKey: string;
       readonly replyAppRole: AppRole;
       readonly receiveId: string;
     };
@@ -89,17 +98,25 @@ export class FeishuGateway {
   }
 
   async receive(event: FeishuMessageEvent): Promise<{ duplicate: boolean }> {
-    if (!this.#store.recordFeishuEvent(event.appRole, event.eventId)) {
-      return { duplicate: true };
-    }
     const principalId = resolvePrincipal({
       tenantKey: event.tenantKey,
       ...(event.userId === undefined ? {} : { userId: event.userId }),
       ...(event.unionId === undefined ? {} : { unionId: event.unionId }),
     });
     const command = parseCommand(event.text);
-    await this.#route(event, principalId, command);
-    return { duplicate: false };
+    const claim = this.#store.claimFeishuEvent(event.appRole, event.eventId);
+    if (claim === "completed") {
+      return { duplicate: true };
+    }
+    if (claim === "processing") throw new Error("Feishu event is already processing");
+    try {
+      await this.#route(event, principalId, command, eventKey(event));
+      this.#store.completeFeishuEvent(event.appRole, event.eventId);
+      return { duplicate: false };
+    } catch (error) {
+      this.#store.releaseFeishuEventClaim(event.appRole, event.eventId);
+      throw error;
+    }
   }
 
   async receiveSdkEvent(appRole: AppRole, raw: unknown): Promise<{ duplicate: boolean }> {
@@ -110,10 +127,11 @@ export class FeishuGateway {
     event: FeishuMessageEvent,
     principalId: string,
     command: FeishuCommand,
+    routeKey: string,
   ): Promise<void> {
     switch (command.kind) {
       case "topic.new": {
-        const topic = this.#createTopic(event.tenantKey, principalId, command.title);
+        const topic = this.#createTopic(event.tenantKey, principalId, command.title, `${routeKey}:topic`);
         this.#respond(event, textCard("Topic 已创建", `${topic.title}\n${topic.id}`));
         return;
       }
@@ -151,12 +169,21 @@ export class FeishuGateway {
         const topic = this.#requireCurrent(event.tenantKey, principalId);
         const members = this.#store.members(topic.id);
         if (!canEditTopic(topic, principalId, members)) throw new Error("principal cannot share Topic");
-        const member: TopicMember = { principalId: command.principalId, role: command.role };
+        const mention = event.mentions?.find((candidate) => candidate.key === command.principalId);
+        const memberPrincipalId = mention === undefined
+          ? command.principalId
+          : resolvePrincipal({
+              tenantKey: event.tenantKey,
+              ...(mention.userId === undefined ? {} : { userId: mention.userId }),
+              ...(mention.unionId === undefined ? {} : { unionId: mention.unionId }),
+            });
+        const member: TopicMember = { principalId: memberPrincipalId, role: command.role };
         this.#store.append({
           topicId: topic.id,
           type: "topic.shared",
           actorPrincipalId: principalId,
           payload: { member },
+          idempotencyKey: `${routeKey}:topic-shared`,
         });
         this.#respond(event, textCard("Topic 已共享", `${member.principalId}: ${member.role}`));
         return;
@@ -169,33 +196,35 @@ export class FeishuGateway {
           type: "topic.archived",
           actorPrincipalId: principalId,
           payload: { topic: archived },
+          idempotencyKey: `${routeKey}:topic-archived`,
         });
         this.#respond(event, textCard("Topic 已归档", archived.title));
         return;
       }
       case "note": {
-        const topic = this.#currentOrCreate(event, principalId, command.text);
-        this.#appendMessage(topic, event, principalId, command.text, true);
+        const topic = this.#currentOrCreate(event, principalId, command.text, routeKey);
+        this.#appendMessage(topic, event, principalId, command.text, true, routeKey);
         this.#respond(event, textCard("笔记已保存", topic.title));
         return;
       }
       case "research": {
-        const topic = this.#currentOrCreate(event, principalId, command.question);
-        this.#appendMessage(topic, event, principalId, command.question, false);
+        const topic = this.#currentOrCreate(event, principalId, command.question, routeKey);
+        this.#appendMessage(topic, event, principalId, command.question, false, routeKey);
         await this.#dispatcher.dispatch({
           mode: "research",
           topicId: topic.id,
           topicTitle: topic.title,
           principalId,
           question: command.question,
+          idempotencyKey: `${routeKey}:dispatch`,
           replyAppRole: event.appRole,
           receiveId: event.chatId,
         });
         return;
       }
       case "message": {
-        const topic = this.#currentOrCreate(event, principalId, command.text);
-        this.#appendMessage(topic, event, principalId, command.text, false);
+        const topic = this.#currentOrCreate(event, principalId, command.text, routeKey);
+        this.#appendMessage(topic, event, principalId, command.text, false, routeKey);
         if (event.appRole === "hub") {
           await this.#dispatcher.dispatch({
             mode: "research",
@@ -203,6 +232,7 @@ export class FeishuGateway {
             topicTitle: topic.title,
             principalId,
             question: command.text,
+            idempotencyKey: `${routeKey}:dispatch`,
             replyAppRole: event.appRole,
             receiveId: event.chatId,
           });
@@ -214,6 +244,7 @@ export class FeishuGateway {
             topicTitle: topic.title,
             principalId,
             question: command.text,
+            idempotencyKey: `${routeKey}:dispatch`,
             replyAppRole: event.appRole,
             receiveId: event.chatId,
           });
@@ -230,6 +261,7 @@ export class FeishuGateway {
           topicId: topic.id,
           topicTitle: topic.title,
           principalId,
+          idempotencyKey: `${routeKey}:dispatch`,
           replyAppRole: event.appRole,
           receiveId: event.chatId,
         });
@@ -249,6 +281,7 @@ export class FeishuGateway {
           topicId: topic.id,
           topicTitle: topic.title,
           principalId,
+          idempotencyKey: `${routeKey}:dispatch`,
           replyAppRole: event.appRole,
           receiveId: event.chatId,
         });
@@ -257,27 +290,40 @@ export class FeishuGateway {
     }
   }
 
-  #createTopic(tenantKey: string, principalId: string, title: string): Topic {
+  #createTopic(
+    tenantKey: string,
+    principalId: string,
+    title: string,
+    idempotencyKey: string,
+  ): Topic {
     const topic = createTopic(title, principalId, { id: this.#idFactory() });
     if (topic.tenantKey !== tenantKey) throw new Error("Topic tenant identity mismatch");
-    this.#store.append({
+    const created = this.#store.append({
       topicId: topic.id,
       type: "topic.created",
       actorPrincipalId: principalId,
       payload: { topic },
       createdAt: topic.createdAt,
+      idempotencyKey,
     });
-    this.#store.setCurrentTopic(tenantKey, principalId, topic.id);
-    return topic;
+    const stored = this.#store.topic(created.topicId);
+    if (stored === undefined) throw new Error("Idempotent Topic effect is missing its projection");
+    this.#store.setCurrentTopic(tenantKey, principalId, stored.id);
+    return stored;
   }
 
-  #currentOrCreate(event: FeishuMessageEvent, principalId: string, text: string): Topic {
+  #currentOrCreate(
+    event: FeishuMessageEvent,
+    principalId: string,
+    text: string,
+    routeKey: string,
+  ): Topic {
     const currentId = this.#store.currentTopic(event.tenantKey, principalId);
     if (currentId !== undefined) {
       const current = this.#store.topic(currentId);
       if (current !== undefined && current.status === "active") return current;
     }
-    return this.#createTopic(event.tenantKey, principalId, summarize(text));
+    return this.#createTopic(event.tenantKey, principalId, summarize(text), `${routeKey}:topic`);
   }
 
   #requireCurrent(tenantKey: string, principalId: string): Topic {
@@ -293,6 +339,7 @@ export class FeishuGateway {
     principalId: string,
     text: string,
     note: boolean,
+    routeKey: string,
   ): void {
     this.#store.append({
       topicId: topic.id,
@@ -305,6 +352,7 @@ export class FeishuGateway {
         messageId: event.messageId,
         openId: event.openId,
       },
+      idempotencyKey: `${routeKey}:message`,
     });
   }
 
@@ -323,6 +371,10 @@ function providerFromRole(role: ProviderAppRole): ProviderName {
   return role;
 }
 
+function eventKey(event: FeishuMessageEvent): string {
+  return `feishu:${event.appRole}:${event.eventId}`;
+}
+
 function summarize(text: string): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length <= 60 ? oneLine : `${oneLine.slice(0, 59)}…`;
@@ -338,6 +390,19 @@ function parseSdkEvent(appRole: AppRole, raw: unknown): FeishuMessageEvent {
   const content = object(JSON.parse(string(message.content, "message content")) as unknown, "message content");
   const userId = optionalString(senderId.user_id);
   const unionId = optionalString(senderId.union_id);
+  const mentions = Array.isArray(message.mentions)
+    ? message.mentions.map((rawMention) => {
+        const mention = object(rawMention, "message mention");
+        const mentionId = object(mention.id, "message mention ID");
+        const mentionUserId = optionalString(mentionId.user_id);
+        const mentionUnionId = optionalString(mentionId.union_id);
+        return {
+          key: string(mention.key, "message mention key"),
+          ...(mentionUserId === undefined ? {} : { userId: mentionUserId }),
+          ...(mentionUnionId === undefined ? {} : { unionId: mentionUnionId }),
+        };
+      })
+    : [];
   return {
     appRole,
     eventId: string(header.event_id, "event ID"),
@@ -348,6 +413,7 @@ function parseSdkEvent(appRole: AppRole, raw: unknown): FeishuMessageEvent {
     messageId: string(message.message_id, "message ID"),
     chatId: string(message.chat_id, "chat ID"),
     text: string(content.text, "text content"),
+    ...(mentions.length === 0 ? {} : { mentions }),
   };
 }
 

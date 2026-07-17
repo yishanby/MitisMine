@@ -82,4 +82,18 @@ describe("EventStore", () => {
     expect(store.recordFeishuEvent("claude", "event-1")).toBe(true);
     store.close();
   });
+
+  it("releases only the matching Feishu event claim", () => {
+    const { store } = openTestStore();
+
+    try {
+      expect(store.recordFeishuEvent("hub", "event-1")).toBe(true);
+      expect(store.recordFeishuEvent("claude", "event-1")).toBe(true);
+      expect(store.releaseFeishuEventClaim("hub", "event-1")).toBe(true);
+      expect(store.recordFeishuEvent("hub", "event-1")).toBe(true);
+      expect(store.recordFeishuEvent("claude", "event-1")).toBe(false);
+    } finally {
+      store.close();
+    }
+  });
 });

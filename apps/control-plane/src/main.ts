@@ -83,27 +83,43 @@ class ChannelDispatcher implements FeishuDispatcher {
   }
 
   async dispatch(input: DispatchInput): Promise<void> {
-    this.#enqueue(input, "已接收", input.mode === "control" ? input.action : "任务已进入队列");
-    void this.#handle(input).catch((error: unknown) => {
+    this.#enqueue(
+      input,
+      "已接收",
+      input.mode === "control" ? input.action : "任务已进入队列",
+      "accepted",
+    );
+    const handling = this.#handle(input);
+    if (
+      input.mode === "research"
+      && this.#checkpoints.load(`research:${input.idempotencyKey}`) === undefined
+    ) {
+      await handling;
+      return;
+    }
+    void handling.catch((error: unknown) => {
       const message = error instanceof Error ? error.message : "unknown failure";
-      this.#enqueue(input, "任务失败", message);
+      this.#enqueue(input, "任务失败", message, "failed");
     });
   }
 
   async #handle(input: DispatchInput): Promise<void> {
     if (input.mode === "research") {
-      const runId = ulid();
-      const result = await this.#orchestrator.start({
-        runId,
-        topicId: input.topicId,
-        question: input.question,
-        cwd: this.#workspace(input.topicId),
-      });
+      const runId = `research:${input.idempotencyKey}`;
+      const result = this.#checkpoints.load(runId) === undefined
+        ? await this.#orchestrator.start({
+            runId,
+            topicId: input.topicId,
+            question: input.question,
+            cwd: this.#workspace(input.topicId),
+          })
+        : await this.#orchestrator.resume(runId);
       this.#store.append({
         topicId: input.topicId,
         type: "research.completed",
         actorPrincipalId: input.principalId,
         payload: { runId, state: result.run.state, report: result.report },
+        idempotencyKey: `${input.idempotencyKey}:research-completed`,
       });
       this.#enqueue(
         input,
@@ -139,6 +155,7 @@ class ChannelDispatcher implements FeishuDispatcher {
         type: "agent.direct.completed",
         actorPrincipalId: input.principalId,
         payload: { provider: input.provider, externalSessionId: result.externalSessionId, text },
+        idempotencyKey: `${input.idempotencyKey}:direct-completed`,
       });
       this.#enqueue(input, `${input.provider} 回复`, text);
       return;
@@ -188,18 +205,18 @@ class ChannelDispatcher implements FeishuDispatcher {
     return workspace;
   }
 
-  #enqueue(input: DispatchInput, title: string, content: string): void {
-    this.#enqueuePayload(input, textCard(title, content));
+  #enqueue(input: DispatchInput, title: string, content: string, effect = "result"): void {
+    this.#enqueuePayload(input, textCard(title, content), effect);
   }
 
-  #enqueuePayload(input: DispatchInput, payload: unknown): void {
-    const id = ulid();
+  #enqueuePayload(input: DispatchInput, payload: unknown, effect = "result"): void {
+    const id = `outbox:${input.idempotencyKey}:${effect}`;
     this.#outbox.enqueue({
       id,
       appRole: input.replyAppRole,
       receiveId: input.receiveId,
       payload,
-      idempotencyKey: `dispatch:${input.topicId}:${id}`,
+      idempotencyKey: `dispatch:${input.idempotencyKey}:${effect}`,
     });
   }
 }

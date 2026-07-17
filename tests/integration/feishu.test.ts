@@ -46,7 +46,10 @@ function message(
   };
 }
 
-function gatewayHarness(path: string) {
+function gatewayHarness(
+  path: string,
+  onDispatch: (input: DispatchInput) => Promise<void> = async () => {},
+) {
   const store = EventStore.open(path);
   const outbox = DurableOutbox.open(path);
   const dispatches: DispatchInput[] = [];
@@ -58,6 +61,7 @@ function gatewayHarness(path: string) {
     dispatcher: {
       dispatch: async (input) => {
         dispatches.push(input);
+        await onDispatch(input);
       },
     },
   });
@@ -138,6 +142,23 @@ describe("FeishuGateway", () => {
     harness.outbox.close();
   });
 
+  it("resolves a Feishu @mention when sharing a Topic", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    await harness.gateway.receive(message("hub", "/topic new Shared"));
+    await harness.gateway.receive({
+      ...message("hub", "/topic share @_user_1 editor", "event-share"),
+      mentions: [{ key: "@_user_1", userId: "user-2", unionId: "union-2" }],
+    });
+
+    expect(harness.store.members("topic-1")).toContainEqual({
+      principalId: "tenant-1:user:user-2",
+      role: "editor",
+    });
+    harness.store.close();
+    harness.outbox.close();
+  });
+
   it("deduplicates events across restart and replays the durable Outbox", async () => {
     const { path } = temporaryDatabase();
     const first = gatewayHarness(path);
@@ -153,6 +174,114 @@ describe("FeishuGateway", () => {
     expect(second.outbox.pending()).toHaveLength(1);
     second.store.close();
     second.outbox.close();
+  });
+
+  it("retries a failed dispatch and only deduplicates after success", async () => {
+    const { path } = temporaryDatabase();
+    let attempts = 0;
+    const harness = gatewayHarness(path, async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient dispatch failure");
+    });
+    try {
+      const event = message("hub", "Retry this research", "retry-event");
+
+      await expect(harness.gateway.receive(event)).rejects.toThrow("transient dispatch failure");
+      await expect(harness.gateway.receive(event)).resolves.toEqual({ duplicate: false });
+      await expect(harness.gateway.receive(event)).resolves.toEqual({ duplicate: true });
+      expect(attempts).toBe(2);
+      expect(harness.store.listTopics("tenant-1", "tenant-1:user:user-1")).toHaveLength(1);
+      expect(harness.store.events("topic-1").map((stored) => stored.type)).toEqual([
+        "topic.created",
+        "message.added",
+      ]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it("replays a route after the accepted response is durably enqueued", async () => {
+    const { path } = temporaryDatabase();
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    let failAfterEnqueue = true;
+    let nextId = 0;
+    const gateway = new FeishuGateway({
+      store,
+      outbox: {
+        enqueue: (input) => {
+          const inserted = outbox.enqueue(input);
+          if (failAfterEnqueue) {
+            failAfterEnqueue = false;
+            throw new Error("crash after accepted outbox");
+          }
+          return inserted;
+        },
+      },
+      dispatcher: { dispatch: async () => {} },
+      idFactory: () => `topic-${++nextId}`,
+    });
+    const event = message("hub", "/topic new Durable route", "outbox-crash-event");
+
+    try {
+      await expect(gateway.receive(event)).rejects.toThrow("crash after accepted outbox");
+      await expect(gateway.receive(event)).resolves.toEqual({ duplicate: false });
+      await expect(gateway.receive(event)).resolves.toEqual({ duplicate: true });
+      expect(store.listTopics("tenant-1", "tenant-1:user:user-1")).toHaveLength(1);
+      expect(outbox.pending()).toHaveLength(1);
+    } finally {
+      store.close();
+      outbox.close();
+    }
+  });
+
+  it("reuses the deterministic dispatch key after a checkpointed failure", async () => {
+    const { path } = temporaryDatabase();
+    let checkpointKey: string | undefined;
+    let starts = 0;
+    let resumes = 0;
+    const harness = gatewayHarness(path, async (input) => {
+      if (checkpointKey === undefined) {
+        checkpointKey = input.idempotencyKey;
+        starts += 1;
+        throw new Error("crash after checkpoint");
+      }
+      expect(input.idempotencyKey).toBe(checkpointKey);
+      resumes += 1;
+    });
+    const event = message("hub", "Checkpointed research", "checkpoint-event");
+
+    try {
+      await expect(harness.gateway.receive(event)).rejects.toThrow("crash after checkpoint");
+      await expect(harness.gateway.receive(event)).resolves.toEqual({ duplicate: false });
+      expect({ starts, resumes }).toEqual({ starts: 1, resumes: 1 });
+      expect(harness.store.events("topic-1").map((stored) => stored.type)).toEqual([
+        "topic.created",
+        "message.added",
+      ]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it("does not claim an event when stable identity resolution fails", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    const corrected = message("hub", "/topic new Identity", "identity-event");
+    const { userId: _userId, unionId: _unionId, ...missingIdentity } = corrected;
+
+    try {
+      await expect(harness.gateway.receive(missingIdentity)).rejects.toThrow(
+        "stable Feishu identity missing",
+      );
+      await expect(harness.gateway.receive(corrected)).resolves.toEqual({ duplicate: false });
+      expect(harness.store.topic("topic-1")?.title).toBe("Identity");
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
   });
 
   it("accepts the documented Feishu v2 fixture", async () => {
