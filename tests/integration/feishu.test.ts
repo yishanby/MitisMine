@@ -46,6 +46,20 @@ function message(
   };
 }
 
+function messageFrom(
+  userId: string,
+  appRole: FeishuMessageEvent["appRole"],
+  text: string,
+  eventId: string,
+): FeishuMessageEvent {
+  return {
+    ...message(appRole, text, eventId),
+    userId,
+    unionId: `union-${userId}`,
+    openId: `${appRole}-${userId}-open-id`,
+  };
+}
+
 function gatewayHarness(
   path: string,
   onDispatch: (input: DispatchInput) => Promise<void> = async () => {},
@@ -155,6 +169,47 @@ describe("FeishuGateway", () => {
       principalId: "tenant-1:user:user-2",
       role: "editor",
     });
+    harness.store.close();
+    harness.outbox.close();
+  });
+
+  it("lets a viewer inspect a shared Topic but never append or dispatch mutations", async () => {
+    const { path } = temporaryDatabase();
+    const harness = gatewayHarness(path);
+    await harness.gateway.receive(message("hub", "/topic new Shared read-only", "viewer-create"));
+    await harness.gateway.receive({
+      ...message("hub", "/topic share @_viewer viewer", "viewer-share"),
+      mentions: [{ key: "@_viewer", userId: "viewer", unionId: "union-viewer" }],
+    });
+    await harness.gateway.receive(messageFrom("viewer", "hub", "/topic use topic-1", "viewer-use"));
+
+    await harness.gateway.receive(messageFrom("viewer", "hub", "/topic show", "viewer-show"));
+    await harness.gateway.receive(messageFrom("viewer", "hub", "/status", "viewer-status"));
+    await harness.gateway.receive(messageFrom("viewer", "hub", "/report", "viewer-report"));
+    expect(harness.dispatches.map((input) => input.mode === "control" ? input.action : input.mode)).toEqual([
+      "status",
+      "report",
+    ]);
+
+    const watermark = harness.store.topic("topic-1")?.lastEventSeq;
+    const dispatchCount = harness.dispatches.length;
+    const forbidden = [
+      "/note cannot write",
+      "cannot send ordinary messages",
+      "/research cannot research",
+      "/stop",
+      "/action write blocked.txt nope",
+      "/topic share tenant-1:user:other editor",
+      "/topic archive",
+    ];
+    for (const [index, text] of forbidden.entries()) {
+      await expect(
+        harness.gateway.receive(messageFrom("viewer", "hub", text, `viewer-forbidden-${index}`)),
+      ).rejects.toThrow(/not allowed/i);
+    }
+
+    expect(harness.store.topic("topic-1")?.lastEventSeq).toBe(watermark);
+    expect(harness.dispatches).toHaveLength(dispatchCount);
     harness.store.close();
     harness.outbox.close();
   });

@@ -20,9 +20,18 @@ const providers = ["claude", "codex", "copilot"] as const;
 class MemoryOrchestrationStore implements OrchestrationStore {
   readonly checkpoints = new Map<string, OrchestrationCheckpoint>();
   readonly records: OrchestrationRecord[] = [];
+  readonly topicSessions = new Map<string, string>();
+  readonly staleTerminalOverwrites: string[] = [];
   crashAtCrossReview = false;
 
   save(checkpoint: OrchestrationCheckpoint): void {
+    const previous = this.checkpoints.get(checkpoint.run.id);
+    if (
+      previous?.run.state === "cancelled" &&
+      checkpoint.run.state !== "cancelled"
+    ) {
+      this.staleTerminalOverwrites.push(checkpoint.run.state);
+    }
     this.checkpoints.set(checkpoint.run.id, structuredClone(checkpoint));
     if (this.crashAtCrossReview && checkpoint.run.state === "cross_review") {
       this.crashAtCrossReview = false;
@@ -44,24 +53,40 @@ class MemoryOrchestrationStore implements OrchestrationStore {
       (checkpoint) => checkpoint.run.topicId === topicId,
     ).length;
   }
+
+  topicSession(topicId: string, provider: ProviderName): string | undefined {
+    return this.topicSessions.get(`${topicId}:${provider}`);
+  }
+
+  saveTopicSession(topicId: string, provider: ProviderName, externalSessionId: string): void {
+    this.topicSessions.set(`${topicId}:${provider}`, externalSessionId);
+  }
 }
 
 interface FakeOptions {
   readonly failed?: readonly ProviderName[];
   readonly openCritiques?: boolean;
+  readonly proposeSubtasks?: boolean;
+  readonly updateReportsOnResolve?: boolean;
+  readonly rejectFirstSignoff?: boolean;
+  readonly highCritiqueOnFirstSignoff?: boolean;
 }
 
 function phaseOf(prompt: string): string {
   return /^PHASE: ([^\n]+)/.exec(prompt)?.[1] ?? "unknown";
 }
 
-function report(provider: ProviderName): unknown {
+function report(
+  provider: ProviderName,
+  proposeSubtasks = false,
+  revision: "initial" | "resolved" = "initial",
+): unknown {
   return {
-    summary: `${provider} summary`,
+    summary: `${provider} ${revision} summary`,
     claims: [
       {
         id: `${provider}-claim`,
-        text: `${provider} supported claim`,
+        text: `${provider} ${revision} supported claim`,
         importance: "important",
         confidence: 0.9,
         evidenceIds: [`${provider}-evidence`],
@@ -73,32 +98,65 @@ function report(provider: ProviderName): unknown {
         url: `https://example.com/${provider}`,
         title: `${provider} source`,
         publisher: "Example",
-        quote: "Primary-source quotation",
+        quote: revision === "resolved"
+          ? "New quotation gathered during dispute resolution"
+          : "Primary-source quotation",
         retrievedAt: "2026-07-17T12:00:00.000Z",
       },
     ],
     openQuestions: [],
-    subtaskProposals: [],
+    subtaskProposals: proposeSubtasks
+      ? [
+          { id: `${provider}-sub-1`, title: "Check source", prompt: "Check source one" },
+          { id: `${provider}-sub-2`, title: "Check counterpoint", prompt: "Check source two" },
+        ]
+      : [],
   };
 }
 
 function fakeAdapters(
-  calls: Array<{ provider: ProviderName; phase: string; prompt: string }>,
+  calls: Array<{
+    provider: ProviderName;
+    phase: string;
+    prompt: string;
+    runId: string;
+    method: "start" | "resume";
+    externalSessionId?: string;
+    resultExternalSessionId: string;
+  }>,
   concurrency: { active: number; maximum: number },
   options: FakeOptions = {},
 ): AdapterRegistry {
   const make = (provider: ProviderName): AgentAdapter => {
-    const invoke = async (task: AgentTask | ResumeAgentTask): Promise<AdapterResult> => {
+    let startedSessions = 0;
+    let signoffCalls = 0;
+    const invoke = async (
+      task: AgentTask | ResumeAgentTask,
+      method: "start" | "resume",
+    ): Promise<AdapterResult> => {
       if (options.failed?.includes(provider)) throw new Error(`${provider} unavailable`);
       const phase = phaseOf(task.prompt);
-      calls.push({ provider, phase, prompt: task.prompt });
+      const resultExternalSessionId = "externalSessionId" in task
+        ? task.externalSessionId
+        : `${provider}-session-${++startedSessions}`;
+      calls.push({
+        provider,
+        phase,
+        prompt: task.prompt,
+        runId: task.runId,
+        method,
+        ...(method === "resume" && "externalSessionId" in task
+          ? { externalSessionId: task.externalSessionId }
+          : {}),
+        resultExternalSessionId,
+      });
       concurrency.active += 1;
       concurrency.maximum = Math.max(concurrency.maximum, concurrency.active);
       await new Promise((resolve) => setTimeout(resolve, 2));
       concurrency.active -= 1;
       let output: unknown;
       if (phase === "independent_research" || phase === "synthesize") {
-        output = report(provider);
+        output = report(provider, phase === "independent_research" && options.proposeSubtasks);
       } else if (phase === "cross_review") {
         output = {
           critiques: options.openCritiques
@@ -113,18 +171,42 @@ function fakeAdapters(
             : [],
         };
       } else if (phase === "signoff") {
-        output = { approved: true, critiques: [] };
+        signoffCalls += 1;
+        if (options.rejectFirstSignoff && signoffCalls === 1) {
+          output = { approved: false, critiques: [] };
+        } else if (options.highCritiqueOnFirstSignoff && signoffCalls === 1) {
+          output = {
+            approved: true,
+            critiques: [{
+              targetClaimId: `${provider}-claim`,
+              severity: "high",
+              text: "Signoff-only blocking concern",
+              status: "open",
+            }],
+          };
+        } else {
+          output = { approved: true, critiques: [] };
+        }
+      } else if (phase === "resolve_disputes") {
+        output = report(
+          provider,
+          false,
+          options.updateReportsOnResolve ? "resolved" : "initial",
+        );
       } else {
-        output = { resolved: true };
+        output = {};
       }
       return {
         provider,
-        externalSessionId:
-          "externalSessionId" in task ? task.externalSessionId : `${provider}-session`,
+        externalSessionId: resultExternalSessionId,
         events: [{ type: "final", text: JSON.stringify(output) }],
       };
     };
-    return { provider, start: invoke, resume: invoke };
+    return {
+      provider,
+      start: (task) => invoke(task, "start"),
+      resume: (task) => invoke(task, "resume"),
+    };
   };
   return {
     claude: make("claude"),
@@ -134,7 +216,15 @@ function fakeAdapters(
 }
 
 function createHarness(store: MemoryOrchestrationStore, options: FakeOptions = {}) {
-  const calls: Array<{ provider: ProviderName; phase: string; prompt: string }> = [];
+  const calls: Array<{
+    provider: ProviderName;
+    phase: string;
+    prompt: string;
+    runId: string;
+    method: "start" | "resume";
+    externalSessionId?: string;
+    resultExternalSessionId: string;
+  }> = [];
   const concurrency = { active: 0, maximum: 0 };
   return {
     calls,
@@ -157,6 +247,7 @@ describe("ResearchOrchestrator", () => {
       topicId: "topic-1",
       question: "question",
       cwd: process.cwd(),
+      contextPack: '{"watermark":7,"events":[]}',
     });
 
     expect(result.phases).toEqual([
@@ -167,7 +258,8 @@ describe("ResearchOrchestrator", () => {
       "signoff",
       "completed",
     ]);
-    expect(result.reviews).toHaveLength(6);
+    expect(result.reviews.filter((review) => review.approved === undefined)).toHaveLength(6);
+    expect(result.reviews.filter((review) => review.approved === true)).toHaveLength(2);
     expect(
       result.report?.claims.every(
         (claim) => claim.evidenceIds.length > 0 || claim.status === "unsupported",
@@ -183,6 +275,11 @@ describe("ResearchOrchestrator", () => {
       harness.calls
         .filter((call) => call.phase === "independent_research")
         .every((call) => call.prompt.includes("id, title, and prompt")),
+    ).toBe(true);
+    expect(
+      harness.calls
+        .filter((call) => call.phase === "independent_research")
+        .every((call) => call.prompt.includes('CONTEXT_PACK: {"watermark":7,"events":[]}')),
     ).toBe(true);
     expect(store.records.filter((event) => event.type === "agent.call.started")).toHaveLength(12);
     expect(store.records.filter((event) => event.type === "agent.call.completed")).toHaveLength(12);
@@ -220,7 +317,8 @@ describe("ResearchOrchestrator", () => {
     });
     expect(degradedResult.run.state).toBe("completed");
     expect(degradedResult.degradedProviders).toEqual(["copilot"]);
-    expect(degradedResult.reviews).toHaveLength(2);
+    expect(degradedResult.reviews.filter((review) => review.approved === undefined)).toHaveLength(2);
+    expect(degradedResult.reviews.filter((review) => review.approved === true)).toHaveLength(1);
 
     const pausedStore = new MemoryOrchestrationStore();
     const paused = createHarness(pausedStore, { failed: ["codex", "copilot"] });
@@ -248,8 +346,69 @@ describe("ResearchOrchestrator", () => {
     expect(result.run.state).toBe("completed");
     expect(result.run.round).toBe(3);
     expect(result.run.unresolved).toBe(true);
-    expect(result.reviews).toHaveLength(18);
+    expect(result.reviews.filter((review) => review.approved === undefined)).toHaveLength(18);
+    expect(result.reviews.filter((review) => review.approved === true)).toHaveLength(2);
     expect(result.phases).toContain("resolve_disputes");
+  });
+
+  it("normalizes resolved reports and reviews their updated claims and evidence next", async () => {
+    const store = new MemoryOrchestrationStore();
+    const harness = createHarness(store, { openCritiques: true, updateReportsOnResolve: true });
+
+    const result = await harness.orchestrator.start({
+      runId: "run-resolution-report",
+      topicId: "topic-resolution-report",
+      question: "question",
+      cwd: process.cwd(),
+    });
+
+    expect(result.reports.claude?.claims[0]?.text).toContain("resolved supported claim");
+    expect(result.reports.claude?.evidence[0]?.quote).toContain("New quotation");
+    expect(harness.calls.filter((call) => call.phase === "resolve_disputes").every(
+      (call) => call.prompt.includes("CURRENT_REPORT:") && call.prompt.includes("OPEN_CRITIQUES:"),
+    )).toBe(true);
+    expect(harness.calls.some(
+      (call) => call.phase === "cross_review" && call.prompt.includes("resolved supported claim"),
+    )).toBe(true);
+  });
+
+  it("turns an unqualified approved=false signoff into a blocking high critique", async () => {
+    const store = new MemoryOrchestrationStore();
+    const harness = createHarness(store, { rejectFirstSignoff: true });
+
+    const result = await harness.orchestrator.start({
+      runId: "run-signoff-rejected",
+      topicId: "topic-signoff-rejected",
+      question: "question",
+      cwd: process.cwd(),
+    });
+
+    expect(result.run.round).toBe(2);
+    expect(result.reviews.some((review) =>
+      review.approved === false && review.critiques.some((critique) =>
+        critique.severity === "high" && critique.status === "open"
+      )
+    )).toBe(true);
+  });
+
+  it("persists a signoff-only high critique and includes it in the next resolution prompt", async () => {
+    const store = new MemoryOrchestrationStore();
+    const harness = createHarness(store, { highCritiqueOnFirstSignoff: true });
+
+    const result = await harness.orchestrator.start({
+      runId: "run-signoff-critique",
+      topicId: "topic-signoff-critique",
+      question: "question",
+      cwd: process.cwd(),
+    });
+
+    expect(result.reviews.some((review) => review.critiques.some(
+      (critique) => critique.text === "Signoff-only blocking concern",
+    ))).toBe(true);
+    expect(harness.calls.some(
+      (call) => call.phase === "resolve_disputes" &&
+        call.prompt.includes("Signoff-only blocking concern"),
+    )).toBe(true);
   });
 
   it("rotates the synthesis provider between Topic runs", async () => {
@@ -270,5 +429,110 @@ describe("ResearchOrchestrator", () => {
 
     expect(first.run.coordinatorProvider).toBe(providers[0]);
     expect(second.run.coordinatorProvider).toBe(providers[1]);
+  });
+
+  it("resumes each provider research session across Runs in the same Topic", async () => {
+    const store = new MemoryOrchestrationStore();
+    const harness = createHarness(store);
+    await harness.orchestrator.start({
+      runId: "run-session-1",
+      topicId: "topic-session",
+      question: "one",
+      cwd: process.cwd(),
+    });
+    const firstSessions = Object.fromEntries(
+      providers.map((provider) => [provider, store.topicSession("topic-session", provider)]),
+    );
+
+    await harness.orchestrator.start({
+      runId: "run-session-2",
+      topicId: "topic-session",
+      question: "two",
+      cwd: process.cwd(),
+    });
+
+    const secondIndependent = harness.calls.filter(
+      (call) => call.runId === "run-session-2" && call.phase === "independent_research",
+    );
+    expect(secondIndependent).toHaveLength(3);
+    expect(secondIndependent).toEqual(expect.arrayContaining(
+      providers.map((provider) => expect.objectContaining({
+        provider,
+        method: "resume",
+        externalSessionId: firstSessions[provider],
+      })),
+    ));
+  });
+
+  it("keeps cancellation terminal when providers ignore abort and return late", async () => {
+    const store = new MemoryOrchestrationStore();
+    let startedCount = 0;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let releaseLate: (() => void) | undefined;
+    const late = new Promise<void>((resolve) => { releaseLate = resolve; });
+    const waiting = (provider: ProviderName): AgentAdapter => {
+      const invoke = async (_task: AgentTask | ResumeAgentTask): Promise<AdapterResult> => {
+        startedCount += 1;
+        if (startedCount === providers.length) markStarted?.();
+        await late;
+        return {
+          provider,
+          externalSessionId: `${provider}-late`,
+          events: [{ type: "final", text: JSON.stringify(report(provider)) }],
+        };
+      };
+      return { provider, start: invoke, resume: invoke };
+    };
+    const orchestrator = new ResearchOrchestrator({
+      store,
+      adapters: {
+        claude: waiting("claude"),
+        codex: waiting("codex"),
+        copilot: waiting("copilot"),
+      },
+    });
+    const running = orchestrator.start({
+      runId: "run-cancel",
+      topicId: "topic-1",
+      question: "question",
+      cwd: process.cwd(),
+    });
+    await started;
+
+    await orchestrator.cancel("run-cancel");
+    releaseLate?.();
+    const result = await running;
+
+    expect(result.run.state).toBe("cancelled");
+    expect(store.load("run-cancel")?.run.state).toBe("cancelled");
+    expect(store.staleTerminalOverwrites).toEqual([]);
+  });
+
+  it("executes at most two proposed subtasks per provider under the global semaphore", async () => {
+    const store = new MemoryOrchestrationStore();
+    const harness = createHarness(store, { proposeSubtasks: true });
+    const result = await harness.orchestrator.start({
+      runId: "run-subtasks",
+      topicId: "topic-subtasks",
+      question: "question",
+      cwd: process.cwd(),
+    });
+
+    const subtaskCalls = harness.calls.filter((call) => call.phase === "subtask_research");
+    expect(subtaskCalls).toHaveLength(6);
+    expect(subtaskCalls.every((call) => call.method === "start")).toBe(true);
+    expect(new Set(subtaskCalls.map((call) => call.resultExternalSessionId)).size).toBe(6);
+    for (const call of subtaskCalls) {
+      expect(call.resultExternalSessionId).not.toBe(store.topicSession("topic-subtasks", call.provider));
+    }
+    expect(Object.values(result.subtaskResults).flat()).toHaveLength(6);
+    expect(result.sessions).toEqual(Object.fromEntries(
+      providers.map((provider) => [provider, store.topicSession("topic-subtasks", provider)]),
+    ));
+    expect(Object.values(store.load("run-subtasks")?.subtaskSessions ?? {}).flatMap(
+      (sessions) => Object.values(sessions),
+    )).toHaveLength(6);
+    expect(harness.concurrency.maximum).toBeLessThanOrEqual(6);
   });
 });

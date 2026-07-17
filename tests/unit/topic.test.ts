@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   archiveTopic,
   canEditTopic,
+  canReadTopic,
   createTopic,
   resolvePrincipal,
 } from "../../packages/domain/src/topic.js";
@@ -58,6 +59,19 @@ describe("Topic lifecycle", () => {
     expect(canEditTopic(topic, owner, members)).toBe(true);
     expect(canEditTopic(topic, editor, members)).toBe(true);
     expect(canEditTopic(topic, viewer, members)).toBe(false);
+  });
+
+  it("allows owners, editors, and viewers to read but not non-members", () => {
+    const topic = createTopic("Research", owner);
+    const members = [
+      { principalId: editor, role: "editor" as const },
+      { principalId: viewer, role: "viewer" as const },
+    ];
+
+    expect(canReadTopic(topic, owner, members)).toBe(true);
+    expect(canReadTopic(topic, editor, members)).toBe(true);
+    expect(canReadTopic(topic, viewer, members)).toBe(true);
+    expect(canReadTopic(topic, "tenant:user:outsider", members)).toBe(false);
   });
 
   it("only lets an editor or owner archive an active Topic", () => {

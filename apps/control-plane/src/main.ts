@@ -7,6 +7,7 @@ import { ulid } from "ulid";
 
 import { createAdapters, type AdapterRegistry } from "../../../packages/agent-adapters/src/index.js";
 import { runJsonl } from "../../../packages/agent-protocol/src/runner.js";
+import { compileContext } from "../../../packages/domain/src/context.js";
 import {
   ApprovalEngine,
   TrustedActionExecutor,
@@ -21,6 +22,7 @@ import { FeishuLongConnections } from "../../../packages/feishu/src/live.js";
 import { OutboxDispatcher } from "../../../packages/feishu/src/outbox-dispatcher.js";
 import { type AppRegistration } from "../../../packages/feishu/src/registry.js";
 import { ResearchOrchestrator } from "../../../packages/orchestrator/src/index.js";
+import { directResearchPrompt } from "../../../packages/orchestrator/src/prompts.js";
 import { SqliteOrchestrationStore } from "../../../packages/storage/src/orchestration.js";
 import { SqliteApprovalStore } from "../../../packages/storage/src/approval.js";
 import { DurableOutbox } from "../../../packages/storage/src/outbox.js";
@@ -55,23 +57,23 @@ export async function createService(deps: ServiceDependencies): Promise<ControlP
   return app;
 }
 
-class ChannelDispatcher implements FeishuDispatcher {
-  readonly #orchestrator: ResearchOrchestrator;
-  readonly #checkpoints: SqliteOrchestrationStore;
+export class ChannelDispatcher implements FeishuDispatcher {
+  readonly #orchestrator: Pick<ResearchOrchestrator, "start" | "resume" | "cancel">;
+  readonly #checkpoints: Pick<SqliteOrchestrationStore, "load" | "latestForTopic">;
   readonly #store: EventStore;
   readonly #outbox: DurableOutbox;
   readonly #adapters: AdapterRegistry;
   readonly #dataDirectory: string;
-  readonly #approval: ApprovalEngine;
+  readonly #approval: Pick<ApprovalEngine, "request">;
 
   constructor(options: {
-    orchestrator: ResearchOrchestrator;
-    checkpoints: SqliteOrchestrationStore;
+    orchestrator: Pick<ResearchOrchestrator, "start" | "resume" | "cancel">;
+    checkpoints: Pick<SqliteOrchestrationStore, "load" | "latestForTopic">;
     store: EventStore;
     outbox: DurableOutbox;
     adapters: AdapterRegistry;
     dataDirectory: string;
-    approval: ApprovalEngine;
+    approval: Pick<ApprovalEngine, "request">;
   }) {
     this.#orchestrator = options.orchestrator;
     this.#checkpoints = options.checkpoints;
@@ -112,6 +114,7 @@ class ChannelDispatcher implements FeishuDispatcher {
             topicId: input.topicId,
             question: input.question,
             cwd: this.#workspace(input.topicId),
+            contextPack: this.#contextPack(input.topicId),
           })
         : await this.#orchestrator.resume(runId);
       this.#store.append({
@@ -123,7 +126,13 @@ class ChannelDispatcher implements FeishuDispatcher {
       });
       this.#enqueue(
         input,
-        result.run.unresolved ? "调研完成（存在未决争议）" : "调研完成",
+        result.run.state === "cancelled"
+          ? "调���已停止"
+          : result.run.state === "paused"
+            ? "调研已暂停"
+            : result.run.unresolved
+              ? "调研完成（存在未决争议）"
+              : "调研完成",
         result.report === undefined ? "未生成报告" : renderReport(result.report),
       );
       return;
@@ -134,7 +143,7 @@ class ChannelDispatcher implements FeishuDispatcher {
       const task = {
         topicId: input.topicId,
         runId: `direct-${ulid()}`,
-        prompt: input.question,
+        prompt: directResearchPrompt(input.question, this.#contextPack(input.topicId)),
         cwd: this.#workspace(input.topicId),
       };
       const result = previous?.externalSessionId === undefined
@@ -192,7 +201,12 @@ class ChannelDispatcher implements FeishuDispatcher {
       );
       return;
     }
-    this.#enqueue(input, "停止请求", "停止信号已记录；正在运行的子进程将在安全检查点终止。 ");
+    if (latest === undefined) {
+      this.#enqueue(input, "停止请求", "当前 Topic 没有可停止的 Run");
+      return;
+    }
+    await this.#orchestrator.cancel(latest.run.id);
+    this.#enqueue(input, "调研已停止", `Run: ${latest.run.id}`);
   }
 
   #workspace(topicId: string): string {
@@ -203,6 +217,42 @@ class ChannelDispatcher implements FeishuDispatcher {
     }
     mkdirSync(workspace, { recursive: true });
     return workspace;
+  }
+
+  #contextPack(topicId: string): string {
+    const topic = this.#store.topic(topicId);
+    if (topic === undefined) throw new Error(`Topic not found: ${topicId}`);
+    const events = this.#store.events(topicId).map((event) => {
+      const payload = typeof event.payload === "object" && event.payload !== null
+        ? event.payload as Record<string, unknown>
+        : {};
+      const pinned = event.type === "message.added" && payload.note === true;
+      return {
+        seq: event.seq,
+        type: event.type,
+        text: JSON.stringify({
+          ...(event.actorPrincipalId === undefined ? {} : { actorPrincipalId: event.actorPrincipalId }),
+          payload: event.payload,
+          createdAt: event.createdAt,
+        }),
+        relevance: pinned ? 1 : event.type === "message.added" ? 0.9 : 0.5,
+        pinned,
+      };
+    });
+    return compileContext({
+      maxChars: 12_000,
+      summary: JSON.stringify({
+        id: topic.id,
+        title: topic.title,
+        status: topic.status,
+        ownerPrincipalId: topic.ownerPrincipalId,
+        createdAt: topic.createdAt,
+        updatedAt: topic.updatedAt,
+      }),
+      events,
+      evidence: [],
+      watermark: topic.lastEventSeq,
+    }).serialized;
   }
 
   #enqueue(input: DispatchInput, title: string, content: string, effect = "result"): void {

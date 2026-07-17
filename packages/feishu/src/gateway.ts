@@ -4,6 +4,7 @@ import type { Topic, TopicMember } from "../../domain/src/model.js";
 import {
   archiveTopic,
   canEditTopic,
+  canReadTopic,
   createTopic,
   resolvePrincipal,
 } from "../../domain/src/topic.js";
@@ -154,7 +155,7 @@ export class FeishuGateway {
         return;
       }
       case "topic.show": {
-        const topic = this.#requireCurrent(event.tenantKey, principalId);
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "read");
         const members = this.#store.members(topic.id);
         this.#respond(
           event,
@@ -166,9 +167,7 @@ export class FeishuGateway {
         return;
       }
       case "topic.share": {
-        const topic = this.#requireCurrent(event.tenantKey, principalId);
-        const members = this.#store.members(topic.id);
-        if (!canEditTopic(topic, principalId, members)) throw new Error("principal cannot share Topic");
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "edit");
         const mention = event.mentions?.find((candidate) => candidate.key === command.principalId);
         const memberPrincipalId = mention === undefined
           ? command.principalId
@@ -189,7 +188,7 @@ export class FeishuGateway {
         return;
       }
       case "topic.archive": {
-        const topic = this.#requireCurrent(event.tenantKey, principalId);
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "edit");
         const archived = archiveTopic(topic, principalId, this.#store.members(topic.id));
         this.#store.append({
           topicId: topic.id,
@@ -254,7 +253,11 @@ export class FeishuGateway {
       case "status":
       case "stop":
       case "report": {
-        const topic = this.#requireCurrent(event.tenantKey, principalId);
+        const topic = this.#requireCurrent(
+          event.tenantKey,
+          principalId,
+          command.kind === "stop" ? "edit" : "read",
+        );
         await this.#dispatcher.dispatch({
           mode: "control",
           action: command.kind,
@@ -268,7 +271,7 @@ export class FeishuGateway {
         return;
       }
       case "action.write": {
-        const topic = this.#requireCurrent(event.tenantKey, principalId);
+        const topic = this.#requireCurrent(event.tenantKey, principalId, "edit");
         await this.#dispatcher.dispatch({
           mode: "action",
           action: {
@@ -321,16 +324,32 @@ export class FeishuGateway {
     const currentId = this.#store.currentTopic(event.tenantKey, principalId);
     if (currentId !== undefined) {
       const current = this.#store.topic(currentId);
-      if (current !== undefined && current.status === "active") return current;
+      if (current !== undefined && current.status === "active") {
+        this.#assertAccess(current, principalId, "edit");
+        return current;
+      }
     }
     return this.#createTopic(event.tenantKey, principalId, summarize(text), `${routeKey}:topic`);
   }
 
-  #requireCurrent(tenantKey: string, principalId: string): Topic {
+  #requireCurrent(
+    tenantKey: string,
+    principalId: string,
+    permission: "read" | "edit",
+  ): Topic {
     const topicId = this.#store.currentTopic(tenantKey, principalId);
     const topic = topicId === undefined ? undefined : this.#store.topic(topicId);
     if (topic === undefined) throw new Error("No current Topic; use /topic new first");
+    this.#assertAccess(topic, principalId, permission);
     return topic;
+  }
+
+  #assertAccess(topic: Topic, principalId: string, permission: "read" | "edit"): void {
+    const members = this.#store.members(topic.id);
+    const allowed = permission === "edit"
+      ? canEditTopic(topic, principalId, members)
+      : canReadTopic(topic, principalId, members);
+    if (!allowed) throw new Error(`principal is not allowed to ${permission} Topic`);
   }
 
   #appendMessage(

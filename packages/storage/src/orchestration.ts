@@ -7,6 +7,7 @@ import type {
   OrchestrationRecord,
   OrchestrationStore,
 } from "../../orchestrator/src/index.js";
+import type { ProviderName } from "../../agent-adapters/src/index.js";
 import { SCHEMA_SQL } from "./schema.js";
 
 interface CheckpointRow {
@@ -91,6 +92,30 @@ export class SqliteOrchestrationStore implements OrchestrationStore {
       .prepare("SELECT COUNT(*) AS count FROM orchestration_checkpoints WHERE topic_id = ?")
       .get(topicId) as { count: number };
     return Number(row.count);
+  }
+
+  topicSession(topicId: string, provider: ProviderName): string | undefined {
+    const row = this.#database
+      .prepare(`
+        SELECT external_session_id FROM agent_sessions
+        WHERE topic_id = ? AND provider = ? AND role = 'research'
+      `)
+      .get(topicId, provider) as { external_session_id: string | null } | undefined;
+    return row?.external_session_id ?? undefined;
+  }
+
+  saveTopicSession(topicId: string, provider: ProviderName, externalSessionId: string): void {
+    this.#database
+      .prepare(`
+        INSERT INTO agent_sessions (
+          id, topic_id, provider, role, external_session_id,
+          context_watermark, status
+        ) VALUES (?, ?, ?, 'research', ?, 0, 'active')
+        ON CONFLICT (topic_id, provider, role) DO UPDATE SET
+          external_session_id = excluded.external_session_id,
+          status = excluded.status
+      `)
+      .run(`research:${topicId}:${provider}`, topicId, provider, externalSessionId);
   }
 
   records(runId: string): OrchestrationRecord[] {

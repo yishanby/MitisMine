@@ -63,6 +63,16 @@ export function canEditTopic(
   );
 }
 
+export function canReadTopic(
+  topic: Topic,
+  principalId: string,
+  members: readonly TopicMember[],
+): boolean {
+  return principalId === topic.ownerPrincipalId || members.some(
+    (member) => member.principalId === principalId,
+  );
+}
+
 export function archiveTopic(
   topic: Topic,
   principalId: string,

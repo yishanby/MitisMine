@@ -23,6 +23,7 @@ import {
   repairReportPrompt,
   signoffPrompt,
   synthesisPrompt,
+  subtaskResearchPrompt,
 } from "./prompts.js";
 
 const PROVIDERS = ["claude", "codex", "copilot"] as const;
@@ -45,8 +46,17 @@ export interface ResearchReview {
   reviewer: ProviderName;
   target: ProviderName;
   round: number;
+  approved?: boolean;
   critiques: Critique[];
 }
+
+export interface SubtaskResult {
+  readonly id: string;
+  readonly title: string;
+  readonly text: string;
+}
+
+export type OrchestrationPhase = RunState | "subtask_research";
 
 export interface OrchestrationCheckpoint {
   run: ResearchRun;
@@ -56,6 +66,9 @@ export interface OrchestrationCheckpoint {
   sessions: Partial<Record<ProviderName, string>>;
   reviews: ResearchReview[];
   degradedProviders: ProviderName[];
+  contextPack?: string;
+  subtaskSessions?: Partial<Record<ProviderName, Record<string, string>>>;
+  subtaskResults?: Partial<Record<ProviderName, SubtaskResult[]>>;
   report?: NormalizedReport;
 }
 
@@ -64,7 +77,7 @@ export interface OrchestrationRecord {
   readonly topicId: string;
   readonly type: "agent.call.started" | "agent.call.completed" | "agent.call.failed";
   readonly provider: ProviderName;
-  readonly phase: RunState;
+  readonly phase: OrchestrationPhase;
   readonly createdAt: string;
 }
 
@@ -73,6 +86,8 @@ export interface OrchestrationStore {
   load(runId: string): OrchestrationCheckpoint | undefined;
   record(event: OrchestrationRecord): void;
   runCount(topicId: string): number;
+  topicSession(topicId: string, provider: ProviderName): string | undefined;
+  saveTopicSession(topicId: string, provider: ProviderName, externalSessionId: string): void;
 }
 
 export interface StartResearchInput {
@@ -80,6 +95,7 @@ export interface StartResearchInput {
   readonly topicId: string;
   readonly question: string;
   readonly cwd: string;
+  readonly contextPack?: string;
 }
 
 export interface ResearchResult {
@@ -89,6 +105,7 @@ export interface ResearchResult {
   readonly sessions: Readonly<Partial<Record<ProviderName, string>>>;
   readonly reviews: readonly ResearchReview[];
   readonly degradedProviders: readonly ProviderName[];
+  readonly subtaskResults: Readonly<Partial<Record<ProviderName, readonly SubtaskResult[]>>>;
   readonly report?: NormalizedReport;
 }
 
@@ -126,6 +143,8 @@ export class ResearchOrchestrator {
   readonly #adapters: AdapterRegistry;
   readonly #store: OrchestrationStore;
   readonly #semaphore: Semaphore;
+  readonly #controllers = new Map<string, AbortController>();
+  readonly #cancelled = new Set<string>();
 
   constructor(options: OrchestratorOptions) {
     this.#adapters = options.adapters;
@@ -148,30 +167,70 @@ export class ResearchOrchestrator {
       cwd: input.cwd,
       phases: [],
       reports: {},
-      sessions: {},
+      sessions: Object.fromEntries(
+        PROVIDERS.flatMap((provider) => {
+          const externalSessionId = this.#store.topicSession(input.topicId, provider);
+          return externalSessionId === undefined ? [] : [[provider, externalSessionId]];
+        }),
+      ),
       reviews: [],
       degradedProviders: [],
+      ...(input.contextPack === undefined ? {} : { contextPack: input.contextPack }),
+      subtaskResults: {},
     };
-    this.#store.save(checkpoint);
-    return this.#execute(checkpoint);
+    this.#save(checkpoint);
+    return this.#run(checkpoint);
   }
 
   async resume(runId: string): Promise<ResearchResult> {
     const checkpoint = this.#store.load(runId);
     if (checkpoint === undefined) throw new Error(`ResearchRun not found: ${runId}`);
-    return this.#execute(checkpoint);
+    return this.#run(checkpoint);
   }
 
-  async #execute(checkpoint: OrchestrationCheckpoint): Promise<ResearchResult> {
+  async cancel(runId: string): Promise<void> {
+    const checkpoint = this.#store.load(runId);
+    if (checkpoint === undefined) throw new Error(`ResearchRun not found: ${runId}`);
+    if (["completed", "cancelled", "failed"].includes(checkpoint.run.state)) return;
+    this.#cancelled.add(runId);
+    this.#controllers.get(runId)?.abort();
+    checkpoint.run = transition(checkpoint.run, { type: "CANCEL" });
+    this.#phase(checkpoint, "cancelled");
+    this.#save(checkpoint);
+  }
+
+  async #run(checkpoint: OrchestrationCheckpoint): Promise<ResearchResult> {
+    const controller = new AbortController();
+    this.#controllers.set(checkpoint.run.id, controller);
+    try {
+      return await this.#execute(checkpoint, controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted && !this.#cancelled.has(checkpoint.run.id)) throw error;
+      if (!["completed", "cancelled", "failed"].includes(checkpoint.run.state)) {
+        checkpoint.run = transition(checkpoint.run, { type: "CANCEL" });
+      }
+      this.#phase(checkpoint, "cancelled");
+      this.#save(checkpoint);
+      return this.#result(checkpoint);
+    } finally {
+      this.#controllers.delete(checkpoint.run.id);
+      this.#cancelled.delete(checkpoint.run.id);
+    }
+  }
+
+  async #execute(checkpoint: OrchestrationCheckpoint, signal: AbortSignal): Promise<ResearchResult> {
     while (checkpoint.run.state !== "completed" && checkpoint.run.state !== "paused") {
       switch (checkpoint.run.state) {
         case "queued":
           checkpoint.run = transition(checkpoint.run, { type: "START" });
           this.#phase(checkpoint, "independent_research");
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         case "independent_research":
           await this.#independent(checkpoint);
+          throwIfAborted(signal);
+          await this.#subtasks(checkpoint);
+          throwIfAborted(signal);
           if (successfulProviders(checkpoint).length < 2) {
             checkpoint.run = transition(checkpoint.run, { type: "PAUSE" });
             this.#phase(checkpoint, "paused");
@@ -179,15 +238,16 @@ export class ResearchOrchestrator {
             checkpoint.run = transition(checkpoint.run, { type: "INDEPENDENT_COMPLETED" });
             this.#phase(checkpoint, "normalize_evidence");
           }
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         case "normalize_evidence":
           checkpoint.run = transition(checkpoint.run, { type: "NORMALIZED" });
           this.#phase(checkpoint, "cross_review");
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         case "cross_review": {
           const reviews = await this.#crossReview(checkpoint);
+          throwIfAborted(signal);
           checkpoint.reviews.push(...reviews);
           const open = countOpen(reviews);
           checkpoint.run = transition(checkpoint.run, {
@@ -195,29 +255,33 @@ export class ResearchOrchestrator {
             openMediumHigh: open,
           });
           this.#phase(checkpoint, checkpoint.run.state);
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         }
         case "resolve_disputes":
           await this.#resolveDisputes(checkpoint);
+          throwIfAborted(signal);
           checkpoint.run = transition(checkpoint.run, { type: "RESOLUTION_COMPLETED" });
           this.#phase(checkpoint, "cross_review");
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         case "synthesize":
           await this.#synthesize(checkpoint);
+          throwIfAborted(signal);
           checkpoint.run = transition(checkpoint.run, { type: "SYNTHESIZED" });
           this.#phase(checkpoint, "signoff");
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         case "signoff": {
-          const critiques = await this.#signoff(checkpoint);
+          const reviews = await this.#signoff(checkpoint);
+          throwIfAborted(signal);
+          checkpoint.reviews.push(...reviews);
           checkpoint.run = transition(checkpoint.run, {
             type: "SIGNED_OFF",
-            openMediumHigh: countOpenCritiques(critiques),
+            openMediumHigh: countOpen(reviews),
           });
           this.#phase(checkpoint, checkpoint.run.state);
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
           break;
         }
         case "awaiting_approval":
@@ -239,7 +303,11 @@ export class ResearchOrchestrator {
             checkpoint,
             provider,
             "independent_research",
-            independentResearchPrompt(checkpoint.run.question, provider),
+            independentResearchPrompt(
+              checkpoint.run.question,
+              provider,
+              checkpoint.contextPack ?? '{"watermark":0,"summary":"","evidence":[],"events":[]}',
+            ),
           );
           checkpoint.sessions[provider] = result.externalSessionId;
           try {
@@ -254,12 +322,12 @@ export class ResearchOrchestrator {
             checkpoint.sessions[provider] = repaired.externalSessionId;
             checkpoint.reports[provider] = parseReport(finalText(repaired));
           }
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
         } catch {
           if (!checkpoint.degradedProviders.includes(provider)) {
             checkpoint.degradedProviders.push(provider);
           }
-          this.#store.save(checkpoint);
+          this.#save(checkpoint);
         }
       }),
     );
@@ -292,18 +360,46 @@ export class ResearchOrchestrator {
     return groups.flat();
   }
 
+  async #subtasks(checkpoint: OrchestrationCheckpoint): Promise<void> {
+    const subtaskResults = checkpoint.subtaskResults ?? (checkpoint.subtaskResults = {});
+    await Promise.all(
+      successfulProviders(checkpoint).map(async (provider) => {
+        const report = checkpoint.reports[provider];
+        if (report === undefined) return;
+        const results: SubtaskResult[] = [];
+        for (const proposal of report.subtaskProposals.slice(0, 2)) {
+          const response = await this.#invoke(
+            checkpoint,
+            provider,
+            "subtask_research",
+            subtaskResearchPrompt({ provider, ...proposal }),
+            proposal.id,
+          );
+          results.push({ id: proposal.id, title: proposal.title, text: finalText(response) });
+          subtaskResults[provider] = results;
+          this.#save(checkpoint);
+        }
+      }),
+    );
+  }
+
   async #resolveDisputes(checkpoint: OrchestrationCheckpoint): Promise<void> {
     const open = checkpoint.reviews.filter((review) => countOpen([review]) > 0);
-    await Promise.all(
-      successfulProviders(checkpoint).map((provider) =>
-        this.#invoke(
+    const resolved = await Promise.all(
+      successfulProviders(checkpoint).map(async (provider) => {
+        const report = checkpoint.reports[provider];
+        if (report === undefined) throw new Error(`Missing report for ${provider}`);
+        const result = await this.#invoke(
           checkpoint,
           provider,
           "resolve_disputes",
-          disputeResolutionPrompt(provider, open, checkpoint.run.round),
-        ),
-      ),
+          disputeResolutionPrompt(provider, report, open, checkpoint.run.round),
+        );
+        return [provider, parseReport(finalText(result))] as const;
+      }),
     );
+    for (const [provider, report] of resolved) checkpoint.reports[provider] = report;
+    this.#save(checkpoint);
   }
 
   async #synthesize(checkpoint: OrchestrationCheckpoint): Promise<void> {
@@ -320,6 +416,7 @@ export class ResearchOrchestrator {
       synthesisPrompt(
         checkpoint.run.question,
         checkpoint.reports,
+        checkpoint.subtaskResults ?? {},
         checkpoint.reviews,
         checkpoint.run.unresolved,
       ),
@@ -327,7 +424,7 @@ export class ResearchOrchestrator {
     checkpoint.report = parseReport(finalText(result));
   }
 
-  async #signoff(checkpoint: OrchestrationCheckpoint): Promise<Critique[]> {
+  async #signoff(checkpoint: OrchestrationCheckpoint): Promise<ResearchReview[]> {
     if (checkpoint.report === undefined) throw new Error("Cannot sign off without a report");
     const signers = successfulProviders(checkpoint).filter(
       (provider) => provider !== checkpoint.run.coordinatorProvider,
@@ -340,17 +437,34 @@ export class ResearchOrchestrator {
           "signoff",
           signoffPrompt(checkpoint.report as NormalizedReport),
         );
-        return signoffSchema.parse(parseJson(finalText(result))).critiques;
+        const parsed = signoffSchema.parse(parseJson(finalText(result)));
+        const critiques = [...parsed.critiques];
+        if (!parsed.approved && countOpenCritiques(critiques) === 0) {
+          critiques.push({
+            targetClaimId: checkpoint.report?.claims[0]?.id ?? "final-report",
+            severity: "high",
+            text: "Signoff rejected without a blocking critique; approval is required before completion",
+            status: "open",
+          });
+        }
+        return {
+          reviewer: provider,
+          target: checkpoint.run.coordinatorProvider,
+          round: checkpoint.run.round,
+          approved: parsed.approved,
+          critiques,
+        };
       }),
     );
-    return results.flat();
+    return results;
   }
 
   async #invoke(
     checkpoint: OrchestrationCheckpoint,
     provider: ProviderName,
-    phase: RunState,
+    phase: OrchestrationPhase,
     prompt: string,
+    subtaskId?: string,
   ): Promise<AdapterResult> {
     const baseRecord = {
       runId: checkpoint.run.id,
@@ -365,18 +479,33 @@ export class ResearchOrchestrator {
     });
     try {
       const result = await this.#semaphore.run(() => {
-        const externalSessionId = checkpoint.sessions[provider];
+        const externalSessionId = subtaskId === undefined
+          ? checkpoint.sessions[provider]
+          : checkpoint.subtaskSessions?.[provider]?.[subtaskId];
+        const activeSignal = this.#controllers.get(checkpoint.run.id)?.signal;
         const task = {
           topicId: checkpoint.run.topicId,
           runId: checkpoint.run.id,
           prompt,
           cwd: checkpoint.cwd,
+          ...(activeSignal === undefined ? {} : { signal: activeSignal }),
         };
         return externalSessionId === undefined
           ? this.#adapters[provider].start(task)
           : this.#adapters[provider].resume({ ...task, externalSessionId });
       });
-      checkpoint.sessions[provider] = result.externalSessionId;
+      if (subtaskId === undefined) {
+        checkpoint.sessions[provider] = result.externalSessionId;
+        this.#store.saveTopicSession(
+          checkpoint.run.topicId,
+          provider,
+          result.externalSessionId,
+        );
+      } else {
+        const sessions = checkpoint.subtaskSessions ?? (checkpoint.subtaskSessions = {});
+        const providerSessions = sessions[provider] ?? (sessions[provider] = {});
+        providerSessions[subtaskId] = result.externalSessionId;
+      }
       this.#store.record({
         ...baseRecord,
         type: "agent.call.completed",
@@ -393,6 +522,19 @@ export class ResearchOrchestrator {
     }
   }
 
+  #save(checkpoint: OrchestrationCheckpoint): void {
+    const persisted = this.#store.load(checkpoint.run.id);
+    if (
+      persisted !== undefined &&
+      isTerminalState(persisted.run.state) &&
+      persisted.run.state !== checkpoint.run.state
+    ) {
+      checkpoint.run = persisted.run;
+      return;
+    }
+    this.#store.save(checkpoint);
+  }
+
   #phase(checkpoint: OrchestrationCheckpoint, phase: RunState): void {
     if (!checkpoint.phases.includes(phase)) checkpoint.phases.push(phase);
   }
@@ -405,6 +547,7 @@ export class ResearchOrchestrator {
       sessions: checkpoint.sessions,
       reviews: checkpoint.reviews,
       degradedProviders: checkpoint.degradedProviders,
+      subtaskResults: checkpoint.subtaskResults ?? {},
       ...(checkpoint.report === undefined ? {} : { report: checkpoint.report }),
     };
   }
@@ -447,4 +590,12 @@ function countOpenCritiques(critiques: readonly Critique[]): number {
       critique.status === "open" &&
       (critique.severity === "medium" || critique.severity === "high"),
   ).length;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new Error("ResearchRun cancelled");
+}
+
+function isTerminalState(state: RunState): boolean {
+  return state === "completed" || state === "cancelled" || state === "failed";
 }

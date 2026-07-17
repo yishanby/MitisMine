@@ -4,16 +4,26 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createService } from "../../apps/control-plane/src/main.js";
+import { ChannelDispatcher, createService } from "../../apps/control-plane/src/main.js";
+import type {
+  AdapterRegistry,
+  AgentAdapter,
+  AgentTask,
+  ProviderName,
+  ResumeAgentTask,
+} from "../../packages/agent-adapters/src/index.js";
 import {
   AppConnectionRegistry,
   WorkerRegistry,
 } from "../../apps/control-plane/src/health.js";
 import { WorkerLeaseStore } from "../../apps/worker/src/main.js";
 import { createQueuedRun } from "../../packages/domain/src/run-machine.js";
+import { createTopic } from "../../packages/domain/src/topic.js";
 import { SqliteOrchestrationStore } from "../../packages/storage/src/orchestration.js";
 import { DurableOutbox } from "../../packages/storage/src/outbox.js";
 import { OutboxDispatcher } from "../../packages/feishu/src/outbox-dispatcher.js";
+import { FeishuGateway, type FeishuMessageEvent } from "../../packages/feishu/src/gateway.js";
+import { EventStore } from "../../packages/storage/src/store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -68,6 +78,108 @@ describe("control-plane health", () => {
     await service.close();
     await service.close();
     expect(order).toEqual(["outbox", "store"]);
+  });
+});
+
+describe("ChannelDispatcher Context Pack", () => {
+  it("passes Topic notes and the current watermark to research and direct provider prompts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-context-pack-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "context.db");
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    const researchPacks: string[] = [];
+    const directPrompts: string[] = [];
+    let directCalled: (() => void) | undefined;
+    const directCall = new Promise<void>((resolve) => { directCalled = resolve; });
+    const adapter = (provider: ProviderName): AgentAdapter => {
+      const invoke = async (task: AgentTask | ResumeAgentTask) => {
+        directPrompts.push(task.prompt);
+        directCalled?.();
+        return {
+          provider,
+          externalSessionId: `${provider}-direct-session`,
+          events: [{ type: "final" as const, text: "direct answer" }],
+        };
+      };
+      return { provider, start: invoke, resume: invoke };
+    };
+    const adapters: AdapterRegistry = {
+      claude: adapter("claude"),
+      codex: adapter("codex"),
+      copilot: adapter("copilot"),
+    };
+    const orchestrator = {
+      start: async (input: { contextPack?: string; runId: string; topicId: string; question: string }) => {
+        researchPacks.push(input.contextPack ?? "");
+        const queued = createQueuedRun({
+          id: input.runId,
+          topicId: input.topicId,
+          question: input.question,
+          coordinatorProvider: "claude",
+        });
+        return {
+          run: { ...queued, state: "completed" as const },
+          phases: [],
+          reports: {},
+          sessions: {},
+          reviews: [],
+          degradedProviders: [],
+          subtaskResults: {},
+        };
+      },
+      resume: async () => { throw new Error("unexpected resume"); },
+      cancel: async () => {},
+    };
+    const dispatcher = new ChannelDispatcher({
+      orchestrator,
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters,
+      dataDirectory: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+    let nextTopic = 0;
+    const gateway = new FeishuGateway({
+      store,
+      outbox,
+      dispatcher,
+      idFactory: () => `topic-${++nextTopic}`,
+    });
+    const event = (
+      appRole: FeishuMessageEvent["appRole"],
+      text: string,
+      eventId: string,
+    ): FeishuMessageEvent => ({
+      appRole,
+      text,
+      eventId,
+      tenantKey: "tenant",
+      userId: "owner",
+      openId: `${appRole}-open`,
+      messageId: `${eventId}-message`,
+      chatId: "chat",
+    });
+
+    try {
+      await gateway.receive(event("hub", "/topic new Context", "context-create"));
+      await gateway.receive(event("hub", "/note remember the launch date", "context-note"));
+      await gateway.receive(event("hub", "/research investigate", "context-research"));
+
+      expect(researchPacks).toHaveLength(1);
+      expect(researchPacks[0]).toContain("remember the launch date");
+      expect(researchPacks[0]).toContain('"watermark":3');
+
+      await gateway.receive(event("claude", "continue directly", "context-direct"));
+      await directCall;
+      expect(directPrompts.at(-1)).toContain("CONTEXT_PACK:");
+      expect(directPrompts.at(-1)).toContain("remember the launch date");
+      expect(directPrompts.at(-1)).toContain('"watermark":5');
+    } finally {
+      store.close();
+      outbox.close();
+    }
   });
 });
 
@@ -139,6 +251,29 @@ describe("SqliteOrchestrationStore", () => {
     expect(second.load("run-1")?.run.state).toBe("queued");
     expect(second.runCount("topic-1")).toBe(1);
     expect(second.records("run-1")).toHaveLength(1);
+    second.close();
+  });
+
+  it("restores Topic research sessions after restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-topic-session-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "sessions.db");
+    const events = EventStore.open(path);
+    const topic = createTopic("Persistent sessions", "tenant:user:owner", { id: "topic-session" });
+    events.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: { topic },
+    });
+    events.close();
+
+    const first = SqliteOrchestrationStore.open(path);
+    first.saveTopicSession("topic-session", "claude", "claude-external-1");
+    first.close();
+
+    const second = SqliteOrchestrationStore.open(path);
+    expect(second.topicSession("topic-session", "claude")).toBe("claude-external-1");
     second.close();
   });
 });
