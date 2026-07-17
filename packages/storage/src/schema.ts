@@ -106,6 +106,74 @@ CREATE TABLE IF NOT EXISTS direct_session_cursors (
 CREATE INDEX IF NOT EXISTS direct_sessions_topic_provider_updated_idx
   ON direct_sessions (topic_id, provider, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS group_chat_topics (
+  tenant_key TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_key, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS group_discussions (
+  id TEXT PRIMARY KEY,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  tenant_key TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  question TEXT NOT NULL,
+  starter_principal_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (
+    state IN ('active', 'paused', 'summarizing', 'completed', 'stopped', 'failed')
+  ),
+  round INTEGER NOT NULL,
+  turn_index INTEGER NOT NULL,
+  next_provider TEXT NOT NULL,
+  max_rounds INTEGER NOT NULL,
+  preferred_provider TEXT,
+  control_message_id TEXT,
+  active_turn_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS group_discussions_one_active_chat_idx
+  ON group_discussions (tenant_key, chat_id)
+  WHERE state IN ('active', 'paused', 'summarizing');
+
+CREATE TABLE IF NOT EXISTS discussion_steers (
+  id TEXT PRIMARY KEY,
+  discussion_id TEXT NOT NULL REFERENCES group_discussions(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL UNIQUE,
+  topic_event_seq INTEGER NOT NULL,
+  principal_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  preferred_provider TEXT,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'consumed')),
+  created_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS discussion_steers_pending_idx
+  ON discussion_steers (discussion_id, status, created_at, id);
+
+CREATE TABLE IF NOT EXISTS discussion_turns (
+  id TEXT PRIMARY KEY,
+  discussion_id TEXT NOT NULL REFERENCES group_discussions(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  round INTEGER NOT NULL,
+  turn_index INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'cancelled', 'failed')),
+  external_session_id TEXT,
+  text TEXT,
+  continue_discussion INTEGER,
+  open_questions_json TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT,
+  completed_at TEXT,
+  UNIQUE (discussion_id, turn_index)
+);
+
+CREATE INDEX IF NOT EXISTS discussion_turns_round_idx
+  ON discussion_turns (discussion_id, round, turn_index);
+
 CREATE TABLE IF NOT EXISTS claims (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
