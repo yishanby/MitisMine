@@ -145,6 +145,14 @@ CREATE TABLE IF NOT EXISTS worker_leases (
   status TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS worker_lease_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS orchestration_checkpoints (
   run_id TEXT PRIMARY KEY,
   topic_id TEXT NOT NULL,

@@ -248,6 +248,68 @@ describe("ChannelDispatcher Context Pack", () => {
 });
 
 describe("WorkerLeaseStore", () => {
+  it("records completed, requeued, and failed lease transitions", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));
+    temporaryDirectories.push(directory);
+    const store = WorkerLeaseStore.open(join(directory, "leases.db"));
+    const now = new Date("2026-07-17T12:00:00.000Z");
+
+    try {
+      store.lease("completed-task", "local", now, 1_000);
+      store.complete("completed-task", "local", new Date("2026-07-17T12:00:00.100Z"));
+      store.lease("queued-task", "local", now, 1_000);
+      store.requeue("queued-task", "local", new Date("2026-07-17T12:00:00.100Z"));
+      store.lease("failed-task", "local", now, 1_000);
+      store.fail("failed-task", "local", new Date("2026-07-17T12:00:00.100Z"));
+
+      expect(store.status("completed-task")).toBe("completed");
+      expect(store.history("completed-task")).toEqual(["leased", "completed"]);
+      expect(store.status("queued-task")).toBe("queued");
+      expect(store.history("queued-task")).toEqual(["leased", "queued"]);
+      expect(store.status("failed-task")).toBe("failed");
+      expect(store.history("failed-task")).toEqual(["leased", "failed"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("does not let another worker finish an active lease", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));
+    temporaryDirectories.push(directory);
+    const store = WorkerLeaseStore.open(join(directory, "leases.db"));
+    try {
+      store.lease("task-1", "worker-1", new Date("2026-07-17T12:00:00.000Z"), 1_000);
+
+      expect(() => store.complete(
+        "task-1",
+        "worker-2",
+        new Date("2026-07-17T12:00:00.100Z"),
+      )).toThrow(/active worker lease/i);
+      expect(store.status("task-1")).toBe("leased");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("does not let another worker steal an unexpired lease", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));
+    temporaryDirectories.push(directory);
+    const store = WorkerLeaseStore.open(join(directory, "leases.db"));
+    try {
+      store.lease("task-1", "worker-1", new Date("2026-07-17T12:00:00.000Z"), 1_000);
+
+      expect(() => store.lease(
+        "task-1",
+        "worker-2",
+        new Date("2026-07-17T12:00:00.100Z"),
+        1_000,
+      )).toThrow(/already leased/i);
+      expect(store.history("task-1")).toEqual(["leased"]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("requeues expired leases across process restart", () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-leases-"));
     temporaryDirectories.push(directory);
@@ -262,9 +324,13 @@ describe("WorkerLeaseStore", () => {
     first.close();
 
     const second = WorkerLeaseStore.open(path);
-    expect(second.requeueExpired(new Date("2026-07-17T12:00:02.000Z"))).toEqual(["task-1"]);
-    expect(second.status("task-1")).toBe("queued");
-    second.close();
+    try {
+      expect(second.requeueExpired(new Date("2026-07-17T12:00:02.000Z"))).toEqual(["task-1"]);
+      expect(second.status("task-1")).toBe("queued");
+      expect(second.history("task-1")).toEqual(["leased", "queued"]);
+    } finally {
+      second.close();
+    }
   });
 
   it("keeps a lease alive when the worker heartbeats", () => {

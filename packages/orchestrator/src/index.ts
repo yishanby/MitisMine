@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { z } from "zod";
 
 import type {
@@ -25,6 +27,7 @@ import {
   synthesisPrompt,
   subtaskResearchPrompt,
 } from "./prompts.js";
+import type { WorkerTaskExecutorPort } from "./worker.js";
 
 const PROVIDERS = ["claude", "codex", "copilot"] as const;
 
@@ -112,6 +115,7 @@ export interface ResearchResult {
 interface OrchestratorOptions {
   readonly adapters: AdapterRegistry;
   readonly store: OrchestrationStore;
+  readonly worker: WorkerTaskExecutorPort;
   readonly maxConcurrency?: number;
 }
 
@@ -142,6 +146,7 @@ class Semaphore {
 export class ResearchOrchestrator {
   readonly #adapters: AdapterRegistry;
   readonly #store: OrchestrationStore;
+  readonly #worker: WorkerTaskExecutorPort;
   readonly #semaphore: Semaphore;
   readonly #controllers = new Map<string, AbortController>();
   readonly #cancelled = new Set<string>();
@@ -149,6 +154,7 @@ export class ResearchOrchestrator {
   constructor(options: OrchestratorOptions) {
     this.#adapters = options.adapters;
     this.#store = options.store;
+    this.#worker = options.worker;
     this.#semaphore = new Semaphore(options.maxConcurrency ?? 6);
   }
 
@@ -478,11 +484,21 @@ export class ResearchOrchestrator {
       createdAt: new Date().toISOString(),
     });
     try {
-      const result = await this.#semaphore.run(() => {
+      const activeSignal = this.#controllers.get(checkpoint.run.id)?.signal;
+      const taskId = workerTaskId({
+        runId: checkpoint.run.id,
+        provider,
+        phase,
+        prompt,
+        ...(subtaskId === undefined ? {} : { subtaskId }),
+      });
+      const result = await this.#semaphore.run(() => this.#worker.execute({
+        taskId,
+        ...(activeSignal === undefined ? {} : { signal: activeSignal }),
+        operation: () => {
         const externalSessionId = subtaskId === undefined
           ? checkpoint.sessions[provider]
           : checkpoint.subtaskSessions?.[provider]?.[subtaskId];
-        const activeSignal = this.#controllers.get(checkpoint.run.id)?.signal;
         const task = {
           topicId: checkpoint.run.topicId,
           runId: checkpoint.run.id,
@@ -493,7 +509,8 @@ export class ResearchOrchestrator {
         return externalSessionId === undefined
           ? this.#adapters[provider].start(task)
           : this.#adapters[provider].resume({ ...task, externalSessionId });
-      });
+        },
+      }));
       if (subtaskId === undefined) {
         checkpoint.sessions[provider] = result.externalSessionId;
         this.#store.saveTopicSession(
@@ -551,6 +568,23 @@ export class ResearchOrchestrator {
       ...(checkpoint.report === undefined ? {} : { report: checkpoint.report }),
     };
   }
+}
+
+export function workerTaskId(input: {
+  readonly runId: string;
+  readonly provider: ProviderName;
+  readonly phase: OrchestrationPhase;
+  readonly prompt: string;
+  readonly subtaskId?: string;
+}): string {
+  const promptHash = createHash("sha256").update(input.prompt, "utf8").digest("hex");
+  return [
+    input.runId,
+    input.provider,
+    input.phase,
+    input.subtaskId ?? "main",
+    promptHash,
+  ].join(":");
 }
 
 function successfulProviders(checkpoint: OrchestrationCheckpoint): ProviderName[] {

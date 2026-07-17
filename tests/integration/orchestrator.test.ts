@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { WorkerLeaseStore } from "../../apps/worker/src/main.js";
 import type {
   AdapterRegistry,
   AdapterResult,
@@ -14,6 +15,11 @@ import {
   type OrchestrationRecord,
   type OrchestrationStore,
 } from "../../packages/orchestrator/src/index.js";
+import {
+  LocalWorkerTaskExecutor,
+  type WorkerLeasePort,
+  type WorkerLeaseStatus,
+} from "../../packages/orchestrator/src/worker.js";
 
 const providers = ["claude", "codex", "copilot"] as const;
 
@@ -60,6 +66,34 @@ class MemoryOrchestrationStore implements OrchestrationStore {
 
   saveTopicSession(topicId: string, provider: ProviderName, externalSessionId: string): void {
     this.topicSessions.set(`${topicId}:${provider}`, externalSessionId);
+  }
+}
+
+class RecordingLeasePort implements WorkerLeasePort {
+  readonly histories = new Map<string, WorkerLeaseStatus[]>();
+
+  lease(taskId: string): void {
+    this.#record(taskId, "leased");
+  }
+
+  heartbeat(): void {}
+
+  complete(taskId: string): void {
+    this.#record(taskId, "completed");
+  }
+
+  requeue(taskId: string): void {
+    this.#record(taskId, "queued");
+  }
+
+  fail(taskId: string): void {
+    this.#record(taskId, "failed");
+  }
+
+  #record(taskId: string, status: WorkerLeaseStatus): void {
+    const history = this.histories.get(taskId) ?? [];
+    history.push(status);
+    this.histories.set(taskId, history);
   }
 }
 
@@ -226,12 +260,15 @@ function createHarness(store: MemoryOrchestrationStore, options: FakeOptions = {
     resultExternalSessionId: string;
   }> = [];
   const concurrency = { active: 0, maximum: 0 };
+  const leases = new RecordingLeasePort();
   return {
     calls,
     concurrency,
+    leases,
     orchestrator: new ResearchOrchestrator({
       adapters: fakeAdapters(calls, concurrency, options),
       store,
+      worker: new LocalWorkerTaskExecutor({ leases }),
       maxConcurrency: 6,
     }),
   };
@@ -283,6 +320,18 @@ describe("ResearchOrchestrator", () => {
     ).toBe(true);
     expect(store.records.filter((event) => event.type === "agent.call.started")).toHaveLength(12);
     expect(store.records.filter((event) => event.type === "agent.call.completed")).toHaveLength(12);
+    expect(harness.leases.histories.size).toBe(harness.calls.length);
+    expect([...harness.leases.histories.values()].every(
+      (history) => history.join(",") === "leased,completed",
+    )).toBe(true);
+    expect([...harness.leases.histories.keys()].every(
+      (taskId) => /^run-normal:(claude|codex|copilot):[a-z_]+:(?:main|[^:]+):[0-9a-f]{64}$/.test(taskId),
+    )).toBe(true);
+    const crossReviewTaskIds = [...harness.leases.histories.keys()].filter(
+      (taskId) => taskId.includes(":cross_review:"),
+    );
+    expect(crossReviewTaskIds).toHaveLength(6);
+    expect(new Set(crossReviewTaskIds).size).toBe(6);
   });
 
   it("resumes from a durable review checkpoint without repeating independent research", async () => {
@@ -491,6 +540,7 @@ describe("ResearchOrchestrator", () => {
         codex: waiting("codex"),
         copilot: waiting("copilot"),
       },
+      worker: new LocalWorkerTaskExecutor({ leases: new RecordingLeasePort() }),
     });
     const running = orchestrator.start({
       runId: "run-cancel",
@@ -507,6 +557,64 @@ describe("ResearchOrchestrator", () => {
     expect(result.run.state).toBe("cancelled");
     expect(store.load("run-cancel")?.run.state).toBe("cancelled");
     expect(store.staleTerminalOverwrites).toEqual([]);
+  });
+
+  it("requeues expired work and resumes with the same deterministic task IDs", async () => {
+    const store = new MemoryOrchestrationStore();
+    store.crashAtCrossReview = true;
+    const initial = createHarness(store);
+    await expect(initial.orchestrator.start({
+      runId: "run-worker-restart",
+      topicId: "topic-worker-restart",
+      question: "question",
+      cwd: process.cwd(),
+    })).rejects.toThrow("simulated crash");
+
+    const leases = WorkerLeaseStore.open(":memory:");
+    const droppedTaskIds: string[] = [];
+    const droppedCalls: Parameters<typeof fakeAdapters>[0] = [];
+    const dropped = new ResearchOrchestrator({
+      store,
+      adapters: fakeAdapters(droppedCalls, { active: 0, maximum: 0 }),
+      worker: {
+        execute: async (input) => {
+          droppedTaskIds.push(input.taskId);
+          leases.lease(
+            input.taskId,
+            "dropped-worker",
+            new Date("2026-07-17T12:00:00.000Z"),
+            1_000,
+          );
+          throw new Error("worker process dropped");
+        },
+      },
+    });
+
+    try {
+      await expect(dropped.resume("run-worker-restart")).rejects.toThrow("worker process dropped");
+      expect(droppedTaskIds.length).toBeGreaterThan(0);
+      expect(droppedTaskIds.every((taskId) => leases.status(taskId) === "leased")).toBe(true);
+      expect(leases.requeueExpired(new Date("2026-07-17T12:00:02.000Z")))
+        .toEqual([...droppedTaskIds].sort());
+
+      const resumedCalls: Parameters<typeof fakeAdapters>[0] = [];
+      const resumed = new ResearchOrchestrator({
+        store,
+        adapters: fakeAdapters(resumedCalls, { active: 0, maximum: 0 }),
+        worker: new LocalWorkerTaskExecutor({
+          leases,
+          now: () => new Date("2026-07-17T12:00:02.000Z"),
+        }),
+      });
+      const result = await resumed.resume("run-worker-restart");
+
+      expect(result.run.state).toBe("completed");
+      for (const taskId of droppedTaskIds) {
+        expect(leases.history(taskId)).toEqual(["leased", "queued", "leased", "completed"]);
+      }
+    } finally {
+      leases.close();
+    }
   });
 
   it("executes at most two proposed subtasks per provider under the global semaphore", async () => {

@@ -24,9 +24,12 @@ import {
   APP_ROLES,
   FeishuAppRegistry,
   type AppRegistration,
+  type IdentityProbe,
+  verifyCrossAppIdentity,
 } from "../../../packages/feishu/src/registry.js";
 import { ResearchOrchestrator } from "../../../packages/orchestrator/src/index.js";
 import { directResearchPrompt } from "../../../packages/orchestrator/src/prompts.js";
+import { LocalWorkerTaskExecutor } from "../../../packages/orchestrator/src/worker.js";
 import { SqliteOrchestrationStore } from "../../../packages/storage/src/orchestration.js";
 import { SqliteApprovalStore } from "../../../packages/storage/src/approval.js";
 import { DurableOutbox } from "../../../packages/storage/src/outbox.js";
@@ -280,7 +283,17 @@ export interface ControlPlaneRuntime {
   close(): Promise<void>;
 }
 
-export async function startControlPlane(config: Config): Promise<ControlPlaneRuntime> {
+export interface ControlPlaneStartupOptions {
+  readonly identityVerifier?: (observations: readonly IdentityProbe[]) => string;
+}
+
+export async function startControlPlane(
+  config: Config,
+  options: ControlPlaneStartupOptions = {},
+): Promise<ControlPlaneRuntime> {
+  (options.identityVerifier ?? verifyCrossAppIdentity)(
+    config.MITISMINE_IDENTITY_PROBES_JSON.observations,
+  );
   mkdirSync(config.MITISMINE_DATA_DIR, { recursive: true });
   mkdirSync(dirname(config.MITISMINE_DB_PATH), { recursive: true });
   const store = EventStore.open(config.MITISMINE_DB_PATH);
@@ -293,7 +306,13 @@ export async function startControlPlane(config: Config): Promise<ControlPlaneRun
   const workers = new WorkerRegistry();
   workers.connectPersistent("local");
   const adapters = createAdapters(runJsonl);
-  const orchestrator = new ResearchOrchestrator({ adapters, store: checkpoints, maxConcurrency: 6 });
+  const worker = new LocalWorkerTaskExecutor({ leases });
+  const orchestrator = new ResearchOrchestrator({
+    adapters,
+    store: checkpoints,
+    worker,
+    maxConcurrency: 6,
+  });
   const trustedExecutor = new TrustedActionExecutor(resolve(config.MITISMINE_DATA_DIR, "approved-actions"));
   const approval = new ApprovalEngine({
     signingSecret: config.MITISMINE_APPROVAL_KEY,
