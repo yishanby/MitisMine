@@ -136,4 +136,24 @@ CREATE TABLE IF NOT EXISTS worker_leases (
   last_heartbeat_at TEXT NOT NULL,
   status TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS orchestration_checkpoints (
+  run_id TEXT PRIMARY KEY,
+  topic_id TEXT NOT NULL,
+  checkpoint_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS orchestration_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  topic_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS orchestration_records_run_idx
+  ON orchestration_records (run_id, id);
 `;

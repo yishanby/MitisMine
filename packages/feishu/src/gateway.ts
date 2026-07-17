@@ -31,6 +31,8 @@ export type DispatchInput =
       readonly topicTitle: string;
       readonly principalId: string;
       readonly question: string;
+      readonly replyAppRole: AppRole;
+      readonly receiveId: string;
     }
   | {
       readonly mode: "direct";
@@ -39,6 +41,8 @@ export type DispatchInput =
       readonly topicTitle: string;
       readonly principalId: string;
       readonly question: string;
+      readonly replyAppRole: AppRole;
+      readonly receiveId: string;
     }
   | {
       readonly mode: "control";
@@ -46,6 +50,8 @@ export type DispatchInput =
       readonly topicId: string;
       readonly topicTitle: string;
       readonly principalId: string;
+      readonly replyAppRole: AppRole;
+      readonly receiveId: string;
     };
 
 export interface FeishuDispatcher {
@@ -172,6 +178,8 @@ export class FeishuGateway {
           topicTitle: topic.title,
           principalId,
           question: command.question,
+          replyAppRole: event.appRole,
+          receiveId: event.chatId,
         });
         return;
       }
@@ -185,6 +193,8 @@ export class FeishuGateway {
             topicTitle: topic.title,
             principalId,
             question: command.text,
+            replyAppRole: event.appRole,
+            receiveId: event.chatId,
           });
         } else {
           await this.#dispatcher.dispatch({
@@ -194,6 +204,8 @@ export class FeishuGateway {
             topicTitle: topic.title,
             principalId,
             question: command.text,
+            replyAppRole: event.appRole,
+            receiveId: event.chatId,
           });
         }
         return;
@@ -208,6 +220,8 @@ export class FeishuGateway {
           topicId: topic.id,
           topicTitle: topic.title,
           principalId,
+          replyAppRole: event.appRole,
+          receiveId: event.chatId,
         });
         return;
       }

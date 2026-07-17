@@ -42,6 +42,26 @@ interface EventRow {
   created_at: string;
 }
 
+export interface StoredAgentSession {
+  readonly id: string;
+  readonly topicId: string;
+  readonly provider: string;
+  readonly role: string;
+  readonly externalSessionId?: string;
+  readonly contextWatermark: number;
+  readonly status: string;
+}
+
+interface AgentSessionRow {
+  id: string;
+  topic_id: string;
+  provider: string;
+  role: string;
+  external_session_id: string | null;
+  context_watermark: number;
+  status: string;
+}
+
 export class EventStore {
   readonly #database: DatabaseSync;
 
@@ -232,6 +252,52 @@ export class EventStore {
       `)
       .run(appRole, eventId, new Date().toISOString());
     return Number(result.changes) === 1;
+  }
+
+  agentSession(topicId: string, provider: string, role: string): StoredAgentSession | undefined {
+    const row = this.#database
+      .prepare(`
+        SELECT id, topic_id, provider, role, external_session_id,
+               context_watermark, status
+        FROM agent_sessions WHERE topic_id = ? AND provider = ? AND role = ?
+      `)
+      .get(topicId, provider, role) as AgentSessionRow | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          id: row.id,
+          topicId: row.topic_id,
+          provider: row.provider,
+          role: row.role,
+          contextWatermark: Number(row.context_watermark),
+          status: row.status,
+          ...(row.external_session_id === null
+            ? {}
+            : { externalSessionId: row.external_session_id }),
+        };
+  }
+
+  upsertAgentSession(session: StoredAgentSession): void {
+    this.#database
+      .prepare(`
+        INSERT INTO agent_sessions (
+          id, topic_id, provider, role, external_session_id,
+          context_watermark, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (topic_id, provider, role) DO UPDATE SET
+          external_session_id = excluded.external_session_id,
+          context_watermark = excluded.context_watermark,
+          status = excluded.status
+      `)
+      .run(
+        session.id,
+        session.topicId,
+        session.provider,
+        session.role,
+        session.externalSessionId ?? null,
+        session.contextWatermark,
+        session.status,
+      );
   }
 
   #topicFromCreatedPayload(payload: unknown, topicId: string): Topic {
