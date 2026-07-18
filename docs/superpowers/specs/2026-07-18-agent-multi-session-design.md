@@ -1,7 +1,7 @@
 # MitisMine 单 Agent 多 Session 设计
 
 日期：2026-07-18  
-状态：已实施并于 2026-07-18 验证
+状态：已实施；截至代码修订 `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a` 于 2026-07-18 完成验证
 
 范围：在共享 Topic 和群体调研之外，为 Claude、Codex、Copilot 三个飞书 App 提供彼此独立、可持久化恢复的多 Session 体验。
 
@@ -113,3 +113,9 @@ Topic 的固定信息、用户笔记以及群体调研结果属于共享上下�
 - 旧 `agent_sessions` direct 数据无损迁移。
 - Topic viewer/editor 权限和飞书事件幂等规则覆盖 Session 操作。
 - 群体 discuss/research 行为及既有测试不回归。
+
+当前验证记录为：根级 `pnpm test:run` 通过 23 个测试文件、跳过 1 个，
+221 个测试通过、3 个显式 live 用例跳过，耗时 5.73 秒；真实 CLI
+start+resume 验证为 Claude 14,283 ms、Codex 27,676 ms、Copilot 31,747 ms，
+3/3 通过。以上是仓库级回归与真实 provider 连续性证据，不表示每条验收标准
+都分别经过独立的线上实证。
