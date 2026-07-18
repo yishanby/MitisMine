@@ -199,6 +199,44 @@ describe("SqliteDiscussionStore", () => {
     }
   });
 
+  it("preserves exact constraint classification when saving a Discussion", () => {
+    const path = databasePath();
+    seedTopic(path);
+    const store = SqliteDiscussionStore.open(path);
+    const first = createDiscussion({
+      id: "discussion-save-1",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "First save",
+      starterPrincipalId: "tenant-1:user:owner",
+      startMessageId: "save-start-1",
+    });
+    const second = createDiscussion({
+      id: "discussion-save-2",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "chat-2",
+      question: "Second save",
+      starterPrincipalId: "tenant-1:user:owner",
+      startMessageId: "save-start-2",
+    });
+    store.createDiscussion(first);
+    store.createDiscussion(second);
+    try {
+      expect(() => store.saveDiscussion({ ...first, startMessageId: "save-start-2" }))
+        .toThrow("Discussion start message conflicts with another Discussion");
+      expect(() => store.saveDiscussion({ ...second, chatId: first.chatId }))
+        .toThrow("This group already has an active Discussion");
+      expect(() => store.saveDiscussion({ ...first, topicId: "missing-topic" }))
+        .toThrow("FOREIGN KEY constraint failed");
+      expect(store.discussion(first.id)).toEqual(first);
+      expect(store.discussion(second.id)).toEqual(second);
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists turns and requeues interrupted work across restart", () => {
     const path = databasePath();
     seedTopic(path);

@@ -318,7 +318,18 @@ export class SqliteDiscussionStore {
       );
       if (Number(result.changes) !== 1) throw new Error(`Discussion not found: ${discussion.id}`);
     } catch (error) {
-      if (error instanceof Error && /group_discussions_one_active_chat_idx|unique/i.test(error.message)) {
+      if (
+        error instanceof Error
+        && error.message === "UNIQUE constraint failed: group_discussions.start_message_id"
+      ) {
+        throw new Error("Discussion start message conflicts with another Discussion");
+      }
+      if (
+        error instanceof Error
+        && error.message === (
+          "UNIQUE constraint failed: group_discussions.tenant_key, group_discussions.chat_id"
+        )
+      ) {
         throw new Error("This group already has an active Discussion");
       }
       throw error;
