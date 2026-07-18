@@ -437,6 +437,13 @@ export class SqliteDiscussionStore {
         FROM discussion_steers WHERE message_id = ?
       `).get(input.messageId) as SteerRow | undefined;
       if (existing !== undefined) {
+        if (
+          existing.discussion_id !== input.discussionId
+          || existing.principal_id !== input.principalId
+          || existing.text !== input.text
+        ) {
+          throw new Error(`Inconsistent Discussion steer receipt: ${input.messageId}`);
+        }
         if (input.topicEventSeq !== undefined && input.topicEventSeq > 0) {
           if (existing.topic_event_seq === 0) {
             this.#database.prepare(`
@@ -533,15 +540,77 @@ export class SqliteDiscussionStore {
     return row === undefined ? undefined : mapSteer(row);
   }
 
-  steerForTopicEvent(topicId: string, topicEventSeq: number): DiscussionSteer | undefined {
-    const row = this.#database.prepare(`
+  steersForTopicEvent(topicId: string, topicEventSeq: number): DiscussionSteer[] {
+    const rows = this.#database.prepare(`
       SELECT s.id, s.discussion_id, s.message_id, s.topic_event_seq, s.principal_id, s.text,
              s.preferred_provider, s.status, s.created_at, s.consumed_at
-      FROM discussion_steers s
-      JOIN group_discussions d ON d.id = s.discussion_id
+      FROM group_discussions d
+      JOIN discussion_steers s ON s.discussion_id = d.id
       WHERE d.topic_id = ? AND s.topic_event_seq = ?
-    `).get(topicId, topicEventSeq) as SteerRow | undefined;
-    return row === undefined ? undefined : mapSteer(row);
+      ORDER BY s.id
+    `).all(topicId, topicEventSeq) as unknown as SteerRow[];
+    return rows.map(mapSteer);
+  }
+
+  recordTerminalSteerTombstone(
+    input: DiscussionSteerInput & { readonly topicEventSeq: number },
+    consumedAt = new Date().toISOString(),
+  ): DiscussionSteer {
+    const createdAt = input.createdAt ?? consumedAt;
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const discussion = this.#database.prepare(`
+        SELECT state FROM group_discussions WHERE id = ?
+      `).get(input.discussionId) as { state: GroupDiscussion["state"] } | undefined;
+      if (discussion === undefined) throw new Error(`Discussion not found: ${input.discussionId}`);
+      if (
+        discussion.state === "active"
+        || discussion.state === "paused"
+        || discussion.state === "summarizing"
+      ) {
+        throw new Error(`Discussion is not terminal: ${input.discussionId}`);
+      }
+      const existing = this.#database.prepare(`
+        SELECT id, discussion_id, message_id, topic_event_seq, principal_id, text,
+               preferred_provider, status, created_at, consumed_at
+        FROM discussion_steers WHERE message_id = ?
+      `).get(input.messageId) as SteerRow | undefined;
+      if (existing !== undefined) {
+        if (
+          existing.discussion_id !== input.discussionId
+          || existing.topic_event_seq !== input.topicEventSeq
+          || existing.principal_id !== input.principalId
+          || existing.text !== input.text
+          || existing.status !== "consumed"
+        ) {
+          throw new Error(`Inconsistent Discussion steer tombstone: ${input.messageId}`);
+        }
+        this.#database.exec("COMMIT");
+        return mapSteer(existing);
+      }
+      this.#database.prepare(`
+        INSERT INTO discussion_steers (
+          id, discussion_id, message_id, topic_event_seq, principal_id, text,
+          preferred_provider, status, created_at, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'consumed', ?, ?)
+      `).run(
+        input.id,
+        input.discussionId,
+        input.messageId,
+        input.topicEventSeq,
+        input.principalId,
+        input.text,
+        input.preferredProvider ?? null,
+        createdAt,
+        consumedAt,
+      );
+      const tombstone = this.#steer(input.id);
+      this.#database.exec("COMMIT");
+      return tombstone as DiscussionSteer;
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   consumeSteers(discussionId: string, ids: readonly string[], consumedAt = new Date().toISOString()): void {

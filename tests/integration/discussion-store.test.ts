@@ -122,6 +122,71 @@ describe("SqliteDiscussionStore", () => {
     }
   });
 
+  it.each(["discussion", "principal", "text"] as const)(
+    "rejects a duplicate message with a conflicting %s before binding or preference mutation",
+    (mismatch) => {
+      const path = databasePath();
+      seedTopic(path);
+      const events = EventStore.open(path);
+      const store = SqliteDiscussionStore.open(path);
+      const first = createDiscussion({
+        id: "identity-discussion-1",
+        topicId: "topic-1",
+        tenantKey: "tenant-1",
+        chatId: "identity-chat-1",
+        question: "First identity",
+        starterPrincipalId: "tenant-1:user:owner",
+      });
+      const second = createDiscussion({
+        id: "identity-discussion-2",
+        topicId: "topic-1",
+        tenantKey: "tenant-1",
+        chatId: "identity-chat-2",
+        question: "Second identity",
+        starterPrincipalId: "tenant-1:user:owner",
+      });
+      store.createDiscussion(first);
+      store.createDiscussion(second);
+      store.recordSteer({
+        id: "identity-steer",
+        discussionId: first.id,
+        messageId: "identity-message",
+        principalId: "tenant-1:user:member",
+        text: "Immutable steer text",
+        createdAt: "2026-07-18T01:00:00.000Z",
+      });
+      const event = events.append({
+        topicId: first.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: { text: "Immutable steer text" },
+      });
+      const beforeReceipt = store.steerForMessage("identity-message");
+      const beforeFirst = store.discussion(first.id);
+      const beforeSecond = store.discussion(second.id);
+      try {
+        expect(() => store.recordSteer({
+          id: "identity-steer-duplicate",
+          discussionId: mismatch === "discussion" ? second.id : first.id,
+          messageId: "identity-message",
+          topicEventSeq: event.seq,
+          principalId: mismatch === "principal"
+            ? "tenant-1:user:conflict"
+            : "tenant-1:user:member",
+          text: mismatch === "text" ? "Conflicting steer text" : "Immutable steer text",
+          preferredProvider: "codex",
+        })).toThrow(/inconsistent discussion steer receipt/i);
+
+        expect(store.steerForMessage("identity-message")).toEqual(beforeReceipt);
+        expect(store.discussion(first.id)).toEqual(beforeFirst);
+        expect(store.discussion(second.id)).toEqual(beforeSecond);
+      } finally {
+        store.close();
+        events.close();
+      }
+    },
+  );
+
   it("returns only a fully correlated start-message replay", () => {
     const path = databasePath();
     seedTopic(path);
@@ -484,6 +549,43 @@ describe("SqliteDiscussionStore", () => {
       expect(reopened.recoverableDiscussions().map(({ state }) => state)).toEqual(states);
     } finally {
       reopened.close();
+    }
+  });
+
+  it("installs and uses scoped indexes for steer-event startup reconciliation", () => {
+    const path = databasePath();
+    seedTopic(path);
+    const store = SqliteDiscussionStore.open(path);
+    store.close();
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+      const indexColumns = (name: string) => (database.prepare(`PRAGMA index_info('${name}')`)
+        .all() as unknown as Array<{ name: string }>).map(({ name: column }) => column);
+      expect(indexColumns("topic_events_type_idx")).toEqual(["type", "topic_id", "seq"]);
+      expect(indexColumns("group_discussions_topic_idx")).toEqual(["topic_id", "id"]);
+      expect(indexColumns("discussion_steers_event_idx"))
+        .toEqual(["discussion_id", "topic_event_seq"]);
+
+      const eventPlan = database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT topic_id, seq, type, actor_principal_id, payload_json, created_at
+        FROM topic_events WHERE type = ? ORDER BY topic_id, seq
+      `).all("discussion.steer.added") as unknown as Array<{ detail: string }>;
+      expect(eventPlan.map(({ detail }) => detail).join("\n"))
+        .toContain("topic_events_type_idx");
+
+      const receiptPlan = database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT s.id
+        FROM group_discussions d
+        JOIN discussion_steers s ON s.discussion_id = d.id
+        WHERE d.topic_id = ? AND s.topic_event_seq = ?
+      `).all("topic-1", 1) as unknown as Array<{ detail: string }>;
+      const receiptDetails = receiptPlan.map(({ detail }) => detail).join("\n");
+      expect(receiptDetails).toContain("group_discussions_topic_idx");
+      expect(receiptDetails).toContain("discussion_steers_event_idx");
+    } finally {
+      database.close();
     }
   });
 });

@@ -1235,6 +1235,71 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("bounds stale summary regeneration while human steers keep arriving", async () => {
+    const summaryPrompts: string[] = [];
+    let summaryCalls = 0;
+    let test!: ReturnType<typeof harness>;
+    const claude = deterministicAdapter("claude", summaryPrompts, async () => {
+      summaryCalls += 1;
+      if (summaryCalls <= 4) {
+        test.discussions.recordSteer({
+          id: `sustained-summary-steer-${summaryCalls}`,
+          discussionId: test.discussion.id,
+          messageId: `sustained-summary-message-${summaryCalls}`,
+          topicEventSeq: 100 + summaryCalls,
+          principalId: `tenant-1:user:member-${summaryCalls}`,
+          text: `New summary constraint ${summaryCalls}`,
+        });
+      }
+      return JSON.stringify({ summary: `Stale summary ${summaryCalls}` });
+    });
+    test = harness({
+      claude,
+      codex: deterministicAdapter("codex", [], async () => {
+        throw new Error("Codex must not run after a successful summary");
+      }),
+      copilot: deterministicAdapter("copilot", [], async () => {
+        throw new Error("Copilot must not run after a successful summary");
+      }),
+    });
+    const paused = transitionDiscussion(test.discussion, "pause");
+    test.discussions.saveDiscussion(paused);
+    test.discussions.recordSteer({
+      id: "sustained-summary-base-steer",
+      discussionId: paused.id,
+      messageId: "sustained-summary-base-message",
+      topicEventSeq: 99,
+      principalId: "tenant-1:user:reviewer",
+      text: "Base summary constraint",
+    });
+    try {
+      await test.coordinator.control(paused.id, "summarize", "tenant-1:user:reviewer");
+      await test.coordinator.waitForIdle(paused.id);
+
+      expect(summaryCalls).toBe(4);
+      expect(summaryPrompts).toHaveLength(4);
+      expect(test.discussions.discussion(paused.id)).toMatchObject({ state: "paused" });
+      expect(test.discussions.discussion(paused.id)?.summaryText).toBeUndefined();
+      expect(test.discussions.pendingSteers(paused.id).map(({ id }) => id)).toEqual([
+        "sustained-summary-base-steer",
+        "sustained-summary-steer-1",
+        "sustained-summary-steer-2",
+        "sustained-summary-steer-3",
+        "sustained-summary-steer-4",
+      ]);
+      expect(test.events.events(test.topic.id).filter(({ type }) => type === "discussion.completed"))
+        .toEqual([]);
+      const pendingOutbox = JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z"));
+      expect(pendingOutbox).not.toContain("discussion:discussion-1:summary:completed");
+      expect(pendingOutbox).toContain("持续收到新指令");
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
   it("rejects a new steer after transactional summary finalization wins the race", async () => {
     const test = harness({
       claude: deterministicAdapter("claude"),

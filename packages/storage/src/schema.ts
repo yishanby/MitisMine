@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS topic_events (
   PRIMARY KEY (topic_id, seq)
 );
 
+CREATE INDEX IF NOT EXISTS topic_events_type_idx
+  ON topic_events (type, topic_id, seq);
+
 CREATE TABLE IF NOT EXISTS topic_event_effects (
   effect_key TEXT PRIMARY KEY,
   topic_id TEXT NOT NULL,
@@ -149,6 +152,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS group_discussions_one_active_chat_idx
   ON group_discussions (tenant_key, chat_id)
   WHERE state IN ('active', 'paused', 'summarizing');
 
+CREATE INDEX IF NOT EXISTS group_discussions_topic_idx
+  ON group_discussions (topic_id, id);
+
 CREATE TABLE IF NOT EXISTS discussion_steers (
   id TEXT PRIMARY KEY,
   discussion_id TEXT NOT NULL REFERENCES group_discussions(id) ON DELETE CASCADE,
@@ -164,6 +170,9 @@ CREATE TABLE IF NOT EXISTS discussion_steers (
 
 CREATE INDEX IF NOT EXISTS discussion_steers_pending_idx
   ON discussion_steers (discussion_id, status, created_at, id);
+
+CREATE INDEX IF NOT EXISTS discussion_steers_event_idx
+  ON discussion_steers (discussion_id, topic_event_seq);
 
 CREATE TABLE IF NOT EXISTS discussion_turns (
   id TEXT PRIMARY KEY,

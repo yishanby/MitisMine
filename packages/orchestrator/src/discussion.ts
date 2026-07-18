@@ -24,6 +24,7 @@ import type {
   OutboxSendResult,
 } from "../../storage/src/outbox.js";
 import {
+  type DiscussionSteer,
   type DiscussionTurn,
   SqliteDiscussionStore,
 } from "../../storage/src/discussion.js";
@@ -76,6 +77,8 @@ interface DiscussionAgentOutput {
   readonly continueDiscussion: boolean;
   readonly openQuestions: readonly string[];
 }
+
+const MAX_STALE_SUMMARY_REGENERATIONS = 3;
 
 class DiscussionInterruption extends Error {
   constructor(message: string) {
@@ -535,6 +538,7 @@ export class DiscussionCoordinator {
     );
     const controller = new AbortController();
     this.#controllers.set(discussion.id, controller);
+    let staleRegenerations = 0;
     try {
       while (true) {
         const steers = this.#store.pendingSteers(discussion.id);
@@ -587,7 +591,37 @@ export class DiscussionCoordinator {
           steers.map(({ id }) => id),
         );
         if (finalized.status === "inactive") return;
-        if (finalized.status === "retry") continue;
+        if (finalized.status === "retry") {
+          if (staleRegenerations < MAX_STALE_SUMMARY_REGENERATIONS) {
+            staleRegenerations += 1;
+            continue;
+          }
+          let paused: GroupDiscussion | undefined;
+          for (let attempt = 0; attempt < 5; attempt += 1) {
+            const current = this.#requireDiscussion(discussion.id);
+            if (current.state !== "summarizing") return;
+            const candidate = transitionDiscussion(current, "pause");
+            if (this.#store.saveDiscussionCas(candidate, current.version)) {
+              paused = candidate;
+              break;
+            }
+          }
+          if (paused === undefined) {
+            throw new Error(`Discussion summary activity pause conflicted repeatedly: ${discussion.id}`);
+          }
+          this.#outbox.enqueue({
+            id: `outbox:discussion:${discussion.id}:summary:steers-active:${paused.version}`,
+            appRole: "hub",
+            receiveId: discussion.chatId,
+            payload: textCard(
+              "总结已暂停",
+              "讨论持续收到新指令，已暂停总结以避免发布过时结论。可稍后点击「立即总结」重试。",
+            ),
+            idempotencyKey: `discussion:${discussion.id}:summary:steers-active:${paused.version}`,
+          });
+          await this.refreshControl(discussion.id);
+          return;
+        }
         this.#repairSummaryEffect(finalized.discussion);
         await this.refreshControl(discussion.id);
         return;
@@ -705,7 +739,12 @@ export class GroupDiscussionChannel {
 
   recoverPendingSteerEvents(): void {
     for (const event of this.#events.eventsByType("discussion.steer.added")) {
-      if (this.#store.steerForTopicEvent(event.topicId, event.seq) !== undefined) continue;
+      const linkedReceipts = this.#store.steersForTopicEvent(event.topicId, event.seq);
+      if (linkedReceipts.length > 1) {
+        throw new Error(
+          `Multiple Discussion steer receipts link to TopicEvent ${event.topicId}:${event.seq}`,
+        );
+      }
       const input = recoveryInputForSteerEvent(event);
       const payload = recordValue(event.payload);
       const discussionId = payload?.discussionId;
@@ -717,15 +756,14 @@ export class GroupDiscussionChannel {
         throw new Error("Inconsistent discussion.steer.added event");
       }
       assertDiscussionSteerAddedEvent(event, input, discussion, true);
+      const linkedReceipt = linkedReceipts[0];
+      if (linkedReceipt !== undefined) {
+        assertSteerReceiptMatchesEvent(linkedReceipt, input, discussion);
+        continue;
+      }
       const existing = this.#store.steerForMessage(input.messageId);
       if (existing !== undefined) {
-        if (
-          existing.discussionId !== discussion.id
-          || existing.principalId !== input.principalId
-          || existing.text !== input.text
-        ) {
-          throw new Error("Inconsistent Discussion steer receipt");
-        }
+        assertSteerReceiptMatchesEvent(existing, input, discussion);
         this.#store.recordSteer({
           id: existing.id,
           discussionId: discussion.id,
@@ -739,8 +777,7 @@ export class GroupDiscussionChannel {
         });
         continue;
       }
-      if (!["active", "paused", "summarizing"].includes(discussion.state)) continue;
-      this.#store.recordSteer({
+      const recoveredInput = {
         id: this.#idFactory(),
         discussionId: discussion.id,
         messageId: input.messageId,
@@ -751,7 +788,12 @@ export class GroupDiscussionChannel {
           ? {}
           : { preferredProvider: input.preferredProvider }),
         createdAt: event.createdAt,
-      });
+      };
+      if (["active", "paused", "summarizing"].includes(discussion.state)) {
+        this.#store.recordSteer(recoveredInput);
+      } else {
+        this.#store.recordTerminalSteerTombstone(recoveredInput, event.createdAt);
+      }
     }
     for (const steer of this.#store.unpublishedSteers()) {
       const discussion = this.#store.discussion(steer.discussionId);
@@ -1230,6 +1272,25 @@ function recoveryInputForSteerEvent(event: TopicEvent): GroupDiscussionReceiveIn
     idempotencyKey: `discussion-steer-event-recovery:${event.topicId}:${event.seq}`,
     ...(preferredProvider === undefined ? {} : { preferredProvider }),
   };
+}
+
+function assertSteerReceiptMatchesEvent(
+  receipt: DiscussionSteer,
+  input: GroupDiscussionReceiveInput,
+  discussion: GroupDiscussion,
+): void {
+  if (
+    receipt.discussionId !== discussion.id
+    || receipt.messageId !== input.messageId
+    || receipt.principalId !== input.principalId
+    || receipt.text !== input.text
+    || (
+      input.preferredProvider !== undefined
+      && receipt.preferredProvider !== input.preferredProvider
+    )
+  ) {
+    throw new Error("Inconsistent Discussion steer receipt");
+  }
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
