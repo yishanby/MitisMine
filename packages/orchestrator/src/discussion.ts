@@ -802,17 +802,12 @@ export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
     if (!message) throw new Error("Discussion Agent returned an empty response");
     return { message, continueDiscussion: true, openQuestions: [] };
   }
+  assertValidDecodedProviderValue(parsed);
   let value: Record<string, unknown>;
   try {
     value = asRecord(parsed);
   } catch {
     return { message: raw.trim(), continueDiscussion: true, openQuestions: [] };
-  }
-  if (typeof value.message === "string") assertValidProviderText(value.message);
-  if (Array.isArray(value.openQuestions)) {
-    for (const question of value.openQuestions) {
-      if (typeof question === "string") assertValidProviderText(question);
-    }
   }
   if (
     typeof value.message !== "string"
@@ -832,9 +827,18 @@ export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
 
 function parseDiscussionSummary(raw: string): string {
   assertValidProviderText(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(unwrapJsonFence(raw)) as unknown;
+  } catch {
+    const summary = raw.trim();
+    if (!summary) throw new Error("Discussion summary is empty");
+    return summary;
+  }
+  assertValidDecodedProviderValue(parsed);
   let summary: string | undefined;
   try {
-    const value = asRecord(JSON.parse(unwrapJsonFence(raw)) as unknown);
+    const value = asRecord(parsed);
     if (typeof value.summary === "string" && value.summary.trim()) summary = value.summary.trim();
   } catch {
     // Fall back to the provider's visible text.
@@ -879,6 +883,20 @@ function asRecord(value: unknown): Record<string, unknown> {
     throw new Error("value is not an object");
   }
   return value as Record<string, unknown>;
+}
+
+function assertValidDecodedProviderValue(value: unknown): void {
+  if (typeof value === "string") {
+    assertValidProviderText(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) assertValidDecodedProviderValue(item);
+    return;
+  }
+  if (typeof value === "object" && value !== null) {
+    for (const item of Object.values(value)) assertValidDecodedProviderValue(item);
+  }
 }
 
 function summarizeQuestion(text: string): string {

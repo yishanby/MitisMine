@@ -591,6 +591,18 @@ describe("DiscussionCoordinator", () => {
       .toThrow(/invalid Unicode.*provider output/i);
   });
 
+  it.each([
+    ["JSON string", (replacementCharacter: string) =>
+      JSON.stringify(`Corrupt ${replacementCharacter} response`)
+        .replace(replacementCharacter, "\\ufffd")],
+    ["JSON array", (replacementCharacter: string) =>
+      JSON.stringify([`Corrupt ${replacementCharacter} response`])
+        .replace(replacementCharacter, "\\ufffd")],
+  ])("rejects invalid Unicode decoded from an Agent %s", (_case, response) => {
+    expect(() => parseDiscussionAgentOutput(response(String.fromCodePoint(0xfffd))))
+      .toThrow(/invalid Unicode.*provider output/i);
+  });
+
   it("parses an Agent contract wrapped in a JSON markdown fence", () => {
     expect(parseDiscussionAgentOutput(`\`\`\`json
 {"message":"Structured response","continueDiscussion":false,"openQuestions":["One risk"]}
@@ -815,6 +827,47 @@ describe("DiscussionCoordinator", () => {
       const published = JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z"));
       expect(published).toContain("Clean fallback summary");
       expect(published).not.toContain(replacementCharacter);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it.each([
+    ["JSON string", (replacementCharacter: string) =>
+      JSON.stringify(`Corrupt ${replacementCharacter} summary`)
+        .replace(replacementCharacter, "\\ufffd")],
+    ["JSON array", (replacementCharacter: string) =>
+      JSON.stringify([`Corrupt ${replacementCharacter} summary`])
+        .replace(replacementCharacter, "\\ufffd")],
+  ])("falls through from an invalid-Unicode %s summary", async (_case, corruptSummary) => {
+    const replacementCharacter = String.fromCodePoint(0xfffd);
+    const attempts: ProviderName[] = [];
+    const summaryAdapter = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
+      expect(task.prompt).toContain("PHASE: discussion_summary");
+      attempts.push(provider);
+      if (provider === "claude") return corruptSummary(replacementCharacter);
+      if (provider === "codex") return JSON.stringify({ summary: "Clean decoded fallback" });
+      throw new Error("Copilot must not run after a clean fallback");
+    });
+    const test = harness({
+      claude: summaryAdapter("claude"),
+      codex: summaryAdapter("codex"),
+      copilot: summaryAdapter("copilot"),
+    });
+    try {
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:member");
+      await test.coordinator.waitForIdle(test.discussion.id);
+
+      expect(attempts).toEqual(["claude", "codex"]);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        summaryText: "Clean decoded fallback",
+      });
+      expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
+        .not.toContain(replacementCharacter);
     } finally {
       await test.coordinator.shutdown();
       test.discussions.close();
