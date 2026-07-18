@@ -26,6 +26,8 @@ export interface GroupDiscussion {
   readonly roundOrder: readonly ProviderName[];
   readonly maxRounds: number;
   readonly version: number;
+  readonly evaluatedTurnIndex: number;
+  readonly startMessageId?: string;
   readonly preferredProvider?: ProviderName;
   readonly controlMessageId?: string;
   readonly activeTurnId?: string;
@@ -41,6 +43,7 @@ export interface CreateDiscussionInput {
   readonly chatId: string;
   readonly question: string;
   readonly starterPrincipalId: string;
+  readonly startMessageId?: string;
   readonly maxRounds?: number;
   readonly now?: string;
 }
@@ -80,6 +83,8 @@ export function createDiscussion(input: CreateDiscussionInput): GroupDiscussion 
     roundOrder: [...roundOrderFor(0)],
     maxRounds,
     version: 0,
+    evaluatedTurnIndex: 0,
+    ...(input.startMessageId === undefined ? {} : { startMessageId: input.startMessageId }),
     createdAt: now,
     updatedAt: now,
   };

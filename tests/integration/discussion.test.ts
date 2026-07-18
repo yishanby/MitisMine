@@ -15,6 +15,7 @@ import {
   completeDiscussionTurn,
   createDiscussion,
   nextDiscussionProvider,
+  transitionDiscussion,
   type GroupDiscussion,
 } from "../../packages/domain/src/discussion.js";
 import { createTopic } from "../../packages/domain/src/topic.js";
@@ -372,6 +373,156 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("resumes past an already evaluated provider-failure boundary", async () => {
+    const turnCalls: Record<ProviderName, number> = { claude: 0, codex: 0, copilot: 0 };
+    const recovering = (provider: ProviderName): AgentAdapter => {
+      const call = async (task: AgentTask | ResumeAgentTask) => {
+        if (task.prompt.includes("PHASE: discussion_summary")) {
+          return {
+            provider,
+            externalSessionId: `${provider}-summary-session`,
+            events: [{ type: "final", text: JSON.stringify({ summary: "Recovered summary" }) }],
+          };
+        }
+        turnCalls[provider] += 1;
+        if (turnCalls[provider] === 1) throw new Error(`${provider} initially unavailable`);
+        return {
+          provider,
+          externalSessionId: `${provider}-recovered-session`,
+          events: [{
+            type: "final",
+            text: JSON.stringify({
+              message: `${provider} recovered`,
+              continueDiscussion: false,
+              openQuestions: [],
+            }),
+          }],
+        };
+      };
+      return { provider, start: call, resume: call };
+    };
+    const test = harness({
+      claude: recovering("claude"),
+      codex: recovering("codex"),
+      copilot: recovering("copilot"),
+    });
+    try {
+      await test.coordinator.run(test.discussion.id);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "paused",
+        turnIndex: 3,
+        evaluatedTurnIndex: 3,
+      });
+
+      await test.coordinator.control(
+        test.discussion.id,
+        "resume",
+        "tenant-1:user:member",
+      );
+      await test.coordinator.waitForIdle(test.discussion.id);
+
+      expect(turnCalls).toEqual({ claude: 2, codex: 2, copilot: 2 });
+      expect(test.discussions.turns(test.discussion.id).map((turn) => turn.state)).toEqual([
+        "failed", "failed", "failed", "completed", "completed", "completed",
+      ]);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        turnIndex: 6,
+        evaluatedTurnIndex: 6,
+      });
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("does not enter the next round after repeated boundary CAS conflicts", async () => {
+    const test = harness({
+      claude: deterministicAdapter("claude"),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    const saveDiscussionCas = test.discussions.saveDiscussionCas.bind(test.discussions);
+    let boundaryConflicts = 0;
+    test.discussions.saveDiscussionCas = (discussion, expectedVersion) => {
+      if (discussion.turnIndex === 3 && discussion.evaluatedTurnIndex === 3) {
+        boundaryConflicts += 1;
+        return false;
+      }
+      return saveDiscussionCas(discussion, expectedVersion);
+    };
+    try {
+      await expect(test.coordinator.run(test.discussion.id))
+        .rejects.toThrow(/boundary evaluation conflicted repeatedly/i);
+
+      expect(boundaryConflicts).toBe(5);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "active",
+        turnIndex: 3,
+        evaluatedTurnIndex: 0,
+      });
+      expect(test.discussions.turnForIndex(test.discussion.id, 3)).toBeUndefined();
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it.each(["pause", "stop"] as const)(
+    "rebuilds a missing control update after restart following a %s CAS",
+    async (action) => {
+      const adapters: AdapterRegistry = {
+        claude: deterministicAdapter("claude"),
+        codex: deterministicAdapter("codex"),
+        copilot: deterministicAdapter("copilot"),
+      };
+      const test = harness(adapters);
+      const databasePath = join(test.directory, "discussion.db");
+      const transitioned = transitionDiscussion(test.discussion, action);
+      expect(test.discussions.saveDiscussionCas(transitioned, test.discussion.version)).toBe(true);
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+
+      const events = EventStore.open(databasePath);
+      const discussions = SqliteDiscussionStore.open(databasePath);
+      const outbox = DurableOutbox.open(databasePath);
+      const coordinator = new DiscussionCoordinator({
+        store: discussions,
+        events,
+        outbox,
+        adapters,
+        workspaceRoot: test.directory,
+        idFactory: () => "must-not-create-a-turn",
+      });
+      try {
+        const recoverable = discussions.recoverableDiscussions();
+        expect(recoverable.map(({ id }) => id)).toEqual([test.discussion.id]);
+        for (const { id } of recoverable) await coordinator.run(id);
+
+        expect(discussions.turns(test.discussion.id)).toEqual([]);
+        expect(outbox.pending("2099-01-01T00:00:00.000Z")).toContainEqual(
+          expect.objectContaining({
+            id: `outbox:discussion:${test.discussion.id}:control:update:${transitioned.version}`,
+            idempotencyKey: `discussion:${test.discussion.id}:control:update:${transitioned.version}`,
+            operation: "update",
+            targetMessageId: test.discussion.controlMessageId,
+          }),
+        );
+      } finally {
+        await coordinator.shutdown();
+        discussions.close();
+        events.close();
+        outbox.close();
+      }
+    },
+  );
+
   it("reconciles a completed provider call after a crash without calling that Agent again", async () => {
     let claudeCalls = 0;
     const codexPrompts: string[] = [];
@@ -435,6 +586,51 @@ describe("DiscussionCoordinator", () => {
       expect(codexPrompts[0]).toContain("arrived during provider generation");
       expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
         .toContain("Claude durable answer");
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("retries a failed turn left in the current Discussion slot by a crash", async () => {
+    let claudeCalls = 0;
+    const test = harness({
+      claude: deterministicAdapter("claude", [], async () => {
+        claudeCalls += 1;
+        return JSON.stringify({ message: "Claude recovered", continueDiscussion: false, openQuestions: [] });
+      }),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    try {
+      test.discussions.claimTurn({
+        id: "failed-before-advance",
+        discussionId: test.discussion.id,
+        provider: "claude",
+        round: 1,
+        turnIndex: 0,
+      });
+      test.discussions.activateTurn(
+        test.discussion.id,
+        "failed-before-advance",
+        0,
+        "claude",
+      );
+      test.discussions.failTurn("failed-before-advance", "failed");
+
+      await test.coordinator.run(test.discussion.id);
+
+      expect(claudeCalls).toBe(1);
+      expect(test.discussions.turn("failed-before-advance")).toMatchObject({
+        state: "completed",
+        text: "Claude recovered",
+      });
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        turnIndex: 3,
+      });
     } finally {
       await test.coordinator.shutdown();
       test.discussions.close();

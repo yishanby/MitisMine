@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS group_discussions (
   round_order_json TEXT NOT NULL DEFAULT '["claude","codex","copilot"]',
   max_rounds INTEGER NOT NULL,
   version INTEGER NOT NULL DEFAULT 0,
+  evaluated_turn_index INTEGER NOT NULL DEFAULT 0,
+  start_message_id TEXT,
   preferred_provider TEXT,
   control_message_id TEXT,
   active_turn_id TEXT,

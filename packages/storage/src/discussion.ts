@@ -82,6 +82,8 @@ interface DiscussionRow {
   round_order_json: string;
   max_rounds: number;
   version: number;
+  evaluated_turn_index: number;
+  start_message_id: string | null;
   preferred_provider: ProviderName | null;
   control_message_id: string | null;
   active_turn_id: string | null;
@@ -141,6 +143,19 @@ export class SqliteDiscussionStore {
     if (!discussionColumns.some(({ name }) => name === "summary_text")) {
       database.exec("ALTER TABLE group_discussions ADD COLUMN summary_text TEXT");
     }
+    if (!discussionColumns.some(({ name }) => name === "start_message_id")) {
+      database.exec("ALTER TABLE group_discussions ADD COLUMN start_message_id TEXT");
+    }
+    if (!discussionColumns.some(({ name }) => name === "evaluated_turn_index")) {
+      database.exec(
+        "ALTER TABLE group_discussions ADD COLUMN evaluated_turn_index INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS group_discussions_start_message_idx
+      ON group_discussions (start_message_id)
+      WHERE start_message_id IS NOT NULL
+    `);
     return new SqliteDiscussionStore(database);
   }
 
@@ -171,8 +186,10 @@ export class SqliteDiscussionStore {
         INSERT INTO group_discussions (
           id, topic_id, tenant_key, chat_id, question, starter_principal_id,
           state, round, turn_index, next_provider, round_order_json, max_rounds, version,
-          preferred_provider, control_message_id, active_turn_id, summary_text, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          evaluated_turn_index, start_message_id, preferred_provider, control_message_id,
+          active_turn_id, summary_text,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         discussion.id,
         discussion.topicId,
@@ -187,6 +204,8 @@ export class SqliteDiscussionStore {
         JSON.stringify(discussion.roundOrder),
         discussion.maxRounds,
         discussion.version,
+        discussion.evaluatedTurnIndex,
+        discussion.startMessageId ?? null,
         discussion.preferredProvider ?? null,
         discussion.controlMessageId ?? null,
         discussion.activeTurnId ?? null,
@@ -195,6 +214,10 @@ export class SqliteDiscussionStore {
         discussion.updatedAt,
       );
     } catch (error) {
+      if (discussion.startMessageId !== undefined) {
+        const existing = this.discussionForStartMessage(discussion.startMessageId);
+        if (existing !== undefined) return existing;
+      }
       if (error instanceof Error && /group_discussions_one_active_chat_idx|unique/i.test(error.message)) {
         throw new Error("This group already has an active Discussion");
       }
@@ -207,6 +230,13 @@ export class SqliteDiscussionStore {
     const row = this.#database.prepare(`${DISCUSSION_SELECT} WHERE id = ?`).get(id) as
       | DiscussionRow
       | undefined;
+    return row === undefined ? undefined : mapDiscussion(row);
+  }
+
+  discussionForStartMessage(messageId: string): GroupDiscussion | undefined {
+    const row = this.#database.prepare(`
+      ${DISCUSSION_SELECT} WHERE start_message_id = ?
+    `).get(messageId) as DiscussionRow | undefined;
     return row === undefined ? undefined : mapDiscussion(row);
   }
 
@@ -226,7 +256,7 @@ export class SqliteDiscussionStore {
         UPDATE group_discussions SET
           topic_id = ?, tenant_key = ?, chat_id = ?, question = ?, starter_principal_id = ?,
           state = ?, round = ?, turn_index = ?, next_provider = ?, round_order_json = ?,
-          max_rounds = ?, version = ?,
+          max_rounds = ?, version = ?, evaluated_turn_index = ?, start_message_id = ?,
           preferred_provider = ?, control_message_id = ?, active_turn_id = ?,
           summary_text = ?, updated_at = ?
         WHERE id = ?
@@ -243,6 +273,8 @@ export class SqliteDiscussionStore {
         JSON.stringify(discussion.roundOrder),
         discussion.maxRounds,
         discussion.version,
+        discussion.evaluatedTurnIndex,
+        discussion.startMessageId ?? null,
         discussion.preferredProvider ?? null,
         discussion.controlMessageId ?? null,
         discussion.activeTurnId ?? null,
@@ -268,7 +300,8 @@ export class SqliteDiscussionStore {
       UPDATE group_discussions SET
         topic_id = ?, tenant_key = ?, chat_id = ?, question = ?, starter_principal_id = ?,
         state = ?, round = ?, turn_index = ?, next_provider = ?, round_order_json = ?,
-        max_rounds = ?, version = ?, preferred_provider = ?, control_message_id = ?,
+        max_rounds = ?, version = ?, evaluated_turn_index = ?, start_message_id = ?,
+        preferred_provider = ?, control_message_id = ?,
         active_turn_id = ?, summary_text = ?, updated_at = ?
       WHERE id = ? AND version = ?
     `).run(
@@ -284,6 +317,8 @@ export class SqliteDiscussionStore {
       JSON.stringify(discussion.roundOrder),
       discussion.maxRounds,
       discussion.version,
+      discussion.evaluatedTurnIndex,
+      discussion.startMessageId ?? null,
       discussion.preferredProvider ?? null,
       discussion.controlMessageId ?? null,
       discussion.activeTurnId ?? null,
@@ -468,7 +503,19 @@ export class SqliteDiscussionStore {
         provider = ?, round = ?, state = 'running', external_session_id = NULL,
         text = NULL, continue_discussion = NULL, open_questions_json = '[]',
         steer_ids_json = ?, started_at = ?, completed_at = NULL
-      WHERE id = ? AND state IN ('queued', 'cancelled')
+      WHERE id = ? AND (
+        state IN ('queued', 'cancelled')
+        OR (
+          state = 'failed'
+          AND EXISTS (
+            SELECT 1 FROM group_discussions AS current
+            WHERE current.id = discussion_turns.discussion_id
+              AND current.state = 'active'
+              AND current.active_turn_id = discussion_turns.id
+              AND current.turn_index = discussion_turns.turn_index
+          )
+        )
+      )
     `).run(provider, round, JSON.stringify(steerIds), startedAt, id);
     if (Number(result.changes) !== 1) {
       throw new Error(`Restartable Discussion turn not found: ${id}`);
@@ -562,8 +609,6 @@ export class SqliteDiscussionStore {
   recoverableDiscussions(): GroupDiscussion[] {
     const rows = this.#database.prepare(`
       ${DISCUSSION_SELECT}
-      WHERE state IN ('active', 'summarizing')
-         OR (state = 'completed' AND summary_text IS NOT NULL)
       ORDER BY updated_at, id
     `).all() as unknown as DiscussionRow[];
     return rows.map(mapDiscussion);
@@ -582,7 +627,8 @@ export class SqliteDiscussionStore {
 const DISCUSSION_SELECT = `
   SELECT id, topic_id, tenant_key, chat_id, question, starter_principal_id,
          state, round, turn_index, next_provider, round_order_json, max_rounds, version,
-         preferred_provider, control_message_id, active_turn_id, summary_text, created_at, updated_at
+         evaluated_turn_index, start_message_id, preferred_provider, control_message_id,
+         active_turn_id, summary_text, created_at, updated_at
   FROM group_discussions
 `;
 
@@ -608,8 +654,10 @@ function mapDiscussion(row: DiscussionRow): GroupDiscussion {
     roundOrder: parseProviderArray(row.round_order_json),
     maxRounds: Number(row.max_rounds),
     version: Number(row.version),
+    evaluatedTurnIndex: Number(row.evaluated_turn_index),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ...(row.start_message_id === null ? {} : { startMessageId: row.start_message_id }),
     ...(row.preferred_provider === null ? {} : { preferredProvider: row.preferred_provider }),
     ...(row.control_message_id === null ? {} : { controlMessageId: row.control_message_id }),
     ...(row.active_turn_id === null ? {} : { activeTurnId: row.active_turn_id }),

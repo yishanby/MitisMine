@@ -385,25 +385,47 @@ export class DiscussionCoordinator {
       await this.refreshControl(discussion.id);
       return;
     }
-    const completedRound = Math.ceil(discussion.turnIndex / 3);
-    const roundTurns = this.#store.turns(discussion.id)
-      .filter((turn) => turn.round === completedRound);
-    const successes = roundTurns.filter((turn) => turn.state === "completed").length;
-    if (successes < 2) {
-      this.#store.saveDiscussion(transitionDiscussion(discussion, "pause"));
-      await this.refreshControl(discussion.id);
-      return;
-    }
-    const atLimit = discussion.turnIndex >= discussion.maxRounds * 3;
-    if (
-      atLimit
-      || shouldSummarize(
-        this.#store.roundVotes(discussion.id, completedRound),
+    let reconciled = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const current = this.#requireDiscussion(discussion.id);
+      if (current.state !== "active" || current.turnIndex !== discussion.turnIndex) {
+        reconciled = true;
+        break;
+      }
+      const completedRound = Math.ceil(current.turnIndex / 3);
+      const roundTurns = this.#store.turns(current.id)
+        .filter((turn) => turn.round === completedRound);
+      const successes = roundTurns.filter((turn) => turn.state === "completed").length;
+      const atLimit = current.turnIndex >= current.maxRounds * 3;
+      const summarize = atLimit || shouldSummarize(
+        this.#store.roundVotes(current.id, completedRound),
         completedRound,
-        discussion.maxRounds,
-      )
-    ) {
-      this.#store.saveDiscussion(transitionDiscussion(discussion, "summarize"));
+        current.maxRounds,
+      );
+      if (current.evaluatedTurnIndex >= current.turnIndex && !summarize) {
+        reconciled = true;
+        break;
+      }
+      const transitioned = successes < 2 && current.evaluatedTurnIndex < current.turnIndex
+        ? transitionDiscussion(current, "pause")
+        : summarize
+          ? transitionDiscussion(current, "summarize")
+          : {
+              ...current,
+              version: current.version + 1,
+              updatedAt: new Date().toISOString(),
+            };
+      const evaluated = {
+        ...transitioned,
+        evaluatedTurnIndex: Math.max(current.evaluatedTurnIndex, current.turnIndex),
+      };
+      if (this.#store.saveDiscussionCas(evaluated, current.version)) {
+        reconciled = true;
+        break;
+      }
+    }
+    if (!reconciled) {
+      throw new Error(`Discussion boundary evaluation conflicted repeatedly: ${discussion.id}`);
     }
     await this.refreshControl(discussion.id);
   }
@@ -686,6 +708,12 @@ export class GroupDiscussionChannel {
   }
 
   async receive(input: GroupDiscussionReceiveInput): Promise<void> {
+    const priorStart = this.#store.discussionForStartMessage(input.messageId);
+    if (priorStart !== undefined) {
+      await this.#finishStart(input, priorStart);
+      return;
+    }
+
     const priorReceipt = this.#store.steerForMessage(input.messageId);
     if (priorReceipt !== undefined) {
       this.#store.recordSteer({
@@ -736,13 +764,15 @@ export class GroupDiscussionChannel {
       return;
     }
 
+    if (input.sourceAppRole !== "hub") return;
+
     let topicId = this.#store.chatTopic(input.tenantKey, input.chatId);
     const boundTopic = topicId === undefined ? undefined : this.#events.topic(topicId);
     if (boundTopic === undefined || boundTopic.status !== "active") {
       const topic = createTopic(summarizeQuestion(input.text), input.principalId, {
         id: this.#idFactory(),
       });
-      this.#events.append({
+      const created = this.#events.append({
         topicId: topic.id,
         type: "topic.created",
         actorPrincipalId: input.principalId,
@@ -750,28 +780,32 @@ export class GroupDiscussionChannel {
         createdAt: topic.createdAt,
         idempotencyKey: `group-message:${input.messageId}:topic`,
       });
-      topicId = topic.id;
-      this.#store.bindChatTopic(input.tenantKey, input.chatId, topic.id);
+      topicId = created.topicId;
+      this.#store.bindChatTopic(input.tenantKey, input.chatId, created.topicId);
     }
     if (topicId === undefined) throw new Error("Group Topic binding was not created");
-    const discussion = createDiscussion({
+    const discussion = this.#store.createDiscussion(createDiscussion({
       id: this.#idFactory(),
       topicId,
       tenantKey: input.tenantKey,
       chatId: input.chatId,
       question: input.text,
       starterPrincipalId: input.principalId,
-    });
-    this.#store.createDiscussion(discussion);
+      startMessageId: input.messageId,
+    }));
+    await this.#finishStart(input, discussion);
+  }
+
+  async #finishStart(input: GroupDiscussionReceiveInput, discussion: GroupDiscussion): Promise<void> {
     const started = this.#events.append({
-      topicId,
+      topicId: discussion.topicId,
       type: "discussion.started",
-      actorPrincipalId: input.principalId,
+      actorPrincipalId: discussion.starterPrincipalId,
       payload: {
         discussionId: discussion.id,
-        chatId: input.chatId,
+        chatId: discussion.chatId,
         messageId: input.messageId,
-        question: input.text,
+        question: discussion.question,
       },
       idempotencyKey: `group-message:${input.messageId}:discussion-started`,
     });
@@ -780,8 +814,8 @@ export class GroupDiscussionChannel {
       discussionId: discussion.id,
       messageId: input.messageId,
       topicEventSeq: started.seq,
-      principalId: input.principalId,
-      text: input.text,
+      principalId: discussion.starterPrincipalId,
+      text: discussion.question,
       ...(input.preferredProvider === undefined
         ? {}
         : { preferredProvider: input.preferredProvider }),
