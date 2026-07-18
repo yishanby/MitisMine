@@ -1932,6 +1932,259 @@ describe("GroupDiscussionChannel", () => {
     }
   });
 
+  it("recovers an exact v0 linked steer receipt on a completed Discussion", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-v0-linked-recovery-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const options = {
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `v0-linked-recovery-${++id}`,
+    };
+    const channel = new GroupDiscussionChannel(options);
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+    const messageId = "v0-linked-recovery-message";
+    const text = "Recover the linked v0 steer";
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "v0-linked-recovery-start",
+        text: "Linked v0 recovery Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-v0-linked-recovery-start",
+      });
+      const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(active).toBeDefined();
+      const event = events.append({
+        topicId: active!.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: {
+          discussionId: active!.id,
+          messageId,
+          text,
+          preferredProvider: "codex",
+        },
+        idempotencyKey: "legacy-v0-linked-recovery",
+      });
+      discussions.recordSteer({
+        id: "v0-linked-recovery-receipt",
+        discussionId: active!.id,
+        messageId,
+        topicEventSeq: event.seq,
+        principalId: "tenant-1:user:member",
+        text,
+        preferredProvider: "codex",
+      });
+      discussions.saveDiscussion({
+        ...active!,
+        state: "completed",
+        summaryText: "Already complete",
+        version: active!.version + 1,
+      });
+
+      expect(() => new GroupDiscussionChannel(options).recoverPendingSteerEvents()).not.toThrow();
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        discussionId: active!.id,
+        topicEventSeq: event.seq,
+        principalId: "tenant-1:user:member",
+        text,
+        preferredProvider: "codex",
+        status: "consumed",
+      });
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("projects an exact v0 event-before-receipt orphan at startup", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-v0-event-orphan-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const options = {
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `v0-event-orphan-${++id}`,
+    };
+    const channel = new GroupDiscussionChannel(options);
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+    const messageId = "v0-event-orphan-message";
+    const text = "Recover the orphaned v0 steer";
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "v0-event-orphan-start",
+        text: "Orphaned v0 recovery Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-v0-event-orphan-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      const event = events.append({
+        topicId: discussion!.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: {
+          discussionId: discussion!.id,
+          messageId,
+          text,
+        },
+        idempotencyKey: "legacy-v0-event-orphan",
+      });
+      expect(discussions.steerForMessage(messageId)).toBeUndefined();
+
+      new GroupDiscussionChannel(options).recoverPendingSteerEvents();
+
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        discussionId: discussion!.id,
+        topicEventSeq: event.seq,
+        principalId: "tenant-1:user:member",
+        text,
+        status: "pending",
+      });
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("fails closed when an exact v0 linked steer receipt conflicts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-v0-linked-conflict-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const options = {
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `v0-linked-conflict-${++id}`,
+    };
+    const channel = new GroupDiscussionChannel(options);
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+    const messageId = "v0-linked-conflict-message";
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "v0-linked-conflict-start",
+        text: "Conflicting v0 recovery Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-v0-linked-conflict-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      const event = events.append({
+        topicId: discussion!.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: {
+          discussionId: discussion!.id,
+          messageId,
+          text: "Canonical v0 steer text",
+        },
+        idempotencyKey: "legacy-v0-linked-conflict",
+      });
+      discussions.recordSteer({
+        id: "v0-linked-conflict-receipt",
+        discussionId: discussion!.id,
+        messageId,
+        topicEventSeq: event.seq,
+        principalId: "tenant-1:user:member",
+        text: "Conflicting receipt text",
+      });
+
+      expect(() => new GroupDiscussionChannel(options).recoverPendingSteerEvents())
+        .toThrow(/inconsistent Discussion steer receipt/i);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it.each(["hybrid scoped key", "missing actor"] as const)(
+    "rejects an exact v0 steer payload with %s at startup",
+    async (malformation) => {
+      const label = malformation.replaceAll(" ", "-");
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-v0-${label}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const options = {
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `v0-${label}-${++id}`,
+      };
+      const channel = new GroupDiscussionChannel(options);
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `v0-${label}-message`;
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `v0-${label}-start`,
+          text: "Malformed v0 recovery Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-v0-${label}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          ...(malformation === "missing actor"
+            ? {}
+            : { actorPrincipalId: "tenant-1:user:member" }),
+          payload: {
+            discussionId: discussion!.id,
+            messageId,
+            text: "Reject this malformed v0 steer",
+            ...(malformation === "hybrid scoped key" ? { tenantKey: scope.tenantKey } : {}),
+          },
+          idempotencyKey: `legacy-v0-${label}`,
+        });
+
+        expect(() => new GroupDiscussionChannel(options).recoverPendingSteerEvents())
+          .toThrow(/inconsistent discussion\.steer\.added event/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it.each(["active", "paused", "summarizing"] as const)(
     "projects an exact event-before-receipt orphan at startup while %s",
     async (state) => {

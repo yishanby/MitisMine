@@ -745,7 +745,6 @@ export class GroupDiscussionChannel {
           `Multiple Discussion steer receipts link to TopicEvent ${event.topicId}:${event.seq}`,
         );
       }
-      const input = recoveryInputForSteerEvent(event);
       const payload = recordValue(event.payload);
       const discussionId = payload?.discussionId;
       if (typeof discussionId !== "string") {
@@ -755,6 +754,7 @@ export class GroupDiscussionChannel {
       if (discussion === undefined) {
         throw new Error("Inconsistent discussion.steer.added event");
       }
+      const input = recoveryInputForSteerEvent(event, discussion);
       assertDiscussionSteerAddedEvent(event, input, discussion, true);
       const linkedReceipt = linkedReceipts[0];
       if (linkedReceipt !== undefined) {
@@ -1268,10 +1268,15 @@ function assertDiscussionSteerAddedEvent(
     ["discussionId", "tenantKey", "chatId", "messageId", "text"],
     ["preferredProvider"],
   );
+  const legacyV0Payload = hasExactLegacyPayloadShape(
+    payload,
+    ["discussionId", "messageId", "text"],
+    ["preferredProvider"],
+  );
   const eventPreferredProvider = steerEventPreferredProvider(event);
   if (
     event.type !== "discussion.steer.added"
-    || (!currentPayload && !legacyPayload)
+    || (!currentPayload && !legacyPayload && !legacyV0Payload)
     || event.topicId !== discussion.topicId
     || event.actorPrincipalId !== input.principalId
     || (!allowTerminal && !["active", "paused", "summarizing"].includes(discussion.state))
@@ -1279,8 +1284,8 @@ function assertDiscussionSteerAddedEvent(
     || discussion.chatId !== input.chatId
     || payload?.discussionId !== discussion.id
     || (currentPayload && payload?.principalId !== input.principalId)
-    || payload.tenantKey !== input.tenantKey
-    || payload.chatId !== input.chatId
+    || (!legacyV0Payload && payload.tenantKey !== input.tenantKey)
+    || (!legacyV0Payload && payload.chatId !== input.chatId)
     || payload.messageId !== input.messageId
     || payload.text !== input.text
     || (
@@ -1293,22 +1298,32 @@ function assertDiscussionSteerAddedEvent(
   }
 }
 
-function recoveryInputForSteerEvent(event: TopicEvent): GroupDiscussionReceiveInput {
+function recoveryInputForSteerEvent(
+  event: TopicEvent,
+  discussion: GroupDiscussion,
+): GroupDiscussionReceiveInput {
   const payload = recordValue(event.payload);
   const preferredProvider = steerEventPreferredProvider(event);
+  const legacyV0Payload = hasExactLegacyPayloadShape(
+    payload,
+    ["discussionId", "messageId", "text"],
+    ["preferredProvider"],
+  );
+  const tenantKey = legacyV0Payload ? discussion.tenantKey : payload?.tenantKey;
+  const chatId = legacyV0Payload ? discussion.chatId : payload?.chatId;
   if (
     event.actorPrincipalId === undefined
-    || typeof payload?.tenantKey !== "string"
-    || typeof payload.chatId !== "string"
-    || typeof payload.messageId !== "string"
-    || typeof payload.text !== "string"
+    || typeof tenantKey !== "string"
+    || typeof chatId !== "string"
+    || typeof payload?.messageId !== "string"
+    || typeof payload?.text !== "string"
   ) {
     throw new Error("Inconsistent discussion.steer.added event");
   }
   return {
-    tenantKey: payload.tenantKey,
+    tenantKey,
     principalId: event.actorPrincipalId,
-    chatId: payload.chatId,
+    chatId,
     messageId: payload.messageId,
     text: payload.text,
     sourceAppRole: "hub",
