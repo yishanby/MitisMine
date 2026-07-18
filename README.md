@@ -52,16 +52,20 @@ For each of the four Apps:
 1. Enable the **Bot** feature.
 2. Add `im:message:send_as_bot`.
 3. Add `im:message.p2p_msg:readonly`; for group use also add
-   `im:message.group_at_msg:readonly`. The deployed Apps additionally have
-   `im:message.group_at_msg.include_bot:readonly` and `im:message:readonly`.
-4. Under **Events & Callbacks**, select **persistent connection**, add event
-   `im.message.receive_v1`, and add callback `card.action.trigger`.
+   `im:message.group_at_msg:readonly`. For the recommended multi-bot mention
+   flow also add `im:message.group_at_msg.include_bot:readonly`. Add
+   `im:message:readonly` only if the tenant should deliver unmentioned group
+   messages; MitisMine does not require that broader scope.
+4. Under **Events & Callbacks**, select **persistent connection** and add event
+   `im.message.receive_v1`. On Hub, also add callback `card.action.trigger`;
+   adding it to provider Apps is optional.
 5. Create and publish a version, obtain tenant-admin approval, then install the
    bot. Open a direct chat with each bot; in a group, add and @mention it.
 
-The callback is required for approval and Discussion control buttons. Configure
-the four Apps identically; only their App IDs, Secrets, display names, and
-MitisMine roles differ.
+The callback is required on Hub for approval and Discussion controls. It may be
+registered on all Apps to keep their console configuration uniform, but current
+provider Apps do not emit cards. Apart from that distinction, configure the four
+Apps identically; only their App IDs, Secrets, display names, and roles differ.
 
 ## Install and run
 
@@ -120,8 +124,11 @@ While it is active, any human message delivered to the bots is a soft steer for
 the next speaker—no command is required. Mentioning a provider bot prioritizes
 that provider without giving it a duplicate turn. Use the single Hub control
 card for **暂停**, **继续**, **立即总结**, or **停止**. The same card message is
-updated in place. One group runs at most one active Discussion; after it reaches
-a terminal state, the next question starts another Discussion in the same Topic.
+updated in place. Pause cancels the current Agent turn and resume retries that
+speaker slot; summarize cancels the current turn and produces a final Hub
+summary; stop cancels without producing a summary. One group runs at most one
+active Discussion; after it reaches a terminal state, the next question starts
+another Discussion in the same Topic.
 
 The reliable Feishu path is to @mention Hub for a new question or steer. If the
 tenant's event permissions also deliver unmentioned group messages, those are

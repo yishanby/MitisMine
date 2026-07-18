@@ -141,10 +141,16 @@ describe("Discussion control card callback", () => {
             version: 3,
           },
         },
-        operator: { user_id: "member-1" },
+        operator: { tenant_key: "tenant-1", user_id: "member-1" },
+        context: { open_chat_id: "chat-1", open_message_id: "control-message-1" },
       },
       {
-        discussion: () => ({ tenantKey: "tenant-1", version: 3 }),
+        discussion: () => ({
+          tenantKey: "tenant-1",
+          chatId: "chat-1",
+          controlMessageId: "control-message-1",
+          version: 3,
+        }),
         control: async (...args) => { controls.push(args); },
       },
     );
@@ -157,16 +163,23 @@ describe("Discussion control card callback", () => {
 
   it("rejects provider-App callbacks and invalid Discussion actions", async () => {
     const dependencies = {
-      discussion: () => ({ tenantKey: "tenant-1", version: 1 }),
+      discussion: () => ({
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        controlMessageId: "control-message-1",
+        version: 1,
+      }),
       control: async () => {},
     };
     await expect(handleDiscussionCardAction("claude", {
       action: { value: { action: "discussion.pause", discussionId: "discussion-1", version: 1 } },
-      operator: { user_id: "member-1" },
+      operator: { tenant_key: "tenant-1", user_id: "member-1" },
+      context: { open_chat_id: "chat-1", open_message_id: "control-message-1" },
     }, dependencies)).rejects.toThrow(/Hub/i);
     await expect(handleDiscussionCardAction("hub", {
       action: { value: { action: "discussion.delete", discussionId: "discussion-1", version: 1 } },
-      operator: { user_id: "member-1" },
+      operator: { tenant_key: "tenant-1", user_id: "member-1" },
+      context: { open_chat_id: "chat-1", open_message_id: "control-message-1" },
     }, dependencies)).rejects.toThrow(/invalid/i);
   });
 
@@ -174,9 +187,15 @@ describe("Discussion control card callback", () => {
     const controls: unknown[] = [];
     const result = await handleDiscussionCardAction("hub", {
       action: { value: { action: "discussion.pause", discussionId: "discussion-1", version: 2 } },
-      operator: { user_id: "member-1" },
+      operator: { tenant_key: "tenant-1", user_id: "member-1" },
+      context: { open_chat_id: "chat-1", open_message_id: "control-message-1" },
     }, {
-      discussion: () => ({ tenantKey: "tenant-1", version: 3 }),
+      discussion: () => ({
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        controlMessageId: "control-message-1",
+        version: 3,
+      }),
       control: async (...args) => { controls.push(args); },
     });
 
@@ -184,6 +203,26 @@ describe("Discussion control card callback", () => {
     expect(result).toEqual({
       toast: { type: "warning", content: "状态已更新，请使用最新卡片" },
     });
+  });
+
+  it.each([
+    [{ tenant_key: "other-tenant", user_id: "member-1" }, { open_chat_id: "chat-1", open_message_id: "control-message-1" }],
+    [{ tenant_key: "tenant-1", user_id: "member-1" }, { open_chat_id: "other-chat", open_message_id: "control-message-1" }],
+    [{ tenant_key: "tenant-1", user_id: "member-1" }, { open_chat_id: "chat-1", open_message_id: "other-message" }],
+  ])("rejects a Discussion card outside its tenant, chat, or control message", async (operator, context) => {
+    await expect(handleDiscussionCardAction("hub", {
+      action: { value: { action: "discussion.pause", discussionId: "discussion-1", version: 3 } },
+      operator,
+      context,
+    }, {
+      discussion: () => ({
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        controlMessageId: "control-message-1",
+        version: 3,
+      }),
+      control: async () => {},
+    })).rejects.toThrow(/context|tenant/i);
   });
 });
 

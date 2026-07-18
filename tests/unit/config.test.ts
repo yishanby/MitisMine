@@ -321,14 +321,17 @@ describe("loadConfig", () => {
     const discussions = SqliteDiscussionStore.open(databasePath);
     const topic = createTopic("Visible Discussion", "tenant-1:user:operator-1", { id: "topic-1" });
     events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
-    discussions.createDiscussion(transitionDiscussion(createDiscussion({
+    discussions.createDiscussion({
+      ...transitionDiscussion(createDiscussion({
       id: "discussion-1",
       topicId: topic.id,
       tenantKey: "tenant-1",
       chatId: "chat-1",
       question: "Choose the design",
       starterPrincipalId: topic.ownerPrincipalId,
-    }), "pause"));
+      }), "pause"),
+      controlMessageId: "control-message-1",
+    });
     discussions.close();
     events.close();
     let shutdown: readonly (() => Promise<void> | void)[] = [];
@@ -355,7 +358,8 @@ describe("loadConfig", () => {
       });
       await onCardAction?.("hub", {
         action: { value: { action: "discussion.stop", discussionId: "discussion-1", version: 1 } },
-        operator: { user_id: "operator-1" },
+        operator: { tenant_key: "tenant-1", user_id: "operator-1" },
+        context: { open_chat_id: "chat-1", open_message_id: "control-message-1" },
       });
       await runtime.close();
 

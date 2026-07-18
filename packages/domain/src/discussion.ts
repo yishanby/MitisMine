@@ -29,6 +29,7 @@ export interface GroupDiscussion {
   readonly preferredProvider?: ProviderName;
   readonly controlMessageId?: string;
   readonly activeTurnId?: string;
+  readonly summaryText?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -147,7 +148,7 @@ export function transitionDiscussion(
     throw new Error(`Cannot ${action} a terminal Discussion`);
   }
   const allowed: Record<DiscussionAction, readonly DiscussionState[]> = {
-    pause: ["active"],
+    pause: ["active", "summarizing"],
     resume: ["paused"],
     summarize: ["active", "paused"],
     stop: ["active", "paused", "summarizing"],

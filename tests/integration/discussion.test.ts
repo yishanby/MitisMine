@@ -179,6 +179,59 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("preserves a delivered control-card ID and a new speaker preference while a turn completes", async () => {
+    let releaseClaude: (() => void) | undefined;
+    const claudeBlocked = new Promise<void>((resolve) => { releaseClaude = resolve; });
+    let claudeStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { claudeStarted = resolve; });
+    const adapters: AdapterRegistry = {
+      claude: deterministicAdapter("claude", [], async () => {
+        claudeStarted?.();
+        await claudeBlocked;
+        return JSON.stringify({ message: "Claude first", continueDiscussion: false, openQuestions: [] });
+      }),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    };
+    const test = harness(adapters);
+    const { controlMessageId: _initialControlMessageId, ...withoutControlMessage } = test.discussion;
+    test.discussions.saveDiscussion(withoutControlMessage);
+    const running = test.coordinator.run(test.discussion.id);
+    try {
+      await started;
+      test.discussions.recordControlMessage(test.discussion.id, "new-control-message");
+      const event = test.events.append({
+        topicId: test.topic.id,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: { text: "Copilot should answer next" },
+      });
+      test.discussions.recordSteer({
+        id: "steer-prefer-copilot",
+        discussionId: test.discussion.id,
+        messageId: "message-prefer-copilot",
+        topicEventSeq: event.seq,
+        principalId: "tenant-1:user:member",
+        text: "Copilot should answer next",
+        preferredProvider: "copilot",
+      });
+      releaseClaude?.();
+      await running;
+
+      expect(test.discussions.discussion(test.discussion.id)?.controlMessageId)
+        .toBe("new-control-message");
+      expect(test.discussions.turns(test.discussion.id).map(({ provider }) => provider))
+        .toEqual(["claude", "copilot", "codex"]);
+    } finally {
+      releaseClaude?.();
+      await running.catch(() => {});
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
   it("stops at three rounds when Agents keep requesting more discussion", async () => {
     const continuing = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) =>
       task.prompt.includes("PHASE: discussion_summary")
@@ -312,21 +365,32 @@ describe("DiscussionCoordinator", () => {
 
   it("reconciles a completed provider call after a crash without calling that Agent again", async () => {
     let claudeCalls = 0;
+    const codexPrompts: string[] = [];
     const test = harness({
       claude: deterministicAdapter("claude", [], async () => {
         claudeCalls += 1;
         return JSON.stringify({ message: "duplicate", continueDiscussion: false, openQuestions: [] });
       }),
-      codex: deterministicAdapter("codex"),
+      codex: deterministicAdapter("codex", codexPrompts),
       copilot: deterministicAdapter("copilot"),
     });
     try {
+      test.discussions.recordSteer({
+        id: "steer-captured-before-crash",
+        discussionId: test.discussion.id,
+        messageId: "message-captured-before-crash",
+        topicEventSeq: 1,
+        principalId: "tenant-1:user:member",
+        text: "captured in the turn prompt",
+        createdAt: "2026-07-18T01:00:30.000Z",
+      });
       test.discussions.claimTurn({
         id: "turn-before-crash",
         discussionId: test.discussion.id,
         provider: "claude",
         round: 1,
         turnIndex: 0,
+        steerIds: ["steer-captured-before-crash"],
         startedAt: "2026-07-18T01:01:00.000Z",
       });
       test.discussions.saveDiscussion({
@@ -335,12 +399,12 @@ describe("DiscussionCoordinator", () => {
         version: 1,
       });
       test.discussions.recordSteer({
-        id: "steer-before-crash",
+        id: "steer-unseen-before-crash",
         discussionId: test.discussion.id,
-        messageId: "message-before-crash",
+        messageId: "message-unseen-before-crash",
         topicEventSeq: 1,
         principalId: "tenant-1:user:member",
-        text: "consider migration cost",
+        text: "arrived during provider generation",
         createdAt: "2026-07-18T01:01:30.000Z",
       });
       test.discussions.completeTurn({
@@ -359,7 +423,7 @@ describe("DiscussionCoordinator", () => {
         state: "completed",
         turnIndex: 3,
       });
-      expect(test.discussions.pendingSteers(test.discussion.id)).toEqual([]);
+      expect(codexPrompts[0]).toContain("arrived during provider generation");
       expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
         .toContain("Claude durable answer");
     } finally {
@@ -436,6 +500,126 @@ describe("DiscussionCoordinator", () => {
           ["codex", "completed"],
           ["copilot", "completed"],
         ]);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("cancels an active turn and summarizes immediately without advancing speakers", async () => {
+    let started: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+    let first = true;
+    const claude: AgentAdapter = {
+      provider: "claude",
+      start: async (task) => {
+        if (first) {
+          first = false;
+          started?.();
+          return new Promise((resolve, reject) => {
+            task.signal?.addEventListener("abort", () => reject(new Error("summarize now")), { once: true });
+            void resolve;
+          });
+        }
+        expect(task.prompt).toContain("PHASE: discussion_summary");
+        return {
+          provider: "claude",
+          externalSessionId: "claude-summary",
+          events: [{ type: "final", text: JSON.stringify({ summary: "Immediate summary" }) }],
+        };
+      },
+      resume: async () => { throw new Error("unexpected resume"); },
+    };
+    const test = harness({
+      claude,
+      codex: deterministicAdapter("codex", [], async () => { throw new Error("Codex must not run"); }),
+      copilot: deterministicAdapter("copilot", [], async () => { throw new Error("Copilot must not run"); }),
+    });
+    const running = test.coordinator.run(test.discussion.id);
+    try {
+      await firstStarted;
+      await test.coordinator.control(
+        test.discussion.id,
+        "summarize",
+        "tenant-1:user:member",
+      );
+      await running.catch(() => {});
+      await test.coordinator.waitForIdle(test.discussion.id);
+
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        turnIndex: 0,
+      });
+      expect(test.discussions.discussion(test.discussion.id)?.activeTurnId).toBeUndefined();
+      expect(test.discussions.turns(test.discussion.id)).toEqual([
+        expect.objectContaining({ provider: "claude", state: "cancelled", turnIndex: 0 }),
+      ]);
+      expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
+        .toContain("Immediate summary");
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("pauses after all summary providers fail and lets a participant retry", async () => {
+    let allowSummary = false;
+    const attempts: ProviderName[] = [];
+    const summaryAdapter = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
+      expect(task.prompt).toContain("PHASE: discussion_summary");
+      attempts.push(provider);
+      if (!allowSummary) throw new Error(`${provider} summary unavailable`);
+      return JSON.stringify({ summary: "Summary retry succeeded" });
+    });
+    const test = harness({
+      claude: summaryAdapter("claude"),
+      codex: summaryAdapter("codex"),
+      copilot: summaryAdapter("copilot"),
+    });
+    try {
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:member");
+      await test.coordinator.waitForIdle(test.discussion.id);
+      expect(attempts).toEqual(["claude", "codex", "copilot"]);
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("paused");
+
+      allowSummary = true;
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:member");
+      await test.coordinator.waitForIdle(test.discussion.id);
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("completed");
+      expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
+        .toContain("Summary retry succeeded");
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("recreates a missing final-summary effect from durable completed state", async () => {
+    const test = harness({
+      claude: deterministicAdapter("claude"),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    try {
+      test.discussions.saveDiscussion({
+        ...test.discussion,
+        state: "completed",
+        summaryText: "Durable summary after crash",
+        version: 1,
+      });
+
+      await test.coordinator.run(test.discussion.id);
+
+      expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
+        .toContain("Durable summary after crash");
+      expect(test.events.events(test.topic.id).map(({ type }) => type))
+        .toContain("discussion.completed");
     } finally {
       await test.coordinator.shutdown();
       test.discussions.close();

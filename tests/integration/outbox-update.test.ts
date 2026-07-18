@@ -134,6 +134,7 @@ describe("updatable durable Outbox", () => {
       payload: { schema: "2.0" },
       idempotencyKey: "control-card",
       deliveryEffect: { kind: "discussion.control.created", discussionId: "discussion-1" },
+      nextAttemptAt: "2026-07-18T01:00:00.000Z",
     });
     const sends: string[] = [];
     const effects: OutboxSendResult[] = [];
@@ -171,6 +172,53 @@ describe("updatable durable Outbox", () => {
         { messageId: "message-created" },
       ]);
       expect(outbox.message("control-card")?.status).toBe("sent");
+    } finally {
+      await dispatcher.stop();
+      outbox.close();
+    }
+  });
+
+  it("never retries an older card patch after a newer version is queued", async () => {
+    const outbox = openOutbox();
+    outbox.enqueue({
+      id: "control-v1",
+      appRole: "hub",
+      receiveId: "chat-1",
+      payload: { version: 1 },
+      idempotencyKey: "control-v1",
+      operation: "update",
+      targetMessageId: "control-message",
+      nextAttemptAt: "2026-07-18T01:00:00.000Z",
+    });
+    const sends: string[] = [];
+    const dispatcher = new OutboxDispatcher({
+      outbox,
+      sender: {
+        send: async (message) => {
+          sends.push(message.id);
+          if (message.id === "control-v1") throw new Error("old patch failed");
+          return {};
+        },
+      },
+    });
+
+    try {
+      await dispatcher.flushOnce(new Date("2026-07-18T01:00:00.000Z"));
+      outbox.enqueue({
+        id: "control-v2",
+        appRole: "hub",
+        receiveId: "chat-1",
+        payload: { version: 2 },
+        idempotencyKey: "control-v2",
+        operation: "update",
+        targetMessageId: "control-message",
+        nextAttemptAt: "2026-07-18T01:00:01.000Z",
+      });
+      await dispatcher.flushOnce(new Date("2026-07-18T01:01:00.000Z"));
+
+      expect(sends).toEqual(["control-v1", "control-v2"]);
+      expect(outbox.message("control-v1")?.status).toBe("superseded");
+      expect(outbox.message("control-v2")?.status).toBe("sent");
     } finally {
       await dispatcher.stop();
       outbox.close();

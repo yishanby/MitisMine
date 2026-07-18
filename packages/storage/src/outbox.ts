@@ -91,29 +91,43 @@ export class DurableOutbox implements OutboxPort {
 
   enqueue(input: EnqueueOutboxInput): boolean {
     const operation = input.operation ?? "create";
-    if (operation === "update" && input.targetMessageId === undefined) {
+    const targetMessageId = input.targetMessageId;
+    if (operation === "update" && targetMessageId === undefined) {
       throw new Error("Outbox update requires a target message ID");
     }
-    const result = this.#database
-      .prepare(`
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.#database.prepare(`
         INSERT OR IGNORE INTO outbox_messages (
           id, app_role, receive_id, payload_json, operation,
           target_message_id, delivery_effect_json, result_json, attempts,
           next_attempt_at, status, idempotency_key
         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 'pending', ?)
-      `)
-      .run(
+      `).run(
         input.id,
         input.appRole,
         input.receiveId,
         JSON.stringify(input.payload),
         operation,
-        input.targetMessageId ?? null,
+        targetMessageId ?? null,
         input.deliveryEffect === undefined ? null : JSON.stringify(input.deliveryEffect),
         input.nextAttemptAt ?? new Date().toISOString(),
         input.idempotencyKey,
       );
-    return Number(result.changes) === 1;
+      const inserted = Number(result.changes) === 1;
+      if (inserted && operation === "update") {
+        this.#database.prepare(`
+          UPDATE outbox_messages SET status = 'superseded'
+          WHERE operation = 'update' AND target_message_id = ? AND id <> ?
+            AND status IN ('pending', 'retry', 'delivered')
+        `).run(targetMessageId as string, input.id);
+      }
+      this.#database.exec("COMMIT");
+      return inserted;
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   pending(now = new Date().toISOString()): OutboxMessage[] {
@@ -131,12 +145,15 @@ export class DurableOutbox implements OutboxPort {
   }
 
   markSent(id: string): void {
-    this.#database.prepare("UPDATE outbox_messages SET status = 'sent' WHERE id = ?").run(id);
+    this.#database.prepare(`
+      UPDATE outbox_messages SET status = 'sent' WHERE id = ? AND status <> 'superseded'
+    `).run(id);
   }
 
   markDelivered(id: string, result: OutboxSendResult): void {
     this.#database.prepare(`
-      UPDATE outbox_messages SET status = 'delivered', result_json = ? WHERE id = ?
+      UPDATE outbox_messages SET status = 'delivered', result_json = ?
+      WHERE id = ? AND status <> 'superseded'
     `).run(JSON.stringify(result), id);
   }
 
@@ -146,7 +163,7 @@ export class DurableOutbox implements OutboxPort {
         UPDATE outbox_messages
         SET status = CASE WHEN status = 'delivered' THEN 'delivered' ELSE 'retry' END,
             attempts = attempts + 1, next_attempt_at = ?
-        WHERE id = ?
+        WHERE id = ? AND status <> 'superseded'
       `)
       .run(nextAttemptAt, id);
   }

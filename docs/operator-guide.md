@@ -6,7 +6,10 @@ One control plane owns four Feishu persistent connections, HTTP health routes,
 the durable inbox/Outbox, Orchestrator, Approval Engine, and a local Worker. The
 Worker uses SQLite-backed leases and heartbeats for every provider call.
 
-| Role | App ID | Behavior |
+The App IDs below identify the verified deployment, not reusable defaults.
+Replace them with the four IDs from the target tenant in every new installation.
+
+| Role | Verified App ID | Behavior |
 |---|---|---|
 | Hub | `cli_aad0b5b7aeb89cc4` | Topic management, research, and group moderation |
 | Claude | `cli_aad0b5ed06f8dd23` | Claude direct Sessions and visible group turns |
@@ -22,16 +25,21 @@ Repeat for all four Apps:
 
 1. Enable **Bot**.
 2. Grant `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, and, for
-   groups, `im:message.group_at_msg:readonly`. Add
-   `im:message.group_at_msg.include_bot:readonly` if messages may mention other
-   bots. `im:message:readonly` is also present in the verified deployment.
+   groups, `im:message.group_at_msg:readonly`. For the recommended `@Hub
+   @Provider` steering flow also grant
+   `im:message.group_at_msg.include_bot:readonly`. Grant the broader
+   `im:message:readonly` only if unmentioned group messages should become steer;
+   the reliable documented path does not depend on it.
 3. Select **Events & Callbacks → persistent connection**.
 4. Add event **Message received v2.0** (`im.message.receive_v1`).
-5. Add callback **Card callback communication** (`card.action.trigger`).
+5. On Hub, add callback **Card callback communication**
+   (`card.action.trigger`). Adding it to provider Apps is optional.
 6. Publish a version, have the tenant admin approve/install it, and add the bot
    to its direct/group chats.
 
-All four App IDs must be unique. Approval cards cannot work without the callback.
+All four App IDs must be unique. Hub approval/Discussion cards cannot work
+without its callback. Registering the callback on provider Apps is optional;
+it is harmless when console configurations are kept identical.
 
 ## 3. Configuration and identity preflight
 
@@ -124,7 +132,7 @@ foreach ($name in @(
 ```
 
 After `pnpm build`, save the following as the service wrapper and adjust the
-three absolute directories. It maps every required variable, restores any
+three absolute directories and all four App IDs. It maps every required variable, restores any
 previous process values in `finally`, and never places Secret values in command
 arguments or shell history:
 
@@ -150,10 +158,10 @@ try {
   $env:MITISMINE_AGENT_WORKSPACE_ROOT = 'D:\MitisMine\agent-workspaces'
   $env:MITISMINE_HTTP_HOST = '127.0.0.1'
   $env:MITISMINE_HTTP_PORT = '4317'
-  $env:FEISHU_HUB_APP_ID = 'cli_aad0b5b7aeb89cc4'
-  $env:FEISHU_CLAUDE_APP_ID = 'cli_aad0b5ed06f8dd23'
-  $env:FEISHU_CODEX_APP_ID = 'cli_aad0b6053e78dd01'
-  $env:FEISHU_COPILOT_APP_ID = 'cli_aad0b65c14f8dd24'
+  $env:FEISHU_HUB_APP_ID = '<hub-app-id>'
+  $env:FEISHU_CLAUDE_APP_ID = '<claude-app-id>'
+  $env:FEISHU_CODEX_APP_ID = '<codex-app-id>'
+  $env:FEISHU_COPILOT_APP_ID = '<copilot-app-id>'
   foreach ($name in @(
     'FEISHU_HUB_APP_SECRET','FEISHU_CLAUDE_APP_SECRET',
     'FEISHU_CODEX_APP_SECRET','FEISHU_COPILOT_APP_SECRET',
@@ -225,6 +233,16 @@ product flow has no group-specific slash commands:
 4. Use the card buttons to pause, resume, summarize now, or stop. Any participant
    may pause/resume/summarize; only the starter or Topic owner may stop.
 
+Here, participant means any human whose stable Feishu identity is delivered in
+the group event. The first question's author becomes both Discussion starter and
+owner of the newly created group Topic. That Topic binding is group-local and
+does not replace anyone's currently selected P2P Topic.
+
+Pause aborts the in-flight Agent process and retains its speaker slot; resume
+retries that slot. Summarize now aborts the in-flight turn, produces one final
+Hub summary from completed turns, and ends the Discussion. Stop aborts work and
+ends it without a final summary.
+
 The card is patched in place using its persisted Feishu message ID. Stale button
 replays are ignored. One group can have only one active Discussion, so a new
 human message during it is always steer rather than a second conversation.
@@ -236,6 +254,8 @@ Group Discussion Sessions are isolated from `/research` Sessions and provider
 direct Sessions, but all three paths share one FIFO provider concurrency budget
 of six. `/status`, `/report`, and `/stop` continue to address the P2P ResearchRun;
 use the Discussion card for the group roundtable.
+
+### P2P evidence research controls
 
 Use `/status`, `/report`, and `/stop`. A stop aborts queued/active calls, kills
 their process trees, requeues their leases, and persists `cancelled` with
@@ -286,10 +306,10 @@ invalidates pending approval tokens.
 
 ## 7. Shutdown
 
-Send SIGINT/SIGTERM (Ctrl+C on Windows). The service first stops Outbox polling,
-then aborts and drains group/direct/research work, stops recovery, closes Feishu
-sockets, and finally closes SQLite. Runner cancellation has a bounded grace
-period and terminates the process tree.
+Send SIGINT/SIGTERM (Ctrl+C on Windows). The service first closes inbound Feishu
+sockets, then aborts and drains group/direct/research work, stops recovery,
+flushes and stops the Outbox, and finally closes SQLite. Runner cancellation has
+a bounded grace period and terminates the process tree.
 
 ## 8. Backup and restore
 

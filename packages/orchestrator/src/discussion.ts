@@ -42,6 +42,7 @@ export interface DiscussionCoordinatorOptions {
   readonly idFactory: () => string;
   readonly maxConcurrency?: number;
   readonly limiter?: AgentCallLimiter;
+  readonly onError?: (discussionId: string, error: unknown) => void;
 }
 
 export class DiscussionControlDeliveryEffects {
@@ -83,6 +84,7 @@ export class DiscussionCoordinator {
   readonly #workspaceRoot: string;
   readonly #idFactory: () => string;
   readonly #semaphore: AgentCallLimiter;
+  readonly #onError: (discussionId: string, error: unknown) => void;
   readonly #loops = new Map<string, Promise<void>>();
   readonly #controllers = new Map<string, AbortController>();
   #shuttingDown = false;
@@ -95,6 +97,9 @@ export class DiscussionCoordinator {
     this.#workspaceRoot = resolve(options.workspaceRoot);
     this.#idFactory = options.idFactory;
     this.#semaphore = options.limiter ?? new AgentConcurrencyLimiter(options.maxConcurrency ?? 3);
+    this.#onError = options.onError ?? ((discussionId, error) => {
+      console.error(`Discussion ${discussionId} failed: ${errorMessage(error)}`);
+    });
   }
 
   run(discussionId: string): Promise<void> {
@@ -111,7 +116,20 @@ export class DiscussionCoordinator {
   }
 
   kick(discussionId: string): void {
-    void this.run(discussionId).catch(() => {});
+    void this.run(discussionId).catch(async (error: unknown) => {
+      this.#onError(discussionId, error);
+      try {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const current = this.#requireDiscussion(discussionId);
+          if (current.state !== "active" && current.state !== "summarizing") break;
+          const paused = transitionDiscussion(current, "pause");
+          if (this.#store.saveDiscussionCas(paused, current.version)) break;
+        }
+        await this.refreshControl(discussionId);
+      } catch (recoveryError) {
+        this.#onError(discussionId, recoveryError);
+      }
+    });
   }
 
   async waitForIdle(discussionId: string): Promise<void> {
@@ -139,11 +157,37 @@ export class DiscussionCoordinator {
       await this.refreshControl(discussionId);
       return;
     }
-    const updated = transitionDiscussion(discussion, action);
-    this.#store.saveDiscussion(updated);
-    if (action === "pause" || action === "stop") {
+    const activeLoop = this.#loops.get(discussionId);
+    let updated: GroupDiscussion | undefined;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const current = this.#requireDiscussion(discussionId);
+      if (
+        (action === "pause" && current.state === "paused")
+        || (action === "resume" && current.state === "active")
+        || (action === "summarize" && ["summarizing", "completed"].includes(current.state))
+        || (action === "stop" && current.state === "stopped")
+      ) {
+        await this.refreshControl(discussionId);
+        return;
+      }
+      const candidate = transitionDiscussion(current, action);
+      if (this.#store.saveDiscussionCas(candidate, current.version)) {
+        updated = candidate;
+        break;
+      }
+    }
+    if (updated === undefined) throw new Error(`Discussion control conflicted repeatedly: ${discussionId}`);
+    this.#events.append({
+      topicId: updated.topicId,
+      type: "discussion.controlled",
+      actorPrincipalId: principalId,
+      payload: { discussionId, action, version: updated.version },
+      idempotencyKey: `discussion:${discussionId}:control:${updated.version}:${action}`,
+    });
+    if (action === "pause" || action === "stop" || action === "summarize") {
       this.#controllers.get(discussionId)?.abort(new Error(`Discussion ${action} requested`));
     }
+    if (action === "summarize") await activeLoop?.catch(() => {});
     await this.refreshControl(discussionId);
     if (action === "resume" || action === "summarize") this.kick(discussionId);
   }
@@ -203,6 +247,7 @@ export class DiscussionCoordinator {
     while (!this.#shuttingDown) {
       const discussion = this.#requireDiscussion(discussionId);
       this.#repairCompletedTurnEffects(discussion);
+      this.#repairSummaryEffect(discussion);
       await this.refreshControl(discussionId);
       if (discussion.state === "active") {
         if (await this.#reconcileCompletedTurn(discussion)) continue;
@@ -218,6 +263,7 @@ export class DiscussionCoordinator {
 
   async #executeTurn(discussion: GroupDiscussion): Promise<void> {
     const provider = nextDiscussionProvider(discussion);
+    const steers = this.#store.pendingSteers(discussion.id);
     const priorTurn = this.#store.turnForIndex(discussion.id, discussion.turnIndex);
     const turnId = priorTurn?.id ?? this.#idFactory();
     if (priorTurn === undefined) {
@@ -227,22 +273,21 @@ export class DiscussionCoordinator {
         provider,
         round: discussion.round,
         turnIndex: discussion.turnIndex,
+        steerIds: steers.map(({ id }) => id),
       });
       if (!claimed) throw new Error("Discussion turn index was already claimed");
     } else {
-      this.#store.restartTurn(turnId, provider, discussion.round);
+      this.#store.restartTurn(turnId, provider, discussion.round, steers.map(({ id }) => id));
     }
     const controller = new AbortController();
     this.#controllers.set(discussion.id, controller);
-    const runningDiscussion: GroupDiscussion = {
-      ...discussion,
-      activeTurnId: turnId,
-      version: discussion.version + 1,
-      updatedAt: new Date().toISOString(),
-    };
-    this.#store.saveDiscussion(runningDiscussion);
+    const runningDiscussion = this.#store.activateTurn(
+      discussion.id,
+      turnId,
+      discussion.turnIndex,
+      provider,
+    );
     await this.refreshControl(discussion.id);
-    const steers = this.#store.pendingSteers(discussion.id);
     const prompt = discussionTurnPrompt({
       provider,
       question: discussion.question,
@@ -254,9 +299,35 @@ export class DiscussionCoordinator {
       })),
       sharedContext: this.#sharedContext(discussion.topicId),
     });
+    let output: DiscussionAgentOutput;
     try {
       const raw = await this.#callProvider(runningDiscussion, provider, prompt, controller.signal);
-      const output = parseDiscussionAgentOutput(raw);
+      output = parseDiscussionAgentOutput(raw);
+    } catch (error) {
+      const state = controller.signal.aborted ? "cancelled" : "failed";
+      this.#store.failTurn(turnId, state);
+      if (!controller.signal.aborted) {
+        this.#outbox.enqueue({
+          id: `outbox:discussion:${discussion.id}:visible:${discussion.turnIndex}:failed`,
+          appRole: provider,
+          receiveId: discussion.chatId,
+          payload: textCard(`${providerLabel(provider)} 暂时无法发言`, errorMessage(error)),
+          idempotencyKey: `discussion:${discussion.id}:visible:${discussion.turnIndex}:failed`,
+        });
+        const advanced = this.#advanceTurn(discussion.id, turnId, provider, true);
+        if (advanced !== undefined) await this.#afterTurn(advanced);
+        if (this.#controllers.get(discussion.id) === controller) {
+          this.#controllers.delete(discussion.id);
+        }
+        return;
+      }
+      this.#store.clearActiveTurn(discussion.id, turnId);
+      if (this.#controllers.get(discussion.id) === controller) {
+        this.#controllers.delete(discussion.id);
+      }
+      throw error;
+    }
+    try {
       const session = this.#events.agentSession(
         discussion.topicId,
         provider,
@@ -272,36 +343,17 @@ export class DiscussionCoordinator {
         continueDiscussion: output.continueDiscussion,
         openQuestions: output.openQuestions,
       });
-      this.#store.consumeSteers(discussion.id, steers.map((steer) => steer.id));
-      const updated = completeDiscussionTurn(runningDiscussion, {
-        provider,
-        continueDiscussion: output.continueDiscussion,
-      });
-      this.#store.saveDiscussion(updated);
       const completedTurn = this.#store.turn(turnId);
       if (completedTurn === undefined) throw new Error(`Completed Discussion turn not found: ${turnId}`);
+      this.#store.consumeSteers(discussion.id, completedTurn.steerIds);
       this.#publishCompletedTurn(discussion, completedTurn);
-      await this.#afterTurn(updated);
-    } catch (error) {
-      const state = controller.signal.aborted ? "cancelled" : "failed";
-      this.#store.failTurn(turnId, state);
-      if (!controller.signal.aborted) {
-        this.#outbox.enqueue({
-          id: `outbox:discussion:${discussion.id}:visible:${discussion.turnIndex}:failed`,
-          appRole: provider,
-          receiveId: discussion.chatId,
-          payload: textCard(`${providerLabel(provider)} 暂时无法发言`, errorMessage(error)),
-          idempotencyKey: `discussion:${discussion.id}:visible:${discussion.turnIndex}:failed`,
-        });
-        const advanced = completeDiscussionTurn(runningDiscussion, {
-          provider,
-          continueDiscussion: true,
-        });
-        this.#store.saveDiscussion(advanced);
-        await this.#afterTurn(advanced);
-        return;
-      }
-      throw error;
+      const updated = this.#advanceTurn(
+        discussion.id,
+        turnId,
+        provider,
+        output.continueDiscussion,
+      );
+      if (updated !== undefined) await this.#afterTurn(updated);
     } finally {
       if (this.#controllers.get(discussion.id) === controller) {
         this.#controllers.delete(discussion.id);
@@ -343,19 +395,39 @@ export class DiscussionCoordinator {
     if (turn.continueDiscussion === undefined || turn.text === undefined) {
       throw new Error(`Completed Discussion turn is incomplete: ${turn.id}`);
     }
-    const completedAt = turn.completedAt;
-    const consumedSteers = this.#store.pendingSteers(discussion.id).filter(
-      (steer) => completedAt !== undefined && steer.createdAt <= completedAt,
+    this.#store.consumeSteers(discussion.id, turn.steerIds);
+    const updated = this.#advanceTurn(
+      discussion.id,
+      turn.id,
+      turn.provider,
+      turn.continueDiscussion,
     );
-    this.#store.consumeSteers(discussion.id, consumedSteers.map(({ id }) => id));
-    const updated = completeDiscussionTurn(discussion, {
-      provider: turn.provider,
-      continueDiscussion: turn.continueDiscussion,
-    });
-    this.#store.saveDiscussion(updated);
+    if (updated === undefined) return false;
     this.#publishCompletedTurn(discussion, turn);
     await this.#afterTurn(updated);
     return true;
+  }
+
+  #advanceTurn(
+    discussionId: string,
+    turnId: string,
+    provider: ProviderName,
+    continueDiscussion: boolean,
+  ): GroupDiscussion | undefined {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const current = this.#requireDiscussion(discussionId);
+      if (current.state !== "active" || current.activeTurnId !== turnId) return undefined;
+      const pendingPreferred = current.preferredProvider;
+      const updatedBase = completeDiscussionTurn(
+        { ...current, preferredProvider: provider },
+        { provider, continueDiscussion },
+      );
+      const updated = pendingPreferred === undefined
+        ? updatedBase
+        : { ...updatedBase, preferredProvider: pendingPreferred };
+      if (this.#store.saveDiscussionCas(updated, current.version)) return updated;
+    }
+    throw new Error(`Discussion turn advancement conflicted repeatedly: ${discussionId}`);
   }
 
   #repairCompletedTurnEffects(discussion: GroupDiscussion): void {
@@ -391,8 +463,31 @@ export class DiscussionCoordinator {
     });
   }
 
+  #repairSummaryEffect(discussion: GroupDiscussion): void {
+    if (discussion.state !== "completed" || discussion.summaryText === undefined) return;
+    this.#events.append({
+      topicId: discussion.topicId,
+      type: "discussion.completed",
+      payload: { discussionId: discussion.id, summary: discussion.summaryText },
+      idempotencyKey: `discussion:${discussion.id}:summary:completed`,
+    });
+    this.#outbox.enqueue({
+      id: `outbox:discussion:${discussion.id}:summary:completed`,
+      appRole: "hub",
+      receiveId: discussion.chatId,
+      payload: textCard("讨论总结", discussion.summaryText),
+      idempotencyKey: `discussion:${discussion.id}:summary:completed`,
+    });
+  }
+
   async #summarize(discussion: GroupDiscussion): Promise<void> {
-    const provider = nextDiscussionProvider(discussion);
+    const firstProvider = nextDiscussionProvider(discussion);
+    const providers: ProviderName[] = [
+      firstProvider,
+      ...(["claude", "codex", "copilot"] as const).filter(
+        (provider) => provider !== firstProvider,
+      ),
+    ];
     const turns = this.#store.turns(discussion.id).filter(
       (turn): turn is DiscussionTurn & { text: string } =>
         turn.state === "completed" && turn.text !== undefined,
@@ -408,41 +503,58 @@ export class DiscussionCoordinator {
     });
     const controller = new AbortController();
     this.#controllers.set(discussion.id, controller);
+    let summary: string | undefined;
+    const failures: string[] = [];
     try {
-      const raw = await this.#callProvider(discussion, provider, prompt, controller.signal);
-      const summary = parseDiscussionSummary(raw);
-      this.#events.append({
-        topicId: discussion.topicId,
-        type: "discussion.completed",
-        payload: { discussionId: discussion.id, summary },
-        idempotencyKey: `discussion:${discussion.id}:summary:completed`,
-      });
-      const completed: GroupDiscussion = {
-        ...discussion,
-        state: "completed",
-        version: discussion.version + 1,
-        updatedAt: new Date().toISOString(),
-      };
-      this.#store.saveDiscussion(completed);
-      this.#outbox.enqueue({
-        id: `outbox:discussion:${discussion.id}:summary:completed`,
-        appRole: "hub",
-        receiveId: discussion.chatId,
-        payload: textCard("讨论总结", summary),
-        idempotencyKey: `discussion:${discussion.id}:summary:completed`,
-      });
-      await this.refreshControl(discussion.id);
-    } catch (error) {
-      if (!controller.signal.aborted) {
-        this.#store.saveDiscussion({
-          ...discussion,
-          state: "failed",
-          version: discussion.version + 1,
-          updatedAt: new Date().toISOString(),
+      for (const provider of providers) {
+        try {
+          const raw = await this.#callProvider(discussion, provider, prompt, controller.signal);
+          summary = parseDiscussionSummary(raw);
+          break;
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          failures.push(`${providerLabel(provider)}: ${errorMessage(error)}`);
+        }
+      }
+      if (summary === undefined) {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const current = this.#requireDiscussion(discussion.id);
+          if (current.state !== "summarizing") break;
+          const paused = transitionDiscussion(current, "pause");
+          if (this.#store.saveDiscussionCas(paused, current.version)) break;
+        }
+        const current = this.#requireDiscussion(discussion.id);
+        this.#outbox.enqueue({
+          id: `outbox:discussion:${discussion.id}:summary:failed:${current.version}`,
+          appRole: "hub",
+          receiveId: discussion.chatId,
+          payload: textCard("总结暂不可用", `${failures.join("\n")}\n\n可稍后点击「立即总结」重试。`),
+          idempotencyKey: `discussion:${discussion.id}:summary:failed:${current.version}`,
         });
         await this.refreshControl(discussion.id);
+        return;
       }
-      throw error;
+      let completed: GroupDiscussion | undefined;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const current = this.#requireDiscussion(discussion.id);
+        if (current.state !== "summarizing") return;
+        const candidate: GroupDiscussion = {
+          ...current,
+          state: "completed",
+          summaryText: summary,
+          version: current.version + 1,
+          updatedAt: new Date().toISOString(),
+        };
+        if (this.#store.saveDiscussionCas(candidate, current.version)) {
+          completed = candidate;
+          break;
+        }
+      }
+      if (completed === undefined) {
+        throw new Error(`Discussion summary completion conflicted repeatedly: ${discussion.id}`);
+      }
+      this.#repairSummaryEffect(completed);
+      await this.refreshControl(discussion.id);
     } finally {
       if (this.#controllers.get(discussion.id) === controller) {
         this.#controllers.delete(discussion.id);

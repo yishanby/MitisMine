@@ -30,6 +30,7 @@ export interface FeishuMessageEvent {
     readonly key: string;
     readonly userId?: string;
     readonly unionId?: string;
+    readonly name?: string;
   }[];
 }
 
@@ -158,7 +159,7 @@ export class FeishuGateway {
     if (this.#groupDiscussions === undefined) {
       throw new Error("Group Discussion coordinator is not configured");
     }
-    const text = stripMentions(event.text, event.mentions);
+    const text = stripBotMentions(event.text, event.mentions);
     if (!text) throw new Error("Group Discussion message is empty after removing mentions");
     await this.#groupDiscussions.receive({
       tenantKey: event.tenantKey,
@@ -168,7 +169,9 @@ export class FeishuGateway {
       text,
       sourceAppRole: event.appRole,
       idempotencyKey: `${routeKey}:group-discussion`,
-      ...(event.appRole === "hub" ? {} : { preferredProvider: event.appRole }),
+      ...(event.appRole !== "hub" && providerExplicitlyMentioned(event)
+        ? { preferredProvider: event.appRole }
+        : {}),
     });
   }
 
@@ -682,15 +685,24 @@ function summarize(text: string): string {
   return oneLine.length <= 60 ? oneLine : `${oneLine.slice(0, 59)}…`;
 }
 
-function stripMentions(
+function stripBotMentions(
   text: string,
   mentions: FeishuMessageEvent["mentions"],
 ): string {
   let result = text;
   for (const mention of mentions ?? []) {
-    result = result.replaceAll(mention.key, " ");
+    if (mention.name === undefined || /(?:^mitismine\b|总控)/i.test(mention.name)) {
+      result = result.replaceAll(mention.key, " ");
+    }
   }
   return result.replace(/\s+/g, " ").trim();
+}
+
+function providerExplicitlyMentioned(event: FeishuMessageEvent): boolean {
+  if (event.appRole === "hub") return false;
+  return event.mentions?.some(
+    ({ name }) => name?.toLowerCase().includes(event.appRole) === true,
+  ) === true;
 }
 
 function parseSdkEvent(appRole: AppRole, raw: unknown): FeishuMessageEvent {
@@ -709,10 +721,12 @@ function parseSdkEvent(appRole: AppRole, raw: unknown): FeishuMessageEvent {
         const mentionId = object(mention.id, "message mention ID");
         const mentionUserId = optionalString(mentionId.user_id);
         const mentionUnionId = optionalString(mentionId.union_id);
+        const mentionName = optionalString(mention.name);
         return {
           key: string(mention.key, "message mention key"),
           ...(mentionUserId === undefined ? {} : { userId: mentionUserId }),
           ...(mentionUnionId === undefined ? {} : { unionId: mentionUnionId }),
+          ...(mentionName === undefined ? {} : { name: mentionName }),
         };
       })
     : [];

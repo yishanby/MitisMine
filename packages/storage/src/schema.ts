@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS group_discussions (
   preferred_provider TEXT,
   control_message_id TEXT,
   active_turn_id TEXT,
+  summary_text TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -168,6 +169,7 @@ CREATE TABLE IF NOT EXISTS discussion_turns (
   text TEXT,
   continue_discussion INTEGER,
   open_questions_json TEXT NOT NULL DEFAULT '[]',
+  steer_ids_json TEXT NOT NULL DEFAULT '[]',
   started_at TEXT,
   completed_at TEXT,
   UNIQUE (discussion_id, turn_index)

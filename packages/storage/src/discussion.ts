@@ -44,6 +44,7 @@ export interface DiscussionTurn {
   readonly text?: string;
   readonly continueDiscussion?: boolean;
   readonly openQuestions: readonly string[];
+  readonly steerIds: readonly string[];
   readonly startedAt?: string;
   readonly completedAt?: string;
 }
@@ -54,6 +55,7 @@ export interface ClaimDiscussionTurnInput {
   readonly provider: ProviderName;
   readonly round: number;
   readonly turnIndex: number;
+  readonly steerIds?: readonly string[];
   readonly startedAt?: string;
 }
 
@@ -83,6 +85,7 @@ interface DiscussionRow {
   preferred_provider: ProviderName | null;
   control_message_id: string | null;
   active_turn_id: string | null;
+  summary_text: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -111,6 +114,7 @@ interface TurnRow {
   text: string | null;
   continue_discussion: number | null;
   open_questions_json: string;
+  steer_ids_json: string;
   started_at: string | null;
   completed_at: string | null;
 }
@@ -127,6 +131,16 @@ export class SqliteDiscussionStore {
     const database = new DatabaseSync(path);
     database.exec("PRAGMA journal_mode = WAL;");
     database.exec(SCHEMA_SQL);
+    const turnColumns = database.prepare("PRAGMA table_info(discussion_turns)").all() as unknown as
+      Array<{ name: string }>;
+    if (!turnColumns.some(({ name }) => name === "steer_ids_json")) {
+      database.exec("ALTER TABLE discussion_turns ADD COLUMN steer_ids_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    const discussionColumns = database.prepare("PRAGMA table_info(group_discussions)").all() as unknown as
+      Array<{ name: string }>;
+    if (!discussionColumns.some(({ name }) => name === "summary_text")) {
+      database.exec("ALTER TABLE group_discussions ADD COLUMN summary_text TEXT");
+    }
     return new SqliteDiscussionStore(database);
   }
 
@@ -157,8 +171,8 @@ export class SqliteDiscussionStore {
         INSERT INTO group_discussions (
           id, topic_id, tenant_key, chat_id, question, starter_principal_id,
           state, round, turn_index, next_provider, round_order_json, max_rounds, version,
-          preferred_provider, control_message_id, active_turn_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          preferred_provider, control_message_id, active_turn_id, summary_text, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         discussion.id,
         discussion.topicId,
@@ -176,6 +190,7 @@ export class SqliteDiscussionStore {
         discussion.preferredProvider ?? null,
         discussion.controlMessageId ?? null,
         discussion.activeTurnId ?? null,
+        discussion.summaryText ?? null,
         discussion.createdAt,
         discussion.updatedAt,
       );
@@ -212,7 +227,8 @@ export class SqliteDiscussionStore {
           topic_id = ?, tenant_key = ?, chat_id = ?, question = ?, starter_principal_id = ?,
           state = ?, round = ?, turn_index = ?, next_provider = ?, round_order_json = ?,
           max_rounds = ?, version = ?,
-          preferred_provider = ?, control_message_id = ?, active_turn_id = ?, updated_at = ?
+          preferred_provider = ?, control_message_id = ?, active_turn_id = ?,
+          summary_text = ?, updated_at = ?
         WHERE id = ?
       `).run(
         discussion.topicId,
@@ -230,6 +246,7 @@ export class SqliteDiscussionStore {
         discussion.preferredProvider ?? null,
         discussion.controlMessageId ?? null,
         discussion.activeTurnId ?? null,
+        discussion.summaryText ?? null,
         discussion.updatedAt,
         discussion.id,
       );
@@ -243,9 +260,84 @@ export class SqliteDiscussionStore {
     return this.discussion(discussion.id) as GroupDiscussion;
   }
 
-  recordControlMessage(discussionId: string, messageId: string, now = new Date().toISOString()): void {
+  saveDiscussionCas(discussion: GroupDiscussion, expectedVersion: number): boolean {
+    if (discussion.version !== expectedVersion + 1) {
+      throw new Error("Discussion CAS must advance version by one");
+    }
     const result = this.#database.prepare(`
-      UPDATE group_discussions SET control_message_id = ?, updated_at = ? WHERE id = ?
+      UPDATE group_discussions SET
+        topic_id = ?, tenant_key = ?, chat_id = ?, question = ?, starter_principal_id = ?,
+        state = ?, round = ?, turn_index = ?, next_provider = ?, round_order_json = ?,
+        max_rounds = ?, version = ?, preferred_provider = ?, control_message_id = ?,
+        active_turn_id = ?, summary_text = ?, updated_at = ?
+      WHERE id = ? AND version = ?
+    `).run(
+      discussion.topicId,
+      discussion.tenantKey,
+      discussion.chatId,
+      discussion.question,
+      discussion.starterPrincipalId,
+      discussion.state,
+      discussion.round,
+      discussion.turnIndex,
+      discussion.nextProvider,
+      JSON.stringify(discussion.roundOrder),
+      discussion.maxRounds,
+      discussion.version,
+      discussion.preferredProvider ?? null,
+      discussion.controlMessageId ?? null,
+      discussion.activeTurnId ?? null,
+      discussion.summaryText ?? null,
+      discussion.updatedAt,
+      discussion.id,
+      expectedVersion,
+    );
+    return Number(result.changes) === 1;
+  }
+
+  activateTurn(
+    discussionId: string,
+    turnId: string,
+    turnIndex: number,
+    provider: ProviderName,
+    now = new Date().toISOString(),
+  ): GroupDiscussion {
+    const result = this.#database.prepare(`
+      UPDATE group_discussions SET
+        active_turn_id = ?,
+        preferred_provider = CASE WHEN preferred_provider = ? THEN NULL ELSE preferred_provider END,
+        version = version + 1, updated_at = ?
+      WHERE id = ? AND state = 'active' AND turn_index = ?
+    `).run(turnId, provider, now, discussionId, turnIndex);
+    if (Number(result.changes) !== 1) {
+      throw new Error(`Discussion turn can no longer be activated: ${discussionId}:${turnIndex}`);
+    }
+    return this.discussion(discussionId) as GroupDiscussion;
+  }
+
+  clearActiveTurn(
+    discussionId: string,
+    turnId: string,
+    now = new Date().toISOString(),
+  ): void {
+    this.#database.prepare(`
+      UPDATE group_discussions SET
+        active_turn_id = NULL, version = version + 1, updated_at = ?
+      WHERE id = ? AND active_turn_id = ?
+    `).run(now, discussionId, turnId);
+  }
+
+  recordControlMessage(discussionId: string, messageId: string, now = new Date().toISOString()): void {
+    const current = this.discussion(discussionId);
+    if (current === undefined) throw new Error(`Discussion not found: ${discussionId}`);
+    if (current.controlMessageId === messageId) return;
+    if (current.controlMessageId !== undefined) {
+      throw new Error(`Discussion control message is already bound: ${discussionId}`);
+    }
+    const result = this.#database.prepare(`
+      UPDATE group_discussions SET
+        control_message_id = ?, version = version + 1, updated_at = ?
+      WHERE id = ? AND control_message_id IS NULL
     `).run(messageId, now, discussionId);
     if (Number(result.changes) !== 1) throw new Error(`Discussion not found: ${discussionId}`);
   }
@@ -342,14 +434,15 @@ export class SqliteDiscussionStore {
     const result = this.#database.prepare(`
       INSERT OR IGNORE INTO discussion_turns (
         id, discussion_id, provider, round, turn_index, state,
-        open_questions_json, started_at
-      ) VALUES (?, ?, ?, ?, ?, 'running', '[]', ?)
+        open_questions_json, steer_ids_json, started_at
+      ) VALUES (?, ?, ?, ?, ?, 'running', '[]', ?, ?)
     `).run(
       input.id,
       input.discussionId,
       input.provider,
       input.round,
       input.turnIndex,
+      JSON.stringify(input.steerIds ?? []),
       input.startedAt ?? new Date().toISOString(),
     );
     return Number(result.changes) === 1;
@@ -367,15 +460,16 @@ export class SqliteDiscussionStore {
     id: string,
     provider: ProviderName,
     round: number,
+    steerIds: readonly string[] = [],
     startedAt = new Date().toISOString(),
   ): void {
     const result = this.#database.prepare(`
       UPDATE discussion_turns SET
         provider = ?, round = ?, state = 'running', external_session_id = NULL,
         text = NULL, continue_discussion = NULL, open_questions_json = '[]',
-        started_at = ?, completed_at = NULL
+        steer_ids_json = ?, started_at = ?, completed_at = NULL
       WHERE id = ? AND state IN ('queued', 'cancelled')
-    `).run(provider, round, startedAt, id);
+    `).run(provider, round, JSON.stringify(steerIds), startedAt, id);
     if (Number(result.changes) !== 1) {
       throw new Error(`Restartable Discussion turn not found: ${id}`);
     }
@@ -468,7 +562,9 @@ export class SqliteDiscussionStore {
   recoverableDiscussions(): GroupDiscussion[] {
     const rows = this.#database.prepare(`
       ${DISCUSSION_SELECT}
-      WHERE state IN ('active', 'summarizing') ORDER BY updated_at, id
+      WHERE state IN ('active', 'summarizing')
+         OR (state = 'completed' AND summary_text IS NOT NULL)
+      ORDER BY updated_at, id
     `).all() as unknown as DiscussionRow[];
     return rows.map(mapDiscussion);
   }
@@ -486,13 +582,13 @@ export class SqliteDiscussionStore {
 const DISCUSSION_SELECT = `
   SELECT id, topic_id, tenant_key, chat_id, question, starter_principal_id,
          state, round, turn_index, next_provider, round_order_json, max_rounds, version,
-         preferred_provider, control_message_id, active_turn_id, created_at, updated_at
+         preferred_provider, control_message_id, active_turn_id, summary_text, created_at, updated_at
   FROM group_discussions
 `;
 
 const TURN_SELECT = `
   SELECT id, discussion_id, provider, round, turn_index, state,
-         external_session_id, text, continue_discussion, open_questions_json,
+         external_session_id, text, continue_discussion, open_questions_json, steer_ids_json,
          started_at, completed_at
   FROM discussion_turns
 `;
@@ -517,6 +613,7 @@ function mapDiscussion(row: DiscussionRow): GroupDiscussion {
     ...(row.preferred_provider === null ? {} : { preferredProvider: row.preferred_provider }),
     ...(row.control_message_id === null ? {} : { controlMessageId: row.control_message_id }),
     ...(row.active_turn_id === null ? {} : { activeTurnId: row.active_turn_id }),
+    ...(row.summary_text === null ? {} : { summaryText: row.summary_text }),
   };
 }
 
@@ -544,6 +641,7 @@ function mapTurn(row: TurnRow): DiscussionTurn {
     turnIndex: Number(row.turn_index),
     state: row.state,
     openQuestions: parseStringArray(row.open_questions_json),
+    steerIds: parseStringArray(row.steer_ids_json),
     ...(row.external_session_id === null ? {} : { externalSessionId: row.external_session_id }),
     ...(row.text === null ? {} : { text: row.text }),
     ...(row.continue_discussion === null

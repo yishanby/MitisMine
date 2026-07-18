@@ -136,14 +136,21 @@ describe("FeishuGateway", () => {
         chatId: "group-chat",
         chatType: "group",
         senderType: "user",
-        mentions: [{ key: "@_hub", userId: "hub-bot" }],
+        mentions: [{ key: "@_hub", userId: "hub-bot", name: "MitisMine 总控" }],
       });
       await harness.gateway.receive({
         ...message("codex", "@_codex Focus on cost", "group-codex"),
         chatId: "group-chat",
         chatType: "group",
         senderType: "user",
-        mentions: [{ key: "@_codex", userId: "codex-bot" }],
+        mentions: [{ key: "@_codex", userId: "codex-bot", name: "MitisMine Codex" }],
+      });
+      await harness.gateway.receive({
+        ...message("codex", "@_human Preserve this human mention", "group-human-mention"),
+        chatId: "group-chat",
+        chatType: "group",
+        senderType: "user",
+        mentions: [{ key: "@_human", userId: "human-2", name: "Alice" }],
       });
 
       expect(groupMessages).toEqual([
@@ -159,7 +166,13 @@ describe("FeishuGateway", () => {
           sourceAppRole: "codex",
           preferredProvider: "codex",
         }),
+        expect.objectContaining({
+          chatId: "group-chat",
+          text: "@_human Preserve this human mention",
+          sourceAppRole: "codex",
+        }),
       ]);
+      expect(groupMessages[2]).not.toHaveProperty("preferredProvider");
       expect(harness.dispatches).toEqual([]);
     } finally {
       harness.store.close();

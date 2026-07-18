@@ -486,10 +486,6 @@ export async function startControlPlane(
           : handleApprovalCard(approval, raw);
       },
     });
-    shutdown.push(() => live.close());
-    shutdown.push(() => recovery.stop());
-    shutdown.push(() => dispatcher.shutdown());
-    shutdown.push(() => discussionCoordinator.shutdown());
     const outboxDispatcher = new OutboxDispatcher({
       outbox,
       sender: live,
@@ -498,7 +494,13 @@ export async function startControlPlane(
         coordinator: discussionCoordinator,
       }),
     });
-    shutdown.push(() => outboxDispatcher.stop());
+    shutdown.push(() => runCleanups([
+      () => outboxDispatcher.stop(),
+      () => recovery.stop(),
+      () => dispatcher.shutdown(),
+      () => discussionCoordinator.shutdown(),
+      () => live.close(),
+    ]));
 
     service = await (options.serviceFactory ?? createService)({
       storeHealthy: () => storeOpen,
@@ -624,7 +626,10 @@ export async function handleDiscussionCardAction(
   role: AppRegistration["role"],
   raw: unknown,
   coordinator: {
-    discussion(id: string): Pick<GroupDiscussion, "tenantKey" | "version"> | undefined;
+    discussion(id: string): Pick<
+      GroupDiscussion,
+      "tenantKey" | "chatId" | "controlMessageId" | "version"
+    > | undefined;
     control(id: string, action: DiscussionAction, principalId: string): Promise<void>;
   },
 ): Promise<unknown> {
@@ -649,10 +654,19 @@ export async function handleDiscussionCardAction(
   }
   const discussion = coordinator.discussion(discussionId);
   if (discussion === undefined) throw new Error(`Discussion not found: ${discussionId}`);
+  const operator = asObject(root.operator, "card action operator");
+  const context = asObject(root.context, "card action context");
+  if (
+    operator.tenant_key !== discussion.tenantKey
+    || context.open_chat_id !== discussion.chatId
+    || discussion.controlMessageId === undefined
+    || context.open_message_id !== discussion.controlMessageId
+  ) {
+    throw new Error("Discussion card tenant or message context does not match");
+  }
   if (version !== discussion.version) {
     return { toast: { type: "warning", content: "状态已更新，请使用最新卡片" } };
   }
-  const operator = asObject(root.operator, "card action operator");
   const principalId = resolvePrincipal({
     tenantKey: discussion.tenantKey,
     ...(typeof operator.user_id === "string" ? { userId: operator.user_id } : {}),
