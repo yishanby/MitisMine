@@ -560,6 +560,55 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("preserves a fail-closed paused boundary marker across restart", async () => {
+    const errors: unknown[] = [];
+    const test = harness({
+      claude: deterministicAdapter("claude"),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    }, (_discussionId, error) => { errors.push(error); });
+    const saveDiscussionCas = test.discussions.saveDiscussionCas.bind(test.discussions);
+    let boundaryConflicts = 0;
+    test.discussions.saveDiscussionCas = (discussion, expectedVersion) => {
+      if (discussion.turnIndex === 3 && discussion.evaluatedTurnIndex === 3) {
+        boundaryConflicts += 1;
+        return false;
+      }
+      return saveDiscussionCas(discussion, expectedVersion);
+    };
+    test.coordinator.kick(test.discussion.id);
+    try {
+      await test.coordinator.waitForIdle(test.discussion.id);
+      expect(boundaryConflicts).toBe(5);
+      expect(errors).toHaveLength(1);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "paused",
+        turnIndex: 3,
+        evaluatedTurnIndex: 0,
+      });
+      expect(test.discussions.turnForIndex(test.discussion.id, 3)).toBeUndefined();
+
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+
+      const reopened = SqliteDiscussionStore.open(join(test.directory, "discussion.db"));
+      try {
+        expect(reopened.discussion(test.discussion.id)).toMatchObject({
+          state: "paused",
+          turnIndex: 3,
+          evaluatedTurnIndex: 0,
+        });
+        expect(reopened.turnForIndex(test.discussion.id, 3)).toBeUndefined();
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      await test.coordinator.shutdown();
+    }
+  });
+
   it.each(["pause", "stop"] as const)(
     "rebuilds a missing control update after restart following a %s CAS",
     async (action) => {

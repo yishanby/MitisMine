@@ -426,4 +426,99 @@ describe("GroupDiscussionChannel", () => {
       events.close();
     }
   });
+
+  it.each([
+    ["start", "hub", "tenant"],
+    ["start", "hub", "chat"],
+    ["start", "codex", "tenant"],
+    ["start", "codex", "chat"],
+    ["steer", "hub", "tenant"],
+    ["steer", "hub", "chat"],
+    ["steer", "codex", "tenant"],
+    ["steer", "codex", "chat"],
+  ] as const)(
+    "ignores a %s receipt collision from the %s App in the wrong %s",
+    async (receiptKind, sourceAppRole, wrongScope) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-scoped-receipt-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => `scoped-receipt-${++id}`,
+      });
+      const base = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+        sourceAppRole: "hub" as const,
+      };
+      const start = {
+        ...base,
+        messageId: "scoped-start",
+        text: "Scoped start",
+        idempotencyKey: "hub-scoped-start",
+      };
+
+      try {
+        await channel.receive(start);
+        if (receiptKind === "steer") {
+          await channel.receive({
+            ...base,
+            messageId: "scoped-steer",
+            text: "Scoped steer",
+            idempotencyKey: "hub-scoped-steer",
+          });
+        }
+        const discussion = discussions.activeForChat(base.tenantKey, base.chatId);
+        expect(discussion).toBeDefined();
+        const messageId = receiptKind === "start" ? start.messageId : "scoped-steer";
+        const beforeDiscussion = discussions.discussion(discussion!.id);
+        const beforeReceipt = discussions.steerForMessage(messageId);
+        const beforeEvents = events.events(discussion!.topicId);
+        const beforePending = discussions.pendingSteers(discussion!.id);
+        const beforeBinding = discussions.chatTopic(base.tenantKey, base.chatId);
+        refreshed.length = 0;
+        kicked.length = 0;
+        const tenantKey = wrongScope === "tenant" ? "tenant-2" : base.tenantKey;
+        const chatId = wrongScope === "chat" ? "chat-2" : base.chatId;
+
+        await channel.receive({
+          tenantKey,
+          principalId: wrongScope === "tenant"
+            ? "tenant-2:user:intruder"
+            : base.principalId,
+          chatId,
+          messageId,
+          text: receiptKind === "start" ? start.text : "Scoped steer",
+          sourceAppRole,
+          preferredProvider: "codex",
+          idempotencyKey: `${sourceAppRole}-${wrongScope}-${receiptKind}-collision`,
+        });
+
+        expect(discussions.discussion(discussion!.id)).toEqual(beforeDiscussion);
+        expect(discussions.steerForMessage(messageId)).toEqual(beforeReceipt);
+        expect(discussions.pendingSteers(discussion!.id)).toEqual(beforePending);
+        expect(events.events(discussion!.topicId)).toEqual(beforeEvents);
+        expect(discussions.chatTopic(base.tenantKey, base.chatId)).toBe(beforeBinding);
+        expect(discussions.chatTopic(tenantKey, chatId)).toBe(
+          tenantKey === base.tenantKey && chatId === base.chatId ? beforeBinding : undefined,
+        );
+        expect(refreshed).toEqual([]);
+        expect(kicked).toEqual([]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
 });

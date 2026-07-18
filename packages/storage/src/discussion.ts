@@ -146,19 +146,35 @@ export class SqliteDiscussionStore {
     if (!discussionColumns.some(({ name }) => name === "start_message_id")) {
       database.exec("ALTER TABLE group_discussions ADD COLUMN start_message_id TEXT");
     }
-    if (!discussionColumns.some(({ name }) => name === "evaluated_turn_index")) {
-      database.exec(
-        "ALTER TABLE group_discussions ADD COLUMN evaluated_turn_index INTEGER NOT NULL DEFAULT 0",
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const migrationColumns = database.prepare("PRAGMA table_info(group_discussions)").all() as unknown as
+        Array<{ name: string }>;
+      const legacyEvaluatedBoundary = !migrationColumns.some(
+        ({ name }) => name === "evaluated_turn_index",
       );
+      if (legacyEvaluatedBoundary) {
+        database.exec(
+          "ALTER TABLE group_discussions ADD COLUMN evaluated_turn_index INTEGER NOT NULL DEFAULT 0",
+        );
+        database.exec(`
+          UPDATE group_discussions
+          SET evaluated_turn_index = turn_index
+          WHERE state = 'paused'
+            AND turn_index > 0
+            AND turn_index % 3 = 0
+            AND evaluated_turn_index = 0
+        `);
+      }
+      database.prepare(`
+        INSERT OR IGNORE INTO schema_migrations (migration_key, applied_at)
+        VALUES ('discussion_evaluated_turn_backfill_v1', ?)
+      `).run(new Date().toISOString());
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
     }
-    database.exec(`
-      UPDATE group_discussions
-      SET evaluated_turn_index = turn_index
-      WHERE state = 'paused'
-        AND turn_index > 0
-        AND turn_index % 3 = 0
-        AND evaluated_turn_index = 0
-    `);
     database.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS group_discussions_start_message_idx
       ON group_discussions (start_message_id)
@@ -222,11 +238,21 @@ export class SqliteDiscussionStore {
         discussion.updatedAt,
       );
     } catch (error) {
-      if (discussion.startMessageId !== undefined) {
+      if (
+        error instanceof Error
+        && error.message === "UNIQUE constraint failed: group_discussions.start_message_id"
+        && discussion.startMessageId !== undefined
+      ) {
         const existing = this.discussionForStartMessage(discussion.startMessageId);
-        if (existing !== undefined) return existing;
+        if (existing !== undefined && sameDiscussionStart(existing, discussion)) return existing;
+        throw new Error("Discussion start message conflicts with another Discussion");
       }
-      if (error instanceof Error && /group_discussions_one_active_chat_idx|unique/i.test(error.message)) {
+      if (
+        error instanceof Error
+        && error.message === (
+          "UNIQUE constraint failed: group_discussions.tenant_key, group_discussions.chat_id"
+        )
+      ) {
         throw new Error("This group already has an active Discussion");
       }
       throw error;
@@ -726,4 +752,13 @@ function parseProviderArray(json: string): ProviderName[] {
     throw new Error("Stored Discussion round order is invalid");
   }
   return values as ProviderName[];
+}
+
+function sameDiscussionStart(existing: GroupDiscussion, candidate: GroupDiscussion): boolean {
+  return existing.startMessageId === candidate.startMessageId
+    && existing.tenantKey === candidate.tenantKey
+    && existing.chatId === candidate.chatId
+    && existing.topicId === candidate.topicId
+    && existing.question === candidate.question
+    && existing.starterPrincipalId === candidate.starterPrincipalId;
 }

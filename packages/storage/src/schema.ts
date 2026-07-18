@@ -1,6 +1,11 @@
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  migration_key TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS topics (
   id TEXT PRIMARY KEY,
   tenant_key TEXT NOT NULL,

@@ -122,6 +122,83 @@ describe("SqliteDiscussionStore", () => {
     }
   });
 
+  it("returns only a fully correlated start-message replay", () => {
+    const path = databasePath();
+    seedTopic(path);
+    seedTopic(path, "topic-2");
+    const store = SqliteDiscussionStore.open(path);
+    const first = createDiscussion({
+      id: "discussion-original",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Original question",
+      starterPrincipalId: "tenant-1:user:owner",
+      startMessageId: "shared-start-message",
+    });
+    store.createDiscussion(first);
+    try {
+      expect(store.createDiscussion({ ...first, id: "discussion-exact-replay" })).toEqual(first);
+      const collisions = [
+        { ...first, id: "discussion-other-tenant", tenantKey: "tenant-2", chatId: "chat-2" },
+        { ...first, id: "discussion-other-chat", chatId: "chat-2" },
+        { ...first, id: "discussion-other-topic", topicId: "topic-2" },
+        { ...first, id: "discussion-other-question", question: "Changed question" },
+        {
+          ...first,
+          id: "discussion-other-starter",
+          starterPrincipalId: "tenant-1:user:other",
+        },
+      ];
+      for (const collision of collisions) {
+        expect(() => store.createDiscussion(collision))
+          .toThrow("Discussion start message conflicts with another Discussion");
+        expect(store.discussion(collision.id)).toBeUndefined();
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+  it("classifies only the exact active-chat constraint and preserves PK/FK failures", () => {
+    const path = databasePath();
+    seedTopic(path);
+    const store = SqliteDiscussionStore.open(path);
+    const first = createDiscussion({
+      id: "discussion-original",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Original question",
+      starterPrincipalId: "tenant-1:user:owner",
+      startMessageId: "original-start",
+    });
+    store.createDiscussion(first);
+    try {
+      expect(() => store.createDiscussion({
+        ...first,
+        tenantKey: "tenant-2",
+        chatId: "chat-2",
+        startMessageId: "duplicate-id-start",
+      })).toThrow("UNIQUE constraint failed: group_discussions.id");
+      expect(() => store.createDiscussion({
+        ...first,
+        id: "discussion-missing-topic",
+        topicId: "missing-topic",
+        tenantKey: "tenant-2",
+        chatId: "chat-3",
+        startMessageId: "missing-topic-start",
+      })).toThrow("FOREIGN KEY constraint failed");
+      expect(() => store.createDiscussion({
+        ...first,
+        id: "discussion-active-collision",
+        startMessageId: "active-collision-start",
+      })).toThrow("This group already has an active Discussion");
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists turns and requeues interrupted work across restart", () => {
     const path = databasePath();
     seedTopic(path);
@@ -245,6 +322,53 @@ describe("SqliteDiscussionStore", () => {
       expect(store.discussion("legacy-active-boundary")?.evaluatedTurnIndex).toBe(0);
     } finally {
       store.close();
+    }
+  });
+
+  it("records the legacy boundary migration without rewriting current-schema markers", () => {
+    const path = databasePath();
+    seedTopic(path);
+    const first = SqliteDiscussionStore.open(path);
+    const pausedBoundary = {
+      ...createDiscussion({
+        id: "current-paused-boundary",
+        topicId: "topic-1",
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        question: "Current fail-closed boundary",
+        starterPrincipalId: "tenant-1:user:owner",
+      }),
+      state: "paused" as const,
+      round: 2,
+      turnIndex: 3,
+      nextProvider: "codex" as const,
+      roundOrder: ["codex", "copilot", "claude"] as const,
+      evaluatedTurnIndex: 0,
+    };
+    first.createDiscussion(pausedBoundary);
+    first.close();
+
+    const reopenedOnce = SqliteDiscussionStore.open(path);
+    try {
+      expect(reopenedOnce.discussion(pausedBoundary.id)?.evaluatedTurnIndex).toBe(0);
+    } finally {
+      reopenedOnce.close();
+    }
+    const reopenedTwice = SqliteDiscussionStore.open(path);
+    try {
+      expect(reopenedTwice.discussion(pausedBoundary.id)?.evaluatedTurnIndex).toBe(0);
+    } finally {
+      reopenedTwice.close();
+    }
+    const inspection = new DatabaseSync(path, { readOnly: true });
+    try {
+      const migration = inspection.prepare(`
+        SELECT COUNT(*) AS count FROM schema_migrations
+        WHERE migration_key = 'discussion_evaluated_turn_backfill_v1'
+      `).get() as { count: number };
+      expect(Number(migration.count)).toBe(1);
+    } finally {
+      inspection.close();
     }
   });
 

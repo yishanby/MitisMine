@@ -711,6 +711,7 @@ export class GroupDiscussionChannel {
     const active = this.#store.activeForChat(input.tenantKey, input.chatId);
     const priorStart = this.#store.discussionForStartMessage(input.messageId);
     if (priorStart !== undefined) {
+      if (priorStart.tenantKey !== input.tenantKey || priorStart.chatId !== input.chatId) return;
       if (input.sourceAppRole !== "hub" && active?.id !== priorStart.id) return;
       await this.#finishStart(input, priorStart);
       return;
@@ -718,6 +719,12 @@ export class GroupDiscussionChannel {
 
     const priorReceipt = this.#store.steerForMessage(input.messageId);
     if (priorReceipt !== undefined) {
+      const receiptDiscussion = this.#store.discussion(priorReceipt.discussionId);
+      if (
+        receiptDiscussion === undefined
+        || receiptDiscussion.tenantKey !== input.tenantKey
+        || receiptDiscussion.chatId !== input.chatId
+      ) return;
       if (input.sourceAppRole !== "hub" && active?.id !== priorReceipt.discussionId) return;
       this.#store.recordSteer({
         id: priorReceipt.id,
