@@ -1048,8 +1048,7 @@ export class GroupDiscussionChannel {
             "steer",
           ),
         })
-      : this.#events.events(discussion.topicId)
-        .find(({ seq }) => seq === boundTopicEventSeq);
+      : this.#events.event(discussion.topicId, boundTopicEventSeq);
     if (event === undefined) {
       throw new Error("Inconsistent discussion.steer.added event");
     }

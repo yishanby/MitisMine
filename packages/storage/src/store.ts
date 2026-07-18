@@ -149,6 +149,14 @@ export class EventStore {
     this.#database.close();
   }
 
+  event(topicId: string, seq: number): TopicEvent | undefined {
+    const row = this.#database.prepare(`
+      SELECT topic_id, seq, type, actor_principal_id, payload_json, created_at
+      FROM topic_events WHERE topic_id = ? AND seq = ?
+    `).get(topicId, seq) as EventRow | undefined;
+    return row === undefined ? undefined : mapEvent(row);
+  }
+
   eventForEffect(idempotencyKey: string): TopicEvent | undefined {
     const row = this.#database.prepare(`
       SELECT e.topic_id, e.seq, e.type, e.actor_principal_id, e.payload_json, e.created_at

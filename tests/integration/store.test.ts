@@ -53,6 +53,48 @@ describe("EventStore", () => {
     store.close();
   });
 
+  it("reads one Topic event directly by Topic and sequence", () => {
+    const { store } = openTestStore();
+    const topic = createTopic("Direct event lookup", "tenant:user:owner", {
+      id: "topic-event-lookup",
+      now: "2026-07-18T08:00:00.000Z",
+    });
+    const otherTopic = createTopic("Other Topic", "tenant:user:owner", {
+      id: "topic-event-lookup-other",
+      now: "2026-07-18T08:00:00.000Z",
+    });
+
+    try {
+      store.append({
+        topicId: topic.id,
+        type: "topic.created",
+        actorPrincipalId: topic.ownerPrincipalId,
+        payload: { topic },
+        createdAt: topic.createdAt,
+      });
+      const event = store.append({
+        topicId: topic.id,
+        type: "message.added",
+        actorPrincipalId: "tenant:user:member",
+        payload: { text: "lookup this event" },
+        createdAt: "2026-07-18T08:01:00.000Z",
+      });
+      store.append({
+        topicId: otherTopic.id,
+        type: "topic.created",
+        actorPrincipalId: otherTopic.ownerPrincipalId,
+        payload: { topic: otherTopic },
+        createdAt: otherTopic.createdAt,
+      });
+
+      expect(store.event(topic.id, event.seq)).toEqual(event);
+      expect(store.event(topic.id, event.seq + 100)).toBeUndefined();
+      expect(store.event(otherTopic.id, event.seq)).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists Topic projections and user cursors across restart", () => {
     const { store, path } = openTestStore();
     const topic = createTopic("Persistent", "tenant:user:owner", {
