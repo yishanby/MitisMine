@@ -8,6 +8,8 @@ import { ulid } from "ulid";
 import { createAdapters, type AdapterRegistry } from "../../../packages/agent-adapters/src/index.js";
 import { runJsonl } from "../../../packages/agent-protocol/src/runner.js";
 import { compileContext } from "../../../packages/domain/src/context.js";
+import type { DiscussionAction, GroupDiscussion } from "../../../packages/domain/src/discussion.js";
+import { resolvePrincipal } from "../../../packages/domain/src/topic.js";
 import {
   ApprovalEngine,
   TrustedActionExecutor,
@@ -31,10 +33,20 @@ import {
   verifyCrossAppIdentity,
 } from "../../../packages/feishu/src/registry.js";
 import { ResearchOrchestrator } from "../../../packages/orchestrator/src/index.js";
+import {
+  AgentConcurrencyLimiter,
+  type AgentCallLimiter,
+} from "../../../packages/orchestrator/src/concurrency.js";
+import {
+  DiscussionControlDeliveryEffects,
+  DiscussionCoordinator,
+  GroupDiscussionChannel,
+} from "../../../packages/orchestrator/src/discussion.js";
 import { directResearchPrompt } from "../../../packages/orchestrator/src/prompts.js";
 import { LocalWorkerTaskExecutor } from "../../../packages/orchestrator/src/worker.js";
 import { SqliteOrchestrationStore } from "../../../packages/storage/src/orchestration.js";
 import { SqliteApprovalStore } from "../../../packages/storage/src/approval.js";
+import { SqliteDiscussionStore } from "../../../packages/storage/src/discussion.js";
 import { DurableOutbox } from "../../../packages/storage/src/outbox.js";
 import { EventStore } from "../../../packages/storage/src/store.js";
 import { WorkerLeaseStore } from "../../worker/src/main.js";
@@ -77,6 +89,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
   readonly #adapters: AdapterRegistry;
   readonly #agentWorkspaceRoot: string;
   readonly #approval: Pick<ApprovalEngine, "request">;
+  readonly #limiter: AgentCallLimiter;
   readonly #pending = new Map<Promise<void>, {
     readonly controller: AbortController;
     readonly runId?: string;
@@ -92,6 +105,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
     adapters: AdapterRegistry;
     agentWorkspaceRoot: string;
     approval: Pick<ApprovalEngine, "request">;
+    limiter?: AgentCallLimiter;
   }) {
     this.#orchestrator = options.orchestrator;
     this.#checkpoints = options.checkpoints;
@@ -100,6 +114,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
     this.#adapters = options.adapters;
     this.#agentWorkspaceRoot = options.agentWorkspaceRoot;
     this.#approval = options.approval;
+    this.#limiter = options.limiter ?? new AgentConcurrencyLimiter(6);
   }
 
   async dispatch(input: DispatchInput): Promise<void> {
@@ -134,7 +149,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
     void handling.catch((error: unknown) => {
       const message = error instanceof Error ? error.message : "unknown failure";
       this.#enqueue(input, "任务失败", message, "failed");
-    });
+    }).catch(() => {});
   }
 
   async shutdown(): Promise<void> {
@@ -206,9 +221,9 @@ export class ChannelDispatcher implements FeishuDispatcher {
           cwd: this.#workspace(input.topicId),
           signal,
         };
-        const result = session.externalSessionId === undefined
-          ? await adapter.start(task)
-          : await adapter.resume({ ...task, externalSessionId: session.externalSessionId });
+        const result = await this.#limiter.run(async () => session.externalSessionId === undefined
+          ? adapter.start(task)
+          : adapter.resume({ ...task, externalSessionId: session.externalSessionId }));
         const text = finalText(result.events);
         const contextWatermark = this.#store.topic(input.topicId)?.lastEventSeq ?? 0;
         const latest = this.#store.directSession(session.id);
@@ -365,6 +380,7 @@ export interface ControlPlaneRuntime {
 
 export interface ControlPlaneStartupOptions {
   readonly identityVerifier?: (observations: readonly IdentityProbe[]) => string;
+  readonly adapterFactory?: () => AdapterRegistry;
   readonly serviceFactory?: (deps: ServiceDependencies) => Promise<ControlPlaneService>;
   readonly liveFactory?: (options: {
     readonly registrations: readonly AppRegistration[];
@@ -391,6 +407,8 @@ export async function startControlPlane(
     shutdown.push(() => { storeOpen = false; store.close(); });
     const outbox = DurableOutbox.open(config.MITISMINE_DB_PATH);
     shutdown.push(() => outbox.close());
+    const discussions = SqliteDiscussionStore.open(config.MITISMINE_DB_PATH);
+    shutdown.push(() => discussions.close());
     const checkpoints = SqliteOrchestrationStore.open(config.MITISMINE_DB_PATH);
     shutdown.push(() => checkpoints.close());
     const approvals = SqliteApprovalStore.open(config.MITISMINE_DB_PATH);
@@ -402,23 +420,22 @@ export async function startControlPlane(
     const apps = new AppConnectionRegistry();
     const workers = new WorkerRegistry();
     workers.connectPersistent("local");
-    const adapters = createAdapters(runJsonl);
+    const adapters = options.adapterFactory?.() ?? createAdapters(runJsonl);
+    const agentConcurrency = new AgentConcurrencyLimiter(6);
     const worker = new LocalWorkerTaskExecutor({ leases });
     const orchestrator = new ResearchOrchestrator({
       adapters,
       store: checkpoints,
       worker,
-      maxConcurrency: 6,
+      limiter: agentConcurrency,
     });
     const recovery = new RecoverySupervisor({ leases, checkpoints, orchestrator });
-    shutdown.push(() => recovery.stop());
     const trustedExecutor = new TrustedActionExecutor(resolve(config.MITISMINE_DATA_DIR, "approved-actions"));
     const approval = new ApprovalEngine({
       signingSecret: config.MITISMINE_APPROVAL_KEY,
       store: approvals,
       executor: (action, idempotencyKey) => trustedExecutor.execute(action, idempotencyKey),
     });
-    shutdown.push(() => dispatcher.shutdown());
     const dispatcher = new ChannelDispatcher({
       orchestrator,
       checkpoints,
@@ -427,17 +444,60 @@ export async function startControlPlane(
       adapters,
       agentWorkspaceRoot: config.MITISMINE_AGENT_WORKSPACE_ROOT,
       approval,
+      limiter: agentConcurrency,
     });
-    const gateway = new FeishuGateway({ store, outbox, dispatcher, idFactory: ulid });
+    const discussionCoordinator = new DiscussionCoordinator({
+      store: discussions,
+      events: store,
+      outbox,
+      adapters,
+      workspaceRoot: config.MITISMINE_AGENT_WORKSPACE_ROOT,
+      idFactory: ulid,
+      limiter: agentConcurrency,
+    });
+    discussions.recoverInterrupted();
+    const recoverableDiscussions = discussions.recoverableDiscussions().map(({ id }) => id);
+    const groupDiscussions = new GroupDiscussionChannel({
+      store: discussions,
+      events: store,
+      coordinator: discussionCoordinator,
+      idFactory: ulid,
+    });
+    const gateway = new FeishuGateway({
+      store,
+      outbox,
+      dispatcher,
+      idFactory: ulid,
+      groupDiscussions,
+    });
     const registrations = registrationsFromConfig(config);
     const live = (options.liveFactory ?? ((input) => new FeishuLongConnections(input)))({
       registrations,
       gateway,
       connections: apps,
-      onCardAction: async (_role, raw) => handleApprovalCard(approval, raw),
+      onCardAction: async (role, raw) => {
+        const value = cardActionValue(raw);
+        return typeof value.action === "string" && value.action.startsWith("discussion.")
+          ? handleDiscussionCardAction(role, raw, {
+              discussion: (id) => discussions.discussion(id),
+              control: (id, action, principalId) =>
+                discussionCoordinator.control(id, action, principalId),
+            })
+          : handleApprovalCard(approval, raw);
+      },
     });
     shutdown.push(() => live.close());
-    const outboxDispatcher = new OutboxDispatcher({ outbox, sender: live });
+    shutdown.push(() => recovery.stop());
+    shutdown.push(() => dispatcher.shutdown());
+    shutdown.push(() => discussionCoordinator.shutdown());
+    const outboxDispatcher = new OutboxDispatcher({
+      outbox,
+      sender: live,
+      deliveryEffects: new DiscussionControlDeliveryEffects({
+        store: discussions,
+        coordinator: discussionCoordinator,
+      }),
+    });
     shutdown.push(() => outboxDispatcher.stop());
 
     service = await (options.serviceFactory ?? createService)({
@@ -451,6 +511,7 @@ export async function startControlPlane(
     void recovery.runOnce();
     await service.listen({ host: config.MITISMINE_HTTP_HOST, port: config.MITISMINE_HTTP_PORT });
     await live.ready();
+    for (const discussionId of recoverableDiscussions) discussionCoordinator.kick(discussionId);
     return { service, close: () => service?.close() ?? Promise.resolve() };
   } catch (startupError) {
     try {
@@ -536,8 +597,7 @@ function renderReport(report: { readonly summary: string; readonly claims: reado
 
 async function handleApprovalCard(approval: ApprovalEngine, raw: unknown): Promise<unknown> {
   const root = asObject(raw, "card action");
-  const action = asObject(root.action, "card action payload");
-  const value = asObject(action.value, "card action value");
+  const value = cardActionValue(raw);
   if (value.action !== "approve" || typeof value.token !== "string") {
     return { toast: { type: "warning", content: "未执行" } };
   }
@@ -552,6 +612,61 @@ async function handleApprovalCard(approval: ApprovalEngine, raw: unknown): Promi
   }
   await approval.approve(value.token, expectedPrincipal);
   return { toast: { type: "success", content: "已批准并执行" } };
+}
+
+function cardActionValue(raw: unknown): Record<string, unknown> {
+  const root = asObject(raw, "card action");
+  const action = asObject(root.action, "card action payload");
+  return asObject(action.value, "card action value");
+}
+
+export async function handleDiscussionCardAction(
+  role: AppRegistration["role"],
+  raw: unknown,
+  coordinator: {
+    discussion(id: string): Pick<GroupDiscussion, "tenantKey" | "version"> | undefined;
+    control(id: string, action: DiscussionAction, principalId: string): Promise<void>;
+  },
+): Promise<unknown> {
+  if (role !== "hub") throw new Error("Discussion controls are only accepted by the Hub App");
+  const root = asObject(raw, "card action");
+  const action = asObject(root.action, "card action payload");
+  const value = asObject(action.value, "card action value");
+  const rawAction = value.action;
+  const discussionId = value.discussionId;
+  const version = value.version;
+  if (
+    typeof rawAction !== "string"
+    || !rawAction.startsWith("discussion.")
+    || !["pause", "resume", "summarize", "stop"].includes(rawAction.slice("discussion.".length))
+    || typeof discussionId !== "string"
+    || !discussionId
+    || typeof version !== "number"
+    || !Number.isInteger(version)
+    || version < 0
+  ) {
+    throw new Error("Discussion card action is invalid");
+  }
+  const discussion = coordinator.discussion(discussionId);
+  if (discussion === undefined) throw new Error(`Discussion not found: ${discussionId}`);
+  if (version !== discussion.version) {
+    return { toast: { type: "warning", content: "状态已更新，请使用最新卡片" } };
+  }
+  const operator = asObject(root.operator, "card action operator");
+  const principalId = resolvePrincipal({
+    tenantKey: discussion.tenantKey,
+    ...(typeof operator.user_id === "string" ? { userId: operator.user_id } : {}),
+    ...(typeof operator.union_id === "string" ? { unionId: operator.union_id } : {}),
+  });
+  const discussionAction = rawAction.slice("discussion.".length) as DiscussionAction;
+  await coordinator.control(discussionId, discussionAction, principalId);
+  const content: Record<DiscussionAction, string> = {
+    pause: "已暂停",
+    resume: "已继续",
+    summarize: "正在总结",
+    stop: "已停止",
+  };
+  return { toast: { type: "success", content: content[discussionAction] } };
 }
 
 function asObject(value: unknown, label: string): Record<string, unknown> {

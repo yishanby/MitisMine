@@ -310,11 +310,166 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("reconciles a completed provider call after a crash without calling that Agent again", async () => {
+    let claudeCalls = 0;
+    const test = harness({
+      claude: deterministicAdapter("claude", [], async () => {
+        claudeCalls += 1;
+        return JSON.stringify({ message: "duplicate", continueDiscussion: false, openQuestions: [] });
+      }),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    try {
+      test.discussions.claimTurn({
+        id: "turn-before-crash",
+        discussionId: test.discussion.id,
+        provider: "claude",
+        round: 1,
+        turnIndex: 0,
+        startedAt: "2026-07-18T01:01:00.000Z",
+      });
+      test.discussions.saveDiscussion({
+        ...test.discussion,
+        activeTurnId: "turn-before-crash",
+        version: 1,
+      });
+      test.discussions.recordSteer({
+        id: "steer-before-crash",
+        discussionId: test.discussion.id,
+        messageId: "message-before-crash",
+        topicEventSeq: 1,
+        principalId: "tenant-1:user:member",
+        text: "consider migration cost",
+        createdAt: "2026-07-18T01:01:30.000Z",
+      });
+      test.discussions.completeTurn({
+        id: "turn-before-crash",
+        externalSessionId: "claude-before-crash",
+        text: "Claude durable answer",
+        continueDiscussion: false,
+        openQuestions: [],
+        completedAt: "2026-07-18T01:02:00.000Z",
+      });
+
+      await test.coordinator.run(test.discussion.id);
+
+      expect(claudeCalls).toBe(0);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        turnIndex: 3,
+      });
+      expect(test.discussions.pendingSteers(test.discussion.id)).toEqual([]);
+      expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
+        .toContain("Claude durable answer");
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
   it("falls back to visible text when an Agent does not return JSON", () => {
     expect(parseDiscussionAgentOutput("A plain but useful response")).toEqual({
       message: "A plain but useful response",
       continueDiscussion: true,
       openQuestions: [],
     });
+  });
+
+  it("cancels an active turn on pause and resumes the same speaker slot", async () => {
+    let first = true;
+    let started: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+    const claude: AgentAdapter = {
+      provider: "claude",
+      start: async (task) => {
+        if (first) {
+          first = false;
+          started?.();
+          return new Promise((resolve, reject) => {
+            task.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            void resolve;
+          });
+        }
+        return {
+          provider: "claude",
+          externalSessionId: "claude-resumed-slot",
+          events: [{
+            type: "final",
+            text: JSON.stringify({ message: "Claude resumed", continueDiscussion: false, openQuestions: [] }),
+          }],
+        };
+      },
+      resume: async () => { throw new Error("unexpected external resume"); },
+    };
+    const test = harness({
+      claude,
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    const running = test.coordinator.run(test.discussion.id);
+    try {
+      await firstStarted;
+      await test.coordinator.control(
+        test.discussion.id,
+        "pause",
+        "tenant-1:user:member",
+      );
+      await running.catch(() => {});
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("paused");
+      expect(test.discussions.turns(test.discussion.id)).toEqual([
+        expect.objectContaining({ provider: "claude", turnIndex: 0, state: "cancelled" }),
+      ]);
+
+      await test.coordinator.control(
+        test.discussion.id,
+        "resume",
+        "tenant-1:user:member",
+      );
+      await test.coordinator.waitForIdle(test.discussion.id);
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("completed");
+      expect(test.discussions.turns(test.discussion.id).map((turn) => [turn.provider, turn.state]))
+        .toEqual([
+          ["claude", "completed"],
+          ["codex", "completed"],
+          ["copilot", "completed"],
+        ]);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("allows any participant to summarize but only the starter or Topic owner to stop", async () => {
+    const test = harness({
+      claude: deterministicAdapter("claude"),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    try {
+      await expect(test.coordinator.control(
+        test.discussion.id,
+        "stop",
+        "tenant-1:user:member",
+      )).rejects.toThrow(/starter|owner/i);
+
+      await test.coordinator.control(
+        test.discussion.id,
+        "summarize",
+        "tenant-1:user:member",
+      );
+      await test.coordinator.waitForIdle(test.discussion.id);
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("completed");
+      expect(test.discussions.turns(test.discussion.id)).toEqual([]);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
   });
 });

@@ -8,10 +8,10 @@ Worker uses SQLite-backed leases and heartbeats for every provider call.
 
 | Role | App ID | Behavior |
 |---|---|---|
-| Hub | `cli_aad0b5b7aeb89cc4` | Topic management and full research |
-| Claude | `cli_aad0b5ed06f8dd23` | Claude direct continuation |
-| Codex | `cli_aad0b6053e78dd01` | Codex direct continuation |
-| Copilot | `cli_aad0b65c14f8dd24` | Copilot direct continuation |
+| Hub | `cli_aad0b5b7aeb89cc4` | Topic management, research, and group moderation |
+| Claude | `cli_aad0b5ed06f8dd23` | Claude direct Sessions and visible group turns |
+| Codex | `cli_aad0b6053e78dd01` | Codex direct Sessions and visible group turns |
+| Copilot | `cli_aad0b65c14f8dd24` | Copilot direct Sessions and visible group turns |
 
 Never put App Secrets, approval keys, provider credentials, or Cookies in
 source control, prompts, logs, screenshots, or this guide.
@@ -188,7 +188,9 @@ pnpm start
 Startup validates config/identity, opens WAL storage, requeues expired leases,
 registers the local Worker, starts Outbox/recovery, then lets the four App
 sockets accept events. Failed non-terminal resumes are logged and retried;
-an active Run is coalesced with recovery instead of duplicated. Any
+an active Run is coalesced with recovery instead of duplicated. Interrupted
+group turns are requeued, completed-turn effects are reconciled, and active or
+summarizing Discussions resume after all four channels report ready. Any
 `listen()`/connection-readiness failure unwinds sockets and stores. `/health`
 means the process is alive;
 `/ready` returns 200 only when storage, four Apps, and a Worker are healthy.
@@ -207,6 +209,33 @@ heartbeats. Expired leases become queued; checkpoint resume leases the same task
 ID again. Each provider proposes at most two isolated child sessions and all
 active calls share a concurrency limit of six. Round three completes with
 `unresolved=true` rather than hiding disagreement.
+
+### Visible group Discussions
+
+Create one Feishu group and add Hub, Claude, Codex, and Copilot. The normal
+product flow has no group-specific slash commands:
+
+1. Send `@Hub <question>` to start. The first question binds the group to a
+   durable Topic; later Discussions reuse it.
+2. Hub posts one control card. Claude, Codex, and Copilot then speak visibly in
+   sequence and advance automatically for at most three rounds.
+3. Send a normal human message to add a steer. For reliable Feishu delivery,
+   @mention Hub. Mentioning a provider bot asks that provider to take the next
+   available slot without repeating it in the round.
+4. Use the card buttons to pause, resume, summarize now, or stop. Any participant
+   may pause/resume/summarize; only the starter or Topic owner may stop.
+
+The card is patched in place using its persisted Feishu message ID. Stale button
+replays are ignored. One group can have only one active Discussion, so a new
+human message during it is always steer rather than a second conversation.
+Agent-authored group events are ignored before identity resolution, preventing
+cross-App loops. The visible transcript, steer records, turn cursor, provider
+CLI Sessions, and final Hub summary survive restart.
+
+Group Discussion Sessions are isolated from `/research` Sessions and provider
+direct Sessions, but all three paths share one FIFO provider concurrency budget
+of six. `/status`, `/report`, and `/stop` continue to address the P2P ResearchRun;
+use the Discussion card for the group roundtable.
 
 Use `/status`, `/report`, and `/stop`. A stop aborts queued/active calls, kills
 their process trees, requeues their leases, and persists `cancelled` with
@@ -257,9 +286,10 @@ invalidates pending approval tokens.
 
 ## 7. Shutdown
 
-Send SIGINT/SIGTERM (Ctrl+C on Windows). The service stops accepting work,
-awaits the current Outbox flush, closes Feishu sockets, then closes SQLite.
-Runner cancellation has a bounded grace period and terminates the process tree.
+Send SIGINT/SIGTERM (Ctrl+C on Windows). The service first stops Outbox polling,
+then aborts and drains group/direct/research work, stops recovery, closes Feishu
+sockets, and finally closes SQLite. Runner cancellation has a bounded grace
+period and terminates the process tree.
 
 ## 8. Backup and restore
 
@@ -286,7 +316,8 @@ approval result and non-database target files may describe different moments.
   message, Run, history, and Outbox effect keys.
 - Service restart resets inbox `processing` to `pending`, approval `executing`
   to `pending`, interrupted direct Sessions from `running` to `active`, and
-  expired Worker leases to `queued`.
+  expired Worker leases to `queued`. It also resets running Discussion turns to
+  queued and automatically resumes active/summarizing Discussions.
 - Legacy `agent_sessions` rows with role `direct` are migrated idempotently to
   a `main` direct Session while retaining the external Session ID and watermark.
 - Provider failure gets one report-repair attempt; two providers may complete a
@@ -299,6 +330,8 @@ approval result and non-database target files may describe different moments.
   MitisMine will not fall back to raw token injection.
 - Missing cards: inspect `outbox_messages`, send permission, callback
   registration, and the destination chat ID.
+- Discussion card does not update: verify Hub has `card.action.trigger`, then
+  inspect the Discussion `control_message_id` and delivered Outbox effect.
 
 ## 10. Reproduce live verification
 
@@ -311,19 +344,23 @@ pnpm start
 
 In Feishu, use these exact inputs when creating fresh audit evidence:
 
-1. In Hub, send `/topic new Live smoke`.
-2. In Hub, send `/research Verify RFC 2606 reserved DNS names using RFC Editor, IETF, and IANA primary sources.` and wait for the final report.
-3. In each provider App, send `/session new RFC evidence`, followed by
+1. Create a group containing all four bots. Send `@Hub Compare SQLite WAL and
+   PostgreSQL for a single-host durable agent control plane.` Confirm all three
+   provider identities speak, send one steer, exercise pause/resume, then use
+   **立即总结**. Confirm the Hub card retains one Feishu message ID.
+2. In Hub direct chat, send `/topic new Live smoke`.
+3. In Hub, send `/research Verify RFC 2606 reserved DNS names using RFC Editor, IETF, and IANA primary sources.` and wait for the final report.
+4. In each provider App, send `/session new RFC evidence`, followed by
    `Continue this Topic and summarize your strongest RFC 2606 evidence.`. This
    creates three independent external Sessions.
-4. In Claude, additionally create `/session new Counterarguments`, send one
+5. In Claude, additionally create `/session new Counterarguments`, send one
    ordinary message, switch back with `/session use RFC evidence`, and verify
    `/session show` reports the first Session.
-5. Stop Terminal A with Ctrl+C, start it again with `pnpm start`, wait for
+6. Stop Terminal A with Ctrl+C, start it again with `pnpm start`, wait for
    `/ready` HTTP 200, then send `Resume this Topic after restart.` once to each
    provider App. This proves the selected Sessions and external IDs resume.
-6. In Hub, send `/status` and `/report`.
-7. In Hub, send `/action write smoke/approved.txt approved-by-feishu`. Verify
+7. In Hub, send `/status` and `/report`.
+8. In Hub, send `/action write smoke/approved.txt approved-by-feishu`. Verify
    the file did not appear before approval, click **Approve**, then click the
    same approval button again to exercise idempotency.
 

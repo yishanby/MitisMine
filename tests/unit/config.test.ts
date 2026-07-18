@@ -14,6 +14,17 @@ import {
 } from "../../apps/control-plane/src/main.js";
 import { APP_ROLES, FeishuAppRegistry } from "../../packages/feishu/src/registry.js";
 import { WorkerLeaseStore } from "../../apps/worker/src/main.js";
+import type {
+  AdapterRegistry,
+  AgentAdapter,
+  AgentTask,
+  ProviderName,
+  ResumeAgentTask,
+} from "../../packages/agent-adapters/src/index.js";
+import { createDiscussion, transitionDiscussion } from "../../packages/domain/src/discussion.js";
+import { createTopic } from "../../packages/domain/src/topic.js";
+import { SqliteDiscussionStore } from "../../packages/storage/src/discussion.js";
+import { EventStore } from "../../packages/storage/src/store.js";
 
 const validEnvironment = {
   MITISMINE_APPROVAL_KEY: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -299,6 +310,148 @@ describe("loadConfig", () => {
       });
       await runtime.close();
     } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("composes Hub Discussion controls with the durable Discussion store", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-discussion-startup-"));
+    const databasePath = join(directory, "mitismine.db");
+    const events = EventStore.open(databasePath);
+    const discussions = SqliteDiscussionStore.open(databasePath);
+    const topic = createTopic("Visible Discussion", "tenant-1:user:operator-1", { id: "topic-1" });
+    events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    discussions.createDiscussion(transitionDiscussion(createDiscussion({
+      id: "discussion-1",
+      topicId: topic.id,
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Choose the design",
+      starterPrincipalId: topic.ownerPrincipalId,
+    }), "pause"));
+    discussions.close();
+    events.close();
+    let shutdown: readonly (() => Promise<void> | void)[] = [];
+    let onCardAction: ((role: "hub" | "claude" | "codex" | "copilot", raw: unknown) => Promise<unknown>) | undefined;
+    const fakeService = {
+      listen: async () => {},
+      close: async () => { for (const stop of [...shutdown].reverse()) await stop(); },
+    } as unknown as ControlPlaneService;
+    const config = loadConfig({
+      ...validEnvironment,
+      MITISMINE_DB_PATH: databasePath,
+      MITISMINE_DATA_DIR: join(directory, "data"),
+      MITISMINE_AGENT_WORKSPACE_ROOT: join(directory, "workspaces"),
+    });
+
+    let runtime: Awaited<ReturnType<typeof startControlPlane>> | undefined;
+    try {
+      runtime = await startControlPlane(config, {
+        serviceFactory: async (deps) => { shutdown = deps.shutdown ?? []; return fakeService; },
+        liveFactory: (options) => {
+          onCardAction = options.onCardAction;
+          return { ready: async () => {}, close: () => {}, send: async () => {} };
+        },
+      });
+      await onCardAction?.("hub", {
+        action: { value: { action: "discussion.stop", discussionId: "discussion-1", version: 1 } },
+        operator: { user_id: "operator-1" },
+      });
+      await runtime.close();
+
+      const observer = SqliteDiscussionStore.open(databasePath);
+      try {
+        expect(observer.discussion("discussion-1")?.state).toBe("stopped");
+      } finally {
+        observer.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers an interrupted active Discussion and resumes it after channels are ready", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-discussion-recovery-"));
+    const databasePath = join(directory, "mitismine.db");
+    const events = EventStore.open(databasePath);
+    const discussions = SqliteDiscussionStore.open(databasePath);
+    const topic = createTopic("Recovered Discussion", "tenant-1:user:operator-1", { id: "topic-recovery" });
+    events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    const discussion = createDiscussion({
+      id: "discussion-recovery",
+      topicId: topic.id,
+      tenantKey: "tenant-1",
+      chatId: "chat-recovery",
+      question: "Recover and finish",
+      starterPrincipalId: topic.ownerPrincipalId,
+    });
+    discussions.createDiscussion(discussion);
+    discussions.claimTurn({
+      id: "interrupted-turn",
+      discussionId: discussion.id,
+      provider: "claude",
+      round: 1,
+      turnIndex: 0,
+    });
+    discussions.saveDiscussion({ ...discussion, activeTurnId: "interrupted-turn", version: 1 });
+    discussions.close();
+    events.close();
+    let shutdown: readonly (() => Promise<void> | void)[] = [];
+    const fakeService = {
+      listen: async () => {},
+      close: async () => { for (const stop of [...shutdown].reverse()) await stop(); },
+    } as unknown as ControlPlaneService;
+    const invoke = (provider: ProviderName) => async (task: AgentTask | ResumeAgentTask) => ({
+      provider,
+      externalSessionId: `${provider}-recovered`,
+      events: [{
+        type: "final" as const,
+        text: task.prompt.includes("PHASE: discussion_summary")
+          ? JSON.stringify({ summary: "Recovered summary" })
+          : JSON.stringify({ message: `${provider} recovered`, continueDiscussion: false, openQuestions: [] }),
+      }],
+    });
+    const adapter = (provider: ProviderName): AgentAdapter => ({
+      provider,
+      start: invoke(provider),
+      resume: invoke(provider),
+    });
+    const adapters: AdapterRegistry = {
+      claude: adapter("claude"),
+      codex: adapter("codex"),
+      copilot: adapter("copilot"),
+    };
+    const config = loadConfig({
+      ...validEnvironment,
+      MITISMINE_DB_PATH: databasePath,
+      MITISMINE_DATA_DIR: join(directory, "data"),
+      MITISMINE_AGENT_WORKSPACE_ROOT: join(directory, "workspaces"),
+    });
+
+    let runtime: Awaited<ReturnType<typeof startControlPlane>> | undefined;
+    try {
+      runtime = await startControlPlane(config, {
+        adapterFactory: () => adapters,
+        serviceFactory: async (deps) => { shutdown = deps.shutdown ?? []; return fakeService; },
+        liveFactory: () => ({
+          ready: async () => {},
+          close: () => {},
+          send: async (message) => ({ messageId: `feishu-${message.id}` }),
+        }),
+      });
+      const observer = SqliteDiscussionStore.open(databasePath);
+      try {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (observer.discussion(discussion.id)?.state === "completed") break;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(observer.discussion(discussion.id)).toMatchObject({ state: "completed", turnIndex: 3 });
+        expect(observer.turn("interrupted-turn")).toMatchObject({ state: "completed", turnIndex: 0 });
+      } finally {
+        observer.close();
+      }
+    } finally {
+      await runtime?.close();
       rmSync(directory, { recursive: true, force: true });
     }
   });

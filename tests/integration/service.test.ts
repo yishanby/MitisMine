@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ChannelDispatcher, createService } from "../../apps/control-plane/src/main.js";
+import {
+  ChannelDispatcher,
+  createService,
+  handleDiscussionCardAction,
+} from "../../apps/control-plane/src/main.js";
 import type {
   AdapterRegistry,
   AgentAdapter,
@@ -121,6 +125,65 @@ describe("control-plane health", () => {
 
     await expect(service.close()).rejects.toThrow("cleanup failed");
     expect(order).toEqual(["socket", "broken", "store"]);
+  });
+});
+
+describe("Discussion control card callback", () => {
+  it("routes a Hub card action with the operator's stable principal", async () => {
+    const controls: unknown[] = [];
+    const result = await handleDiscussionCardAction(
+      "hub",
+      {
+        action: {
+          value: {
+            action: "discussion.pause",
+            discussionId: "discussion-1",
+            version: 3,
+          },
+        },
+        operator: { user_id: "member-1" },
+      },
+      {
+        discussion: () => ({ tenantKey: "tenant-1", version: 3 }),
+        control: async (...args) => { controls.push(args); },
+      },
+    );
+
+    expect(controls).toEqual([
+      ["discussion-1", "pause", "tenant-1:user:member-1"],
+    ]);
+    expect(result).toEqual({ toast: { type: "success", content: "已暂停" } });
+  });
+
+  it("rejects provider-App callbacks and invalid Discussion actions", async () => {
+    const dependencies = {
+      discussion: () => ({ tenantKey: "tenant-1", version: 1 }),
+      control: async () => {},
+    };
+    await expect(handleDiscussionCardAction("claude", {
+      action: { value: { action: "discussion.pause", discussionId: "discussion-1", version: 1 } },
+      operator: { user_id: "member-1" },
+    }, dependencies)).rejects.toThrow(/Hub/i);
+    await expect(handleDiscussionCardAction("hub", {
+      action: { value: { action: "discussion.delete", discussionId: "discussion-1", version: 1 } },
+      operator: { user_id: "member-1" },
+    }, dependencies)).rejects.toThrow(/invalid/i);
+  });
+
+  it("ignores a replayed action from a stale control-card version", async () => {
+    const controls: unknown[] = [];
+    const result = await handleDiscussionCardAction("hub", {
+      action: { value: { action: "discussion.pause", discussionId: "discussion-1", version: 2 } },
+      operator: { user_id: "member-1" },
+    }, {
+      discussion: () => ({ tenantKey: "tenant-1", version: 3 }),
+      control: async (...args) => { controls.push(args); },
+    });
+
+    expect(controls).toEqual([]);
+    expect(result).toEqual({
+      toast: { type: "warning", content: "状态已更新，请使用最新卡片" },
+    });
   });
 });
 

@@ -28,6 +28,10 @@ import {
   subtaskResearchPrompt,
 } from "./prompts.js";
 import type { WorkerTaskExecutorPort } from "./worker.js";
+import {
+  AgentConcurrencyLimiter,
+  type AgentCallLimiter,
+} from "./concurrency.js";
 
 const PROVIDERS = ["claude", "codex", "copilot"] as const;
 
@@ -117,37 +121,14 @@ interface OrchestratorOptions {
   readonly store: OrchestrationStore;
   readonly worker: WorkerTaskExecutorPort;
   readonly maxConcurrency?: number;
-}
-
-class Semaphore {
-  readonly #limit: number;
-  #active = 0;
-  readonly #waiting: Array<() => void> = [];
-
-  constructor(limit: number) {
-    if (!Number.isInteger(limit) || limit < 1) throw new Error("maxConcurrency must be positive");
-    this.#limit = limit;
-  }
-
-  async run<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.#active >= this.#limit) {
-      await new Promise<void>((resolve) => this.#waiting.push(resolve));
-    }
-    this.#active += 1;
-    try {
-      return await operation();
-    } finally {
-      this.#active -= 1;
-      this.#waiting.shift()?.();
-    }
-  }
+  readonly limiter?: AgentCallLimiter;
 }
 
 export class ResearchOrchestrator {
   readonly #adapters: AdapterRegistry;
   readonly #store: OrchestrationStore;
   readonly #worker: WorkerTaskExecutorPort;
-  readonly #semaphore: Semaphore;
+  readonly #semaphore: AgentCallLimiter;
   readonly #controllers = new Map<string, AbortController>();
   readonly #executions = new Map<string, Promise<ResearchResult>>();
   readonly #cancelled = new Set<string>();
@@ -156,7 +137,7 @@ export class ResearchOrchestrator {
     this.#adapters = options.adapters;
     this.#store = options.store;
     this.#worker = options.worker;
-    this.#semaphore = new Semaphore(options.maxConcurrency ?? 6);
+    this.#semaphore = options.limiter ?? new AgentConcurrencyLimiter(options.maxConcurrency ?? 6);
   }
 
   async start(input: StartResearchInput): Promise<ResearchResult> {

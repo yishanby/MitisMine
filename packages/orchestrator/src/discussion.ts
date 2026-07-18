@@ -8,18 +8,29 @@ import type {
 } from "../../agent-adapters/src/index.js";
 import {
   completeDiscussionTurn,
+  createDiscussion,
   nextDiscussionProvider,
   shouldSummarize,
   transitionDiscussion,
+  type DiscussionAction,
   type GroupDiscussion,
 } from "../../domain/src/discussion.js";
+import { createTopic } from "../../domain/src/topic.js";
 import { discussionCard, textCard } from "../../feishu/src/cards.js";
-import type { OutboxPort } from "../../storage/src/outbox.js";
+import type {
+  OutboxMessage,
+  OutboxPort,
+  OutboxSendResult,
+} from "../../storage/src/outbox.js";
 import {
   type DiscussionTurn,
   SqliteDiscussionStore,
 } from "../../storage/src/discussion.js";
 import type { EventStore } from "../../storage/src/store.js";
+import {
+  AgentConcurrencyLimiter,
+  type AgentCallLimiter,
+} from "./concurrency.js";
 import { discussionSummaryPrompt, discussionTurnPrompt } from "./prompts.js";
 
 export interface DiscussionCoordinatorOptions {
@@ -30,36 +41,38 @@ export interface DiscussionCoordinatorOptions {
   readonly workspaceRoot: string;
   readonly idFactory: () => string;
   readonly maxConcurrency?: number;
+  readonly limiter?: AgentCallLimiter;
+}
+
+export class DiscussionControlDeliveryEffects {
+  readonly #store: Pick<SqliteDiscussionStore, "recordControlMessage">;
+  readonly #coordinator: Pick<DiscussionCoordinator, "refreshControl">;
+
+  constructor(options: {
+    readonly store: Pick<SqliteDiscussionStore, "recordControlMessage">;
+    readonly coordinator: Pick<DiscussionCoordinator, "refreshControl">;
+  }) {
+    this.#store = options.store;
+    this.#coordinator = options.coordinator;
+  }
+
+  async apply(message: OutboxMessage, result: OutboxSendResult): Promise<void> {
+    const effect = message.deliveryEffect;
+    if (effect?.kind !== "discussion.control.created") {
+      throw new Error("Unsupported Outbox delivery effect");
+    }
+    if (result.messageId === undefined || !result.messageId.trim()) {
+      throw new Error("Created Discussion control card did not return a message ID");
+    }
+    this.#store.recordControlMessage(effect.discussionId, result.messageId);
+    await this.#coordinator.refreshControl(effect.discussionId);
+  }
 }
 
 interface DiscussionAgentOutput {
   readonly message: string;
   readonly continueDiscussion: boolean;
   readonly openQuestions: readonly string[];
-}
-
-class Semaphore {
-  readonly #limit: number;
-  #active = 0;
-  readonly #waiting: Array<() => void> = [];
-
-  constructor(limit: number) {
-    if (!Number.isInteger(limit) || limit < 1) throw new Error("maxConcurrency must be positive");
-    this.#limit = limit;
-  }
-
-  async run<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.#active >= this.#limit) {
-      await new Promise<void>((resolveWaiting) => this.#waiting.push(resolveWaiting));
-    }
-    this.#active += 1;
-    try {
-      return await operation();
-    } finally {
-      this.#active -= 1;
-      this.#waiting.shift()?.();
-    }
-  }
 }
 
 export class DiscussionCoordinator {
@@ -69,7 +82,7 @@ export class DiscussionCoordinator {
   readonly #adapters: AdapterRegistry;
   readonly #workspaceRoot: string;
   readonly #idFactory: () => string;
-  readonly #semaphore: Semaphore;
+  readonly #semaphore: AgentCallLimiter;
   readonly #loops = new Map<string, Promise<void>>();
   readonly #controllers = new Map<string, AbortController>();
   #shuttingDown = false;
@@ -81,7 +94,7 @@ export class DiscussionCoordinator {
     this.#adapters = options.adapters;
     this.#workspaceRoot = resolve(options.workspaceRoot);
     this.#idFactory = options.idFactory;
-    this.#semaphore = new Semaphore(options.maxConcurrency ?? 3);
+    this.#semaphore = options.limiter ?? new AgentConcurrencyLimiter(options.maxConcurrency ?? 3);
   }
 
   run(discussionId: string): Promise<void> {
@@ -99,6 +112,40 @@ export class DiscussionCoordinator {
 
   kick(discussionId: string): void {
     void this.run(discussionId).catch(() => {});
+  }
+
+  async waitForIdle(discussionId: string): Promise<void> {
+    await this.#loops.get(discussionId);
+  }
+
+  async control(
+    discussionId: string,
+    action: DiscussionAction,
+    principalId: string,
+  ): Promise<void> {
+    const discussion = this.#requireDiscussion(discussionId);
+    if (action === "stop") {
+      const owner = this.#events.topic(discussion.topicId)?.ownerPrincipalId;
+      if (principalId !== discussion.starterPrincipalId && principalId !== owner) {
+        throw new Error("Only the Discussion starter or Topic owner may stop it");
+      }
+    }
+    if (
+      (action === "pause" && discussion.state === "paused")
+      || (action === "resume" && discussion.state === "active")
+      || (action === "summarize" && ["summarizing", "completed"].includes(discussion.state))
+      || (action === "stop" && discussion.state === "stopped")
+    ) {
+      await this.refreshControl(discussionId);
+      return;
+    }
+    const updated = transitionDiscussion(discussion, action);
+    this.#store.saveDiscussion(updated);
+    if (action === "pause" || action === "stop") {
+      this.#controllers.get(discussionId)?.abort(new Error(`Discussion ${action} requested`));
+    }
+    await this.refreshControl(discussionId);
+    if (action === "resume" || action === "summarize") this.kick(discussionId);
   }
 
   async refreshControl(discussionId: string): Promise<void> {
@@ -155,8 +202,10 @@ export class DiscussionCoordinator {
   async #drive(discussionId: string): Promise<void> {
     while (!this.#shuttingDown) {
       const discussion = this.#requireDiscussion(discussionId);
+      this.#repairCompletedTurnEffects(discussion);
       await this.refreshControl(discussionId);
       if (discussion.state === "active") {
+        if (await this.#reconcileCompletedTurn(discussion)) continue;
         await this.#executeTurn(discussion);
         continue;
       }
@@ -169,15 +218,20 @@ export class DiscussionCoordinator {
 
   async #executeTurn(discussion: GroupDiscussion): Promise<void> {
     const provider = nextDiscussionProvider(discussion);
-    const turnId = this.#idFactory();
-    const claimed = this.#store.claimTurn({
-      id: turnId,
-      discussionId: discussion.id,
-      provider,
-      round: discussion.round,
-      turnIndex: discussion.turnIndex,
-    });
-    if (!claimed) throw new Error("Discussion turn index was already claimed");
+    const priorTurn = this.#store.turnForIndex(discussion.id, discussion.turnIndex);
+    const turnId = priorTurn?.id ?? this.#idFactory();
+    if (priorTurn === undefined) {
+      const claimed = this.#store.claimTurn({
+        id: turnId,
+        discussionId: discussion.id,
+        provider,
+        round: discussion.round,
+        turnIndex: discussion.turnIndex,
+      });
+      if (!claimed) throw new Error("Discussion turn index was already claimed");
+    } else {
+      this.#store.restartTurn(turnId, provider, discussion.round);
+    }
     const controller = new AbortController();
     this.#controllers.set(discussion.id, controller);
     const runningDiscussion: GroupDiscussion = {
@@ -224,27 +278,9 @@ export class DiscussionCoordinator {
         continueDiscussion: output.continueDiscussion,
       });
       this.#store.saveDiscussion(updated);
-      this.#events.append({
-        topicId: discussion.topicId,
-        type: "discussion.agent.completed",
-        payload: {
-          discussionId: discussion.id,
-          turnId,
-          provider,
-          round: discussion.round,
-          text: output.message,
-          continueDiscussion: output.continueDiscussion,
-          openQuestions: output.openQuestions,
-        },
-        idempotencyKey: `discussion:${discussion.id}:turn:${discussion.turnIndex}:completed`,
-      });
-      this.#outbox.enqueue({
-        id: `outbox:discussion:${discussion.id}:visible:${discussion.turnIndex}`,
-        appRole: provider,
-        receiveId: discussion.chatId,
-        payload: textCard(`${providerLabel(provider)} · 第 ${discussion.round} 轮`, output.message),
-        idempotencyKey: `discussion:${discussion.id}:visible:${discussion.turnIndex}`,
-      });
+      const completedTurn = this.#store.turn(turnId);
+      if (completedTurn === undefined) throw new Error(`Completed Discussion turn not found: ${turnId}`);
+      this.#publishCompletedTurn(discussion, completedTurn);
       await this.#afterTurn(updated);
     } catch (error) {
       const state = controller.signal.aborted ? "cancelled" : "failed";
@@ -299,6 +335,60 @@ export class DiscussionCoordinator {
       this.#store.saveDiscussion(transitionDiscussion(discussion, "summarize"));
     }
     await this.refreshControl(discussion.id);
+  }
+
+  async #reconcileCompletedTurn(discussion: GroupDiscussion): Promise<boolean> {
+    const turn = this.#store.turnForIndex(discussion.id, discussion.turnIndex);
+    if (turn?.state !== "completed") return false;
+    if (turn.continueDiscussion === undefined || turn.text === undefined) {
+      throw new Error(`Completed Discussion turn is incomplete: ${turn.id}`);
+    }
+    const completedAt = turn.completedAt;
+    const consumedSteers = this.#store.pendingSteers(discussion.id).filter(
+      (steer) => completedAt !== undefined && steer.createdAt <= completedAt,
+    );
+    this.#store.consumeSteers(discussion.id, consumedSteers.map(({ id }) => id));
+    const updated = completeDiscussionTurn(discussion, {
+      provider: turn.provider,
+      continueDiscussion: turn.continueDiscussion,
+    });
+    this.#store.saveDiscussion(updated);
+    this.#publishCompletedTurn(discussion, turn);
+    await this.#afterTurn(updated);
+    return true;
+  }
+
+  #repairCompletedTurnEffects(discussion: GroupDiscussion): void {
+    for (const turn of this.#store.turns(discussion.id)) {
+      if (turn.state === "completed" && turn.text !== undefined && turn.continueDiscussion !== undefined) {
+        this.#publishCompletedTurn(discussion, turn);
+      }
+    }
+  }
+
+  #publishCompletedTurn(discussion: GroupDiscussion, turn: DiscussionTurn): void {
+    if (turn.text === undefined || turn.continueDiscussion === undefined) return;
+    this.#events.append({
+      topicId: discussion.topicId,
+      type: "discussion.agent.completed",
+      payload: {
+        discussionId: discussion.id,
+        turnId: turn.id,
+        provider: turn.provider,
+        round: turn.round,
+        text: turn.text,
+        continueDiscussion: turn.continueDiscussion,
+        openQuestions: turn.openQuestions,
+      },
+      idempotencyKey: `discussion:${discussion.id}:turn:${turn.turnIndex}:completed`,
+    });
+    this.#outbox.enqueue({
+      id: `outbox:discussion:${discussion.id}:visible:${turn.turnIndex}`,
+      appRole: turn.provider,
+      receiveId: discussion.chatId,
+      payload: textCard(`${providerLabel(turn.provider)} · 第 ${turn.round} 轮`, turn.text),
+      idempotencyKey: `discussion:${discussion.id}:visible:${turn.turnIndex}`,
+    });
   }
 
   async #summarize(discussion: GroupDiscussion): Promise<void> {
@@ -435,6 +525,142 @@ export class DiscussionCoordinator {
   }
 }
 
+export interface GroupDiscussionReceiveInput {
+  readonly tenantKey: string;
+  readonly principalId: string;
+  readonly chatId: string;
+  readonly messageId: string;
+  readonly text: string;
+  readonly sourceAppRole: "hub" | "claude" | "codex" | "copilot";
+  readonly idempotencyKey: string;
+  readonly preferredProvider?: ProviderName;
+}
+
+export class GroupDiscussionChannel {
+  readonly #store: SqliteDiscussionStore;
+  readonly #events: EventStore;
+  readonly #coordinator: Pick<DiscussionCoordinator, "refreshControl" | "kick">;
+  readonly #idFactory: () => string;
+
+  constructor(options: {
+    readonly store: SqliteDiscussionStore;
+    readonly events: EventStore;
+    readonly coordinator: Pick<DiscussionCoordinator, "refreshControl" | "kick">;
+    readonly idFactory: () => string;
+  }) {
+    this.#store = options.store;
+    this.#events = options.events;
+    this.#coordinator = options.coordinator;
+    this.#idFactory = options.idFactory;
+  }
+
+  async receive(input: GroupDiscussionReceiveInput): Promise<void> {
+    const priorReceipt = this.#store.steerForMessage(input.messageId);
+    if (priorReceipt !== undefined) {
+      this.#store.recordSteer({
+        id: priorReceipt.id,
+        discussionId: priorReceipt.discussionId,
+        messageId: input.messageId,
+        topicEventSeq: priorReceipt.topicEventSeq,
+        principalId: input.principalId,
+        text: input.text,
+        ...(input.preferredProvider === undefined
+          ? {}
+          : { preferredProvider: input.preferredProvider }),
+      });
+      await this.#coordinator.refreshControl(priorReceipt.discussionId);
+      this.#coordinator.kick(priorReceipt.discussionId);
+      return;
+    }
+
+    const active = this.#store.activeForChat(input.tenantKey, input.chatId);
+    if (active !== undefined) {
+      const event = this.#events.append({
+        topicId: active.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: input.principalId,
+        payload: {
+          discussionId: active.id,
+          messageId: input.messageId,
+          text: input.text,
+          ...(input.preferredProvider === undefined
+            ? {}
+            : { preferredProvider: input.preferredProvider }),
+        },
+        idempotencyKey: `group-message:${input.messageId}:steer`,
+      });
+      this.#store.recordSteer({
+        id: this.#idFactory(),
+        discussionId: active.id,
+        messageId: input.messageId,
+        topicEventSeq: event.seq,
+        principalId: input.principalId,
+        text: input.text,
+        ...(input.preferredProvider === undefined
+          ? {}
+          : { preferredProvider: input.preferredProvider }),
+      });
+      await this.#coordinator.refreshControl(active.id);
+      this.#coordinator.kick(active.id);
+      return;
+    }
+
+    let topicId = this.#store.chatTopic(input.tenantKey, input.chatId);
+    const boundTopic = topicId === undefined ? undefined : this.#events.topic(topicId);
+    if (boundTopic === undefined || boundTopic.status !== "active") {
+      const topic = createTopic(summarizeQuestion(input.text), input.principalId, {
+        id: this.#idFactory(),
+      });
+      this.#events.append({
+        topicId: topic.id,
+        type: "topic.created",
+        actorPrincipalId: input.principalId,
+        payload: { topic },
+        createdAt: topic.createdAt,
+        idempotencyKey: `group-message:${input.messageId}:topic`,
+      });
+      topicId = topic.id;
+      this.#store.bindChatTopic(input.tenantKey, input.chatId, topic.id);
+    }
+    if (topicId === undefined) throw new Error("Group Topic binding was not created");
+    const discussion = createDiscussion({
+      id: this.#idFactory(),
+      topicId,
+      tenantKey: input.tenantKey,
+      chatId: input.chatId,
+      question: input.text,
+      starterPrincipalId: input.principalId,
+    });
+    this.#store.createDiscussion(discussion);
+    const started = this.#events.append({
+      topicId,
+      type: "discussion.started",
+      actorPrincipalId: input.principalId,
+      payload: {
+        discussionId: discussion.id,
+        chatId: input.chatId,
+        messageId: input.messageId,
+        question: input.text,
+      },
+      idempotencyKey: `group-message:${input.messageId}:discussion-started`,
+    });
+    const initialReceipt = this.#store.recordSteer({
+      id: this.#idFactory(),
+      discussionId: discussion.id,
+      messageId: input.messageId,
+      topicEventSeq: started.seq,
+      principalId: input.principalId,
+      text: input.text,
+      ...(input.preferredProvider === undefined
+        ? {}
+        : { preferredProvider: input.preferredProvider }),
+    }).steer;
+    this.#store.consumeSteers(discussion.id, [initialReceipt.id]);
+    await this.#coordinator.refreshControl(discussion.id);
+    this.#coordinator.kick(discussion.id);
+  }
+}
+
 export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
   try {
     const value = asRecord(JSON.parse(raw) as unknown);
@@ -496,4 +722,9 @@ function asRecord(value: unknown): Record<string, unknown> {
     throw new Error("value is not an object");
   }
   return value as Record<string, unknown>;
+}
+
+function summarizeQuestion(text: string): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length <= 60 ? oneLine : `${oneLine.slice(0, 59)}…`;
 }

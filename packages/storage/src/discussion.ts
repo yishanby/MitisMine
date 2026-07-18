@@ -314,6 +314,15 @@ export class SqliteDiscussionStore {
     return rows.map(mapSteer);
   }
 
+  steerForMessage(messageId: string): DiscussionSteer | undefined {
+    const row = this.#database.prepare(`
+      SELECT id, discussion_id, message_id, topic_event_seq, principal_id, text,
+             preferred_provider, status, created_at, consumed_at
+      FROM discussion_steers WHERE message_id = ?
+    `).get(messageId) as SteerRow | undefined;
+    return row === undefined ? undefined : mapSteer(row);
+  }
+
   consumeSteers(discussionId: string, ids: readonly string[], consumedAt = new Date().toISOString()): void {
     const update = this.#database.prepare(`
       UPDATE discussion_steers SET status = 'consumed', consumed_at = ?
@@ -354,6 +363,24 @@ export class SqliteDiscussionStore {
     if (Number(result.changes) !== 1) throw new Error(`Queued Discussion turn not found: ${id}`);
   }
 
+  restartTurn(
+    id: string,
+    provider: ProviderName,
+    round: number,
+    startedAt = new Date().toISOString(),
+  ): void {
+    const result = this.#database.prepare(`
+      UPDATE discussion_turns SET
+        provider = ?, round = ?, state = 'running', external_session_id = NULL,
+        text = NULL, continue_discussion = NULL, open_questions_json = '[]',
+        started_at = ?, completed_at = NULL
+      WHERE id = ? AND state IN ('queued', 'cancelled')
+    `).run(provider, round, startedAt, id);
+    if (Number(result.changes) !== 1) {
+      throw new Error(`Restartable Discussion turn not found: ${id}`);
+    }
+  }
+
   completeTurn(input: CompleteDiscussionTurnInput): void {
     const result = this.#database.prepare(`
       UPDATE discussion_turns SET
@@ -381,6 +408,13 @@ export class SqliteDiscussionStore {
 
   turn(id: string): DiscussionTurn | undefined {
     const row = this.#database.prepare(`${TURN_SELECT} WHERE id = ?`).get(id) as TurnRow | undefined;
+    return row === undefined ? undefined : mapTurn(row);
+  }
+
+  turnForIndex(discussionId: string, turnIndex: number): DiscussionTurn | undefined {
+    const row = this.#database.prepare(`
+      ${TURN_SELECT} WHERE discussion_id = ? AND turn_index = ?
+    `).get(discussionId, turnIndex) as TurnRow | undefined;
     return row === undefined ? undefined : mapTurn(row);
   }
 

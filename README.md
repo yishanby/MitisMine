@@ -4,11 +4,16 @@ MitisMine turns four Feishu bots into one persistent research workspace. A
 question sent to the Hub is researched independently by Claude Code, Codex, and
 GitHub Copilot CLI, cross-reviewed, resolved for at most three rounds, and
 returned as an evidence-backed report. Each provider bot can also run multiple
-named, durable Sessions inside the same Topic.
+named, durable Sessions inside the same Topic. In a Feishu group, the same four
+bots can instead hold a visible, automatically advancing roundtable that a user
+may steer at any time.
 
 ## Implemented
 
 - Four Feishu Apps over SDK persistent connections: Hub, Claude, Codex, Copilot.
+- Visible group Discussions: Hub moderates, each provider speaks through its own
+  bot identity, natural human messages steer the next turn, and one control card
+  provides pause, resume, summarize, and stop without extra slash commands.
 - Shared Topic lifecycle, owner/editor/viewer authorization, global user cursor,
   bounded Context Packs, full immutable history, and cross-Run provider sessions.
 - Three-provider fan-out, up to two isolated child sessions per provider,
@@ -54,8 +59,9 @@ For each of the four Apps:
 5. Create and publish a version, obtain tenant-admin approval, then install the
    bot. Open a direct chat with each bot; in a group, add and @mention it.
 
-The callback is required for approval buttons. Configure the four Apps
-identically; only their App IDs, Secrets, display names, and MitisMine roles differ.
+The callback is required for approval and Discussion control buttons. Configure
+the four Apps identically; only their App IDs, Secrets, display names, and
+MitisMine roles differ.
 
 ## Install and run
 
@@ -102,9 +108,31 @@ and one healthy Worker.
 
 ## Commands and routing
 
-Topic/read/control commands are handled by the Hub App. Ordinary Hub text and
-`/research` run all three providers. Ordinary text sent to a provider App only
-continues that provider's currently selected Session in the current Topic.
+### Group Discussion: recommended collaborative entry
+
+Add all four bots to one Feishu group, then send `@Hub <问题>`. Hub creates or
+restores the group's Topic and starts one visible Discussion. Claude, Codex,
+and Copilot speak in sequence through their own bot identities; the first
+speaker rotates each round. The Discussion ends early on consensus or is
+summarized after at most three rounds.
+
+While it is active, any human message delivered to the bots is a soft steer for
+the next speaker—no command is required. Mentioning a provider bot prioritizes
+that provider without giving it a duplicate turn. Use the single Hub control
+card for **暂停**, **继续**, **立即总结**, or **停止**. The same card message is
+updated in place. One group runs at most one active Discussion; after it reaches
+a terminal state, the next question starts another Discussion in the same Topic.
+
+The reliable Feishu path is to @mention Hub for a new question or steer. If the
+tenant's event permissions also deliver unmentioned group messages, those are
+handled identically. Bot-authored messages are discarded before inbox and
+identity processing, so the four Apps cannot trigger a feedback loop.
+
+### Direct-chat commands
+
+Topic/read/control commands are handled by the Hub App in direct chat. Ordinary
+Hub text and `/research` run the full evidence workflow. Ordinary text sent to a
+provider App continues that provider's selected Session in the current Topic.
 
 | Command | App | Purpose |
 |---|---|---|
@@ -139,6 +167,8 @@ cursors are independent per user, Topic, and provider, so switching Topics or
 Agent Apps restores the relevant last selection. Shared Topic notes remain
 visible, while direct messages and replies from other Sessions are excluded.
 Turns in one Session run in order; different Sessions may run concurrently.
+Research, visible Discussions, and direct Sessions share one global provider
+concurrency budget of six.
 
 ## Verify
 

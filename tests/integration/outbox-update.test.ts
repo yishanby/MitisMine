@@ -9,7 +9,12 @@ import {
   OutboxDispatcher,
   type OutboxSendResult,
 } from "../../packages/feishu/src/outbox-dispatcher.js";
+import { createDiscussion } from "../../packages/domain/src/discussion.js";
+import { createTopic } from "../../packages/domain/src/topic.js";
+import { DiscussionControlDeliveryEffects } from "../../packages/orchestrator/src/discussion.js";
+import { SqliteDiscussionStore } from "../../packages/storage/src/discussion.js";
 import { DurableOutbox } from "../../packages/storage/src/outbox.js";
+import { EventStore } from "../../packages/storage/src/store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -26,6 +31,62 @@ afterEach(() => {
 });
 
 describe("updatable durable Outbox", () => {
+  it("writes the created control message ID back and immediately patches the latest card", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-control-effect-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "test.db");
+    const events = EventStore.open(path);
+    const store = SqliteDiscussionStore.open(path);
+    const topic = createTopic("Topic", "tenant-1:user:member-1", { id: "topic-1" });
+    events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    store.createDiscussion(createDiscussion({
+      id: "discussion-1",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "question",
+      starterPrincipalId: "tenant-1:user:member-1",
+    }));
+    const refreshed: string[] = [];
+    const effects = new DiscussionControlDeliveryEffects({
+      store,
+      coordinator: { refreshControl: async (id) => { refreshed.push(id); } },
+    });
+
+    try {
+      await effects.apply({
+        id: "control-card",
+        appRole: "hub",
+        receiveId: "chat-1",
+        payload: {},
+        attempts: 0,
+        nextAttemptAt: "2026-07-18T01:00:00.000Z",
+        status: "delivered",
+        idempotencyKey: "control-card",
+        operation: "create",
+        deliveryEffect: { kind: "discussion.control.created", discussionId: "discussion-1" },
+      }, { messageId: "message-created" });
+
+      expect(store.discussion("discussion-1")?.controlMessageId).toBe("message-created");
+      expect(refreshed).toEqual(["discussion-1"]);
+      await expect(effects.apply({
+        id: "missing-result",
+        appRole: "hub",
+        receiveId: "chat-1",
+        payload: {},
+        attempts: 0,
+        nextAttemptAt: "2026-07-18T01:00:00.000Z",
+        status: "delivered",
+        idempotencyKey: "missing-result",
+        operation: "create",
+        deliveryEffect: { kind: "discussion.control.created", discussionId: "discussion-1" },
+      }, {})).rejects.toThrow(/message ID/i);
+    } finally {
+      store.close();
+      events.close();
+    }
+  });
+
   it("persists create/update operations and the update target", () => {
     const outbox = openOutbox();
     try {

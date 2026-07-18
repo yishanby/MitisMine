@@ -28,8 +28,8 @@ export function findTrackedSecretMatches(
 }
 
 function main(): void {
-  const envPath = resolve(".env.local");
-  if (!existsSync(envPath)) throw new Error(".env.local does not exist");
+  const envPath = resolve(process.env.MITISMINE_SECRET_SCAN_ENV_FILE ?? ".env.local");
+  if (!existsSync(envPath)) throw new Error("Secret scan environment file does not exist");
   const names = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
     .split("\0")
     .filter(Boolean);
