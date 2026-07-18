@@ -872,10 +872,13 @@ export class GroupDiscussionChannel {
         priorReceipt.preferredProvider,
         input.preferredProvider,
       );
+      const boundTopicEventSeq = priorReceipt.topicEventSeq > 0
+        ? priorReceipt.topicEventSeq
+        : undefined;
       this.#publishSteerEvent({
         ...input,
         ...(preferredProvider === undefined ? {} : { preferredProvider }),
-      }, receiptDiscussion, priorReceipt.id, true);
+      }, receiptDiscussion, priorReceipt.id, true, boundTopicEventSeq);
       await this.#coordinator.refreshControl(priorReceipt.discussionId);
       this.#coordinator.kick(priorReceipt.discussionId);
       return;
@@ -1019,30 +1022,37 @@ export class GroupDiscussionChannel {
     discussion: GroupDiscussion,
     steerId: string,
     allowTerminal: boolean,
+    boundTopicEventSeq?: number,
   ): void {
-    const event = this.#events.append({
-      topicId: discussion.topicId,
-      type: "discussion.steer.added",
-      actorPrincipalId: input.principalId,
-      payload: {
-        schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
-        discussionId: discussion.id,
-        principalId: input.principalId,
-        tenantKey: input.tenantKey,
-        chatId: input.chatId,
-        messageId: input.messageId,
-        text: input.text,
-        ...(input.preferredProvider === undefined
-          ? {}
-          : { preferredProvider: input.preferredProvider }),
-      },
-      idempotencyKey: groupEffectKey(
-        input.tenantKey,
-        input.chatId,
-        input.messageId,
-        "steer",
-      ),
-    });
+    const event = boundTopicEventSeq === undefined
+      ? this.#events.append({
+          topicId: discussion.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: input.principalId,
+          payload: {
+            schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
+            discussionId: discussion.id,
+            principalId: input.principalId,
+            tenantKey: input.tenantKey,
+            chatId: input.chatId,
+            messageId: input.messageId,
+            text: input.text,
+            ...(input.preferredProvider === undefined
+              ? {}
+              : { preferredProvider: input.preferredProvider }),
+          },
+          idempotencyKey: groupEffectKey(
+            input.tenantKey,
+            input.chatId,
+            input.messageId,
+            "steer",
+          ),
+        })
+      : this.#events.events(discussion.topicId)
+        .find(({ seq }) => seq === boundTopicEventSeq);
+    if (event === undefined) {
+      throw new Error("Inconsistent discussion.steer.added event");
+    }
     assertDiscussionSteerAddedEvent(event, input, discussion, allowTerminal);
     const preferredProvider = reconcilePreferredProvider(
       steerEventPreferredProvider(event),

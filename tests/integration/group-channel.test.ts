@@ -1932,7 +1932,7 @@ describe("GroupDiscussionChannel", () => {
     }
   });
 
-  it("recovers an exact v0 linked steer receipt on a completed Discussion", async () => {
+  it("replays a recovered exact v0 linked receipt on a completed Discussion", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-group-v0-linked-recovery-"));
     temporaryDirectories.push(directory);
     const path = join(directory, "group.db");
@@ -1953,6 +1953,7 @@ describe("GroupDiscussionChannel", () => {
     };
     const messageId = "v0-linked-recovery-message";
     const text = "Recover the linked v0 steer";
+    let discussionId = "";
 
     try {
       await channel.receive({
@@ -1964,6 +1965,7 @@ describe("GroupDiscussionChannel", () => {
       });
       const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
       expect(active).toBeDefined();
+      discussionId = active!.id;
       const event = events.append({
         topicId: active!.topicId,
         type: "discussion.steer.added",
@@ -2001,13 +2003,53 @@ describe("GroupDiscussionChannel", () => {
         preferredProvider: "codex",
         status: "consumed",
       });
+
+      await channel.receive({
+        ...scope,
+        principalId: "tenant-1:user:member",
+        messageId,
+        text,
+        sourceAppRole: "hub",
+        preferredProvider: "codex",
+        idempotencyKey: "hub-v0-linked-recovery-replay",
+      });
+
+      expect(events.events(active!.topicId).filter((candidate) => {
+        const payload = candidate.payload as { messageId?: string };
+        return candidate.type === "discussion.steer.added" && payload.messageId === messageId;
+      }).map(({ seq }) => seq)).toEqual([event.seq]);
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        id: "v0-linked-recovery-receipt",
+        topicEventSeq: event.seq,
+        status: "consumed",
+      });
+      expect(discussions.discussion(active!.id)).toMatchObject({ state: "completed" });
     } finally {
       discussions.close();
       events.close();
     }
+
+    const restartedEvents = EventStore.open(path);
+    const restartedDiscussions = SqliteDiscussionStore.open(path);
+    try {
+      expect(() => new GroupDiscussionChannel({
+        store: restartedDiscussions,
+        events: restartedEvents,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `v0-linked-restart-${++id}`,
+      }).recoverPendingSteerEvents()).not.toThrow();
+      expect(restartedDiscussions.steerForMessage(messageId)).toMatchObject({
+        discussionId,
+        status: "consumed",
+      });
+      expect(restartedDiscussions.discussion(discussionId)).toMatchObject({ state: "completed" });
+    } finally {
+      restartedDiscussions.close();
+      restartedEvents.close();
+    }
   });
 
-  it("projects an exact v0 event-before-receipt orphan at startup", async () => {
+  it("replays a recovered exact v0 event orphan on an active Discussion", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-group-v0-event-orphan-"));
     temporaryDirectories.push(directory);
     const path = join(directory, "group.db");
@@ -2028,6 +2070,7 @@ describe("GroupDiscussionChannel", () => {
     };
     const messageId = "v0-event-orphan-message";
     const text = "Recover the orphaned v0 steer";
+    let discussionId = "";
 
     try {
       await channel.receive({
@@ -2039,6 +2082,7 @@ describe("GroupDiscussionChannel", () => {
       });
       const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
       expect(discussion).toBeDefined();
+      discussionId = discussion!.id;
       const event = events.append({
         topicId: discussion!.topicId,
         type: "discussion.steer.added",
@@ -2061,9 +2105,47 @@ describe("GroupDiscussionChannel", () => {
         text,
         status: "pending",
       });
+
+      await channel.receive({
+        ...scope,
+        principalId: "tenant-1:user:member",
+        messageId,
+        text,
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-v0-event-orphan-replay",
+      });
+
+      expect(events.events(discussion!.topicId).filter((candidate) => {
+        const payload = candidate.payload as { messageId?: string };
+        return candidate.type === "discussion.steer.added" && payload.messageId === messageId;
+      }).map(({ seq }) => seq)).toEqual([event.seq]);
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        topicEventSeq: event.seq,
+        status: "pending",
+      });
+      expect(discussions.discussion(discussion!.id)).toMatchObject({ state: "active" });
     } finally {
       discussions.close();
       events.close();
+    }
+
+    const restartedEvents = EventStore.open(path);
+    const restartedDiscussions = SqliteDiscussionStore.open(path);
+    try {
+      expect(() => new GroupDiscussionChannel({
+        store: restartedDiscussions,
+        events: restartedEvents,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `v0-orphan-restart-${++id}`,
+      }).recoverPendingSteerEvents()).not.toThrow();
+      expect(restartedDiscussions.steerForMessage(messageId)).toMatchObject({
+        discussionId,
+        status: "pending",
+      });
+      expect(restartedDiscussions.discussion(discussionId)).toMatchObject({ state: "active" });
+    } finally {
+      restartedDiscussions.close();
+      restartedEvents.close();
     }
   });
 
