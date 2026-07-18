@@ -2204,6 +2204,169 @@ describe("GroupDiscussionChannel", () => {
     },
   );
 
+  it.each(["unpublished", "linked"] as const)(
+    "enriches an exact %s receipt from its provider steer event during recovery",
+    async (boundary) => {
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-provider-enrich-${boundary}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const options = {
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `provider-enrich-${boundary}-${++id}`,
+      };
+      const channel = new GroupDiscussionChannel(options);
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `provider-enrich-${boundary}-message`;
+      const text = "Recover provider preference";
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `provider-enrich-${boundary}-start`,
+          text: "Provider enrichment Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-provider-enrich-${boundary}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        const receipt = discussions.recordSteer({
+          id: `provider-enrich-${boundary}-receipt`,
+          discussionId: discussion!.id,
+          messageId,
+          principalId: "tenant-1:user:member",
+          text,
+        }).steer;
+        const event = events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: "tenant-1:user:member",
+          payload: {
+            schemaVersion: 2,
+            discussionId: discussion!.id,
+            principalId: "tenant-1:user:member",
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+            preferredProvider: "codex",
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        if (boundary === "linked") {
+          discussions.recordSteer({
+            id: receipt.id,
+            discussionId: discussion!.id,
+            messageId,
+            topicEventSeq: event.seq,
+            principalId: "tenant-1:user:member",
+            text,
+          });
+        }
+
+        new GroupDiscussionChannel(options).recoverPendingSteerEvents();
+
+        expect(discussions.steerForMessage(messageId)).toMatchObject({
+          id: receipt.id,
+          discussionId: discussion!.id,
+          topicEventSeq: event.seq,
+          preferredProvider: "codex",
+          status: "pending",
+        });
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each(["unpublished", "linked"] as const)(
+    "rejects a conflicting provider on an exact %s receipt without mutation",
+    async (boundary) => {
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-provider-conflict-${boundary}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const options = {
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `provider-conflict-${boundary}-${++id}`,
+      };
+      const channel = new GroupDiscussionChannel(options);
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `provider-conflict-${boundary}-message`;
+      const text = "Reject provider conflict";
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `provider-conflict-${boundary}-start`,
+          text: "Provider conflict Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-provider-conflict-${boundary}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        const receipt = discussions.recordSteer({
+          id: `provider-conflict-${boundary}-receipt`,
+          discussionId: discussion!.id,
+          messageId,
+          principalId: "tenant-1:user:member",
+          text,
+          preferredProvider: "claude",
+        }).steer;
+        const event = events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: "tenant-1:user:member",
+          payload: {
+            schemaVersion: 2,
+            discussionId: discussion!.id,
+            principalId: "tenant-1:user:member",
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+            preferredProvider: "codex",
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        if (boundary === "linked") {
+          discussions.recordSteer({
+            id: receipt.id,
+            discussionId: discussion!.id,
+            messageId,
+            topicEventSeq: event.seq,
+            principalId: "tenant-1:user:member",
+            text,
+            preferredProvider: "claude",
+          });
+        }
+        const before = discussions.steerForMessage(messageId);
+
+        expect(() => new GroupDiscussionChannel(options).recoverPendingSteerEvents())
+          .toThrow(/inconsistent discussion steer receipt/i);
+        expect(discussions.steerForMessage(messageId)).toEqual(before);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it.each(["completed", "stopped"] as const)(
     "creates a consumed tombstone for a terminal %s event orphan across restart and replay",
     async (state) => {

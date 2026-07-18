@@ -759,6 +759,17 @@ export class GroupDiscussionChannel {
       const linkedReceipt = linkedReceipts[0];
       if (linkedReceipt !== undefined) {
         assertSteerReceiptMatchesEvent(linkedReceipt, input, discussion);
+        this.#store.recordSteer({
+          id: linkedReceipt.id,
+          discussionId: discussion.id,
+          messageId: input.messageId,
+          topicEventSeq: event.seq,
+          principalId: input.principalId,
+          text: input.text,
+          ...(input.preferredProvider === undefined
+            ? {}
+            : { preferredProvider: input.preferredProvider }),
+        });
         continue;
       }
       const existing = this.#store.steerForMessage(input.messageId);
@@ -1286,6 +1297,7 @@ function assertSteerReceiptMatchesEvent(
     || receipt.text !== input.text
     || (
       input.preferredProvider !== undefined
+      && receipt.preferredProvider !== undefined
       && receipt.preferredProvider !== input.preferredProvider
     )
   ) {
