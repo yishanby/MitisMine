@@ -579,6 +579,18 @@ describe("DiscussionCoordinator", () => {
       .toThrow(/invalid Unicode.*provider output/i);
   });
 
+  it("rejects decoded invalid Unicode before falling back from an invalid Agent contract", () => {
+    const replacementCharacter = String.fromCodePoint(0xfffd);
+    const response = JSON.stringify({
+      message: `Corrupt ${replacementCharacter} response`,
+      continueDiscussion: "yes",
+      openQuestions: [],
+    }).replace(replacementCharacter, "\\ufffd");
+
+    expect(() => parseDiscussionAgentOutput(response))
+      .toThrow(/invalid Unicode.*provider output/i);
+  });
+
   it("parses an Agent contract wrapped in a JSON markdown fence", () => {
     expect(parseDiscussionAgentOutput(`\`\`\`json
 {"message":"Structured response","continueDiscussion":false,"openQuestions":["One risk"]}

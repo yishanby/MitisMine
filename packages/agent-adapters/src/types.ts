@@ -1,4 +1,20 @@
-import type { AgentEvent, RunJsonlOptions } from "../../agent-protocol/src/types.js";
+import type {
+  AgentErrorEvent,
+  AgentEvent,
+  RunJsonlOptions,
+} from "../../agent-protocol/src/types.js";
+
+const safeProviderErrorCodes: ReadonlySet<string> = new Set([
+  "cancelled",
+  "line_too_large",
+  "malformed_jsonl",
+  "output_too_large",
+  "process_error",
+  "process_exit",
+  "process_stderr",
+  "provider_error",
+  "timeout",
+] satisfies readonly (AgentErrorEvent["code"] | "provider_error")[]);
 
 export type ProviderName = "claude" | "codex" | "copilot";
 
@@ -56,7 +72,9 @@ export async function collectNormalized(
     (event) => event.type === "error" && event.code !== "process_stderr",
   );
   if (fatal !== undefined) {
-    const code = typeof fatal.code === "string" ? fatal.code : "provider_error";
+    const code = typeof fatal.code === "string" && safeProviderErrorCodes.has(fatal.code)
+      ? fatal.code
+      : "provider_error";
     throw new Error(`${provider} failed with ${code}`);
   }
   let hasFinal = false;

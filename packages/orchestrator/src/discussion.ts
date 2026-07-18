@@ -794,31 +794,40 @@ export class GroupDiscussionChannel {
 
 export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
   assertValidProviderText(raw);
-  let output: DiscussionAgentOutput;
+  let parsed: unknown;
   try {
-    const value = asRecord(JSON.parse(unwrapJsonFence(raw)) as unknown);
-    if (
-      typeof value.message !== "string"
-      || !value.message.trim()
-      || typeof value.continueDiscussion !== "boolean"
-      || !Array.isArray(value.openQuestions)
-      || value.openQuestions.some((question) => typeof question !== "string")
-    ) {
-      throw new Error("invalid contract");
-    }
-    output = {
-      message: value.message.trim(),
-      continueDiscussion: value.continueDiscussion,
-      openQuestions: value.openQuestions as string[],
-    };
+    parsed = JSON.parse(unwrapJsonFence(raw)) as unknown;
   } catch {
     const message = raw.trim();
     if (!message) throw new Error("Discussion Agent returned an empty response");
     return { message, continueDiscussion: true, openQuestions: [] };
   }
-  assertValidProviderText(output.message);
-  for (const question of output.openQuestions) assertValidProviderText(question);
-  return output;
+  let value: Record<string, unknown>;
+  try {
+    value = asRecord(parsed);
+  } catch {
+    return { message: raw.trim(), continueDiscussion: true, openQuestions: [] };
+  }
+  if (typeof value.message === "string") assertValidProviderText(value.message);
+  if (Array.isArray(value.openQuestions)) {
+    for (const question of value.openQuestions) {
+      if (typeof question === "string") assertValidProviderText(question);
+    }
+  }
+  if (
+    typeof value.message !== "string"
+    || !value.message.trim()
+    || typeof value.continueDiscussion !== "boolean"
+    || !Array.isArray(value.openQuestions)
+    || value.openQuestions.some((question) => typeof question !== "string")
+  ) {
+    return { message: raw.trim(), continueDiscussion: true, openQuestions: [] };
+  }
+  return {
+    message: value.message.trim(),
+    continueDiscussion: value.continueDiscussion,
+    openQuestions: value.openQuestions as string[],
+  };
 }
 
 function parseDiscussionSummary(raw: string): string {

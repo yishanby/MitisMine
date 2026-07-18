@@ -64,6 +64,30 @@ describe("CLI adapters", () => {
     }, normalize)).rejects.toThrow(/final/);
   });
 
+  it("maps an unknown runtime error code to a safe provider error", async () => {
+    const arbitraryCode = "unknown_code:do-not-echo";
+    const runner: AgentRunner = async function* () {
+      yield { type: "session", externalSessionId: "session-unknown-error" };
+      yield {
+        type: "error",
+        code: arbitraryCode,
+        message: "failed",
+      } as unknown as AgentEvent;
+    };
+
+    let rejection: unknown;
+    try {
+      await collectNormalized("claude", runner, { command: "synthetic" }, (event) => [event]);
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toEqual(expect.objectContaining({
+      message: "claude failed with provider_error",
+    }));
+    expect((rejection as Error).message).not.toContain(arbitraryCode);
+  });
+
   it("keeps process stderr as a warning when a final event exists", async () => {
     const runner: AgentRunner = async function* () {
       yield { type: "session", externalSessionId: "session-warning" };
