@@ -4,12 +4,23 @@ Audit date: 2026-07-18 (Asia/Shanghai)
 
 Branch: `feat/visible-group-discussion`
 
-Audited code revision: `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
+Audited application revision: `3bd5ac0afe4b5c26d54bcddf9ef0296d1054f73c`
 
-This audit covers code through `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`.
+This audit covers application code through
+`3bd5ac0afe4b5c26d54bcddf9ef0296d1054f73c`.
 The documentation-only commit that
-records this final evidence follows that revision; its SHA is reported in the
-handoff rather than represented here as audited application code.
+records this final evidence follows that revision and is intentionally not
+represented here as audited application code.
+
+The canonical Feishu interaction itself was executed on
+`dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`. Later revisions through the
+audited application revision harden crash recovery, summary-steer delivery,
+receipt/event reconciliation, and startup-query behavior.
+They do not rewrite the immutable canonical Discussion evidence.
+
+PID `58564` was captured in the canonical `dcc1df4` Feishu acceptance window.
+The exact CLI durations below come from a separate opt-in run on the current
+`3bd5ac0` application revision; they are not timings of the Feishu interaction.
 
 ## Acceptance evidence
 
@@ -18,9 +29,9 @@ handoff rather than represented here as audited application code.
 | Four Apps identify one user and share a cursor | Config identity-observation tests; startup verifier ordering; Gateway cross-App tests | Four persisted App observations resolve to one union principal; `/ready` returned HTTP 200 with store=true, four Apps, and one Worker | Pass |
 | Topic create/switch/restore/share/archive/history | Topic and Feishu integration suites; durable inbox failure injection | Live Topic survived restarts; `/status` and `/report` reload | Pass |
 | Standalone Agent multi-Session | Parser/Gateway/Store/Dispatcher tests cover create/list/use/show/rename/archive, lazy `main`, per-user/provider cursors, start/resume, isolation, serialization, cross-Session concurrency, restart and legacy migration | Updated control plane loaded the live database, migrated all three legacy provider direct Sessions, reached four-App ready=200, and retained all three external IDs | Pass |
-| Visible group Discussion with natural steer | Domain, Gateway, coordinator, card, store, recovery, Unicode guards, and Outbox suites cover one-active-per-chat, three unique speakers per round, same-card patching, steer consumption, pause/resume/summarize/stop, failed providers, turn-index 3/9 crash boundaries and fenced JSON | Unicode-clean canonical Discussion `01KXSRVC8DFBMTJRSY1KJKCM5C` completed at round 2/turn index 5/version 19. Claude, Codex, and Copilot produced five visible completed turns. Pause cancelled an in-flight Copilot attempt while retaining its slot; a genuine `MitisMine 总控` entity-mention steer persisted while paused and was consumed by Copilot after resume; Codex corrected an overstrong NFS claim and Copilot accepted the correction. All control updates targeted one control message; Hub sent the summary separately | Pass |
+| Visible group Discussion with natural steer | Domain, Gateway, coordinator, card, store, recovery, Unicode guards, and Outbox suites cover one-active-per-chat, three unique speakers per round, same-card patching, steer consumption, pause/resume/summarize/stop, failed providers, turn-index 3/9 crash boundaries, fenced JSON, exact v2/scoped-legacy/minimal-v0 event replay, receipt-first and event-first crash recovery, bound-event replay, terminal tombstones, provider reconciliation, pending-steer summary regeneration, bounded paid retries, and indexed `(topic_id, seq)` recovery lookup | Unicode-clean canonical Discussion `01KXSRVC8DFBMTJRSY1KJKCM5C` completed at round 2/turn index 5/version 19. Claude, Codex, and Copilot produced five visible completed turns. Pause cancelled an in-flight Copilot attempt while retaining its slot; a genuine `MitisMine 总控` entity-mention steer persisted while paused and was consumed by Copilot after resume; Codex corrected an overstrong NFS claim and Copilot accepted the correction. All control updates targeted one control message; Hub sent the summary separately | Pass |
 | Owner/editor/viewer enforcement | `canReadTopic`/`canEditTopic`; viewer command matrix | Viewer rules reflected in deployed command path | Pass |
-| Three CLIs and Topic sessions | Adapter contracts; cross-Run/restart Topic-session tests | Fresh real-CLI start+resume suite passed 3/3: Claude 14,283 ms, Codex 27,676 ms, Copilot 31,747 ms; recorded research and direct external IDs remain persisted | Pass |
+| Three CLIs and Topic sessions | Adapter contracts; cross-Run/restart Topic-session tests | Current-revision real-CLI start+resume suite passed 3/3: Claude 16,904 ms, Codex 24,425 ms, Copilot 40,860 ms; recorded research and direct external IDs remain persisted | Pass |
 | Context reaches every agent | Context Pack unit test; real Gateway→ChannelDispatcher note/watermark test | Historical Topic/Run remains queryable | Pass |
 | Independent fan-out, child sessions, concurrency ≤6 | Orchestrator tests: isolation, six unique child sessions, semaphore cap | Three live reports; no degraded provider | Pass |
 | All-pairs review, repair, and ≤3 rounds | Six first-pass reviews; resolution report merge; signoff-only critique; round cap tests | 18 directed reviews over three rounds | Pass |
@@ -31,8 +42,8 @@ handoff rather than represented here as audited application code.
 | Privileged work waits for approval | Approval/Gateway tests, orphaned-executing recovery test | Target absent before click; double click preserved one write/mtime | Pass |
 | `/stop` cancels real work | Abort propagation, stale-save guard, process-tree/grandchild test, lease requeue test | Not used on the evidence Run | Pass (automated) |
 | Secrets do not reach Git/logs/children | Synthetic secret isolation; redaction; least-privilege adapter contracts; tracked-value scan | `.env.local` ignored/untracked; the recorded scan checked 5 configured keys without exposing a value | Pass |
-| Health, safe shutdown, delivery replay | Readiness, all-hook cleanup, startup unwind, pending-call cancel/drain, Outbox stable UUID, active-flush plus newly-queued-output drain, periodic lease recovery tests | Rebuilt service PID `58564`: HTTP 200, ready=true, store=true, four Apps, one Worker | Pass |
-| Deterministic and live verification | 221 tests passed; 3 live tests remain opt-in and skipped in the deterministic run | Fresh opt-in CLI suite passed 3/3; the Unicode-clean canonical group Discussion completed with all 3 providers producing real visible content; the latest recorded typecheck and build runs passed | Pass |
+| Health, safe shutdown, delivery replay | Readiness, all-hook cleanup, startup unwind, pending-call cancel/drain, Outbox stable UUID, active-flush plus newly-queued-output drain, periodic lease recovery tests | Canonical acceptance service PID `58564`: HTTP 200, ready=true, store=true, four Apps, one Worker | Pass |
+| Deterministic and live verification | 343 tests passed; 3 live tests remain opt-in and skipped in the deterministic run | Fresh opt-in CLI suite passed 3/3; the Unicode-clean canonical group Discussion completed with all 3 providers producing real visible content; the final recorded lint, typecheck, build, secret scan, and diff checks passed | Pass |
 
 ## Verification snapshot
 
@@ -40,8 +51,8 @@ Fresh deterministic run on 2026-07-18:
 
 ```text
 Test Files  23 passed | 1 skipped (24)
-Tests       221 passed | 3 skipped (224)
-Duration    5.73 s
+Tests       343 passed | 3 skipped (346)
+Duration    8.80 s
 ```
 
 The three skipped cases are the explicit `MITISMINE_LIVE_CLI=1` suite. A fresh
@@ -54,14 +65,14 @@ Claude Code 2.1.212; Codex CLI 0.143.0; GitHub Copilot CLI 1.0.72-1
 
 ```text
 tests/live/cli-smoke.test.ts  3 passed (3)
-Claude start+resume           14283 ms
-Codex start+resume            27676 ms
-Copilot start+resume          31747 ms
-Tests                         73708 ms
-Vitest duration               74.61 s
+Claude start+resume           16904 ms
+Codex start+resume            24425 ms
+Copilot start+resume          40860 ms
+Tests                         82192 ms
+Vitest duration               83.24 s
 ```
 
-The latest recorded `pnpm typecheck` and `pnpm build` runs passed. The
+The final recorded `pnpm lint`, `pnpm typecheck`, and `pnpm build` runs passed. The
 tracked-secret scan passed for 5 configured keys without exposing a value; no
 stale tracked-file count is asserted here. `git diff --check` is rerun for the
 documentation commit.

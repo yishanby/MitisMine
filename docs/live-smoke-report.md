@@ -5,7 +5,14 @@ Initial smoke: 2026-07-17; final multi-Session, CLI, and visible-group rechecks:
 
 Environment: Windows, Node `24.12.0`, Feishu persistent connection, local SQLite WAL Worker
 
-Audited code revision: `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
+Current audited application revision: `3bd5ac0afe4b5c26d54bcddf9ef0296d1054f73c`
+
+Canonical visible-group interaction revision:
+`dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
+
+Service PID `58564` was captured in the canonical `dcc1df4` Feishu acceptance
+window. The exact CLI durations below come from a separate opt-in run on the
+current `3bd5ac0` application revision.
 
 CLI versions at the final recheck:
 
@@ -45,7 +52,7 @@ included in this report.
 
 | Check | Evidence | Result |
 |---|---|---|
-| Four long connections | Four SDK `client ready` events; after rebuild and restart, `/ready` returned HTTP 200, ready=true, store=true, apps=4, workers=1 from PID `58564` | Pass |
+| Four long connections | Four SDK `client ready` events; in the canonical acceptance window, `/ready` returned HTTP 200, ready=true, store=true, apps=4, workers=1 from PID `58564` | Pass |
 | Identity preflight | Four persisted App observations resolved to one stable principal before startup side effects | Pass |
 | Topic over Feishu | `/topic new Live smoke`; Topic ID persisted and reply card visible | Pass |
 | Three-provider research | Claude, Codex, and Copilot reports present; state=completed, round=3 | Pass |
@@ -57,9 +64,9 @@ included in this report.
 | Restart recovery | Service restarted; `/ready` returned 200; `/status` and `/report` cards reloaded | Pass |
 | Session recovery | Post-restart `RESUMED_CLAUDE_OK`, `RESUMED_CODEX_OK`, and `RESUMED_COPILOT_OK` used unchanged session IDs | Pass |
 | Multi-Session migration preflight | Revision `a74ca6d` started against the live database; legacy Claude/Codex/Copilot direct rows migrated to named `main` Sessions without changing their external IDs; `/ready` remained 200 | Pass |
-| Fresh real CLI start+resume | `tests/live/cli-smoke.test.ts` passed 3/3 after ChatGPT login: Claude 14,283 ms; Codex 27,676 ms; Copilot 31,747 ms; 73,708 ms total tests, 74.61 s Vitest duration | Pass |
+| Fresh real CLI start+resume | On the current application revision, `tests/live/cli-smoke.test.ts` passed 3/3: Claude 16,904 ms; Codex 24,425 ms; Copilot 40,860 ms; 82,192 ms total tests, 83.24 s Vitest duration | Pass |
 | Canonical visible group start and identity | In Feishu, the human used the @ toolbar and selected the real entity whose display name is exactly `MitisMine 总控`, verified it was an entity mention, and then typed the question. The UI showed one Hub control card and real content from all three provider identities; the read-only Discussion audit associated that flow with `01KXSRVC8DFBMTJRSY1KJKCM5C` | Pass |
-| Automatic turns | The UI showed five completed provider messages. The read-only Discussion audit mapped their code-point/Han counts to Claude 0 (99/72), Codex 1 (58/37), Copilot 2 (93/71), Codex 3 (47/30), and Copilot 4 (66/46), and recorded Claude turn 5 as cancelled with no visible content | Pass, 3/3 current content |
+| Automatic turns | The UI showed five completed provider messages. The read-only Discussion audit mapped their code-point/Han counts to Claude 0 (99/72), Codex 1 (58/37), Copilot 2 (93/71), Codex 3 (47/30), and Copilot 4 (66/46), and recorded Claude turn 5 as cancelled with no visible content | Pass; all 3 provider identities produced visible content |
 | Durable pause, steer, and resume | A separate read-only SQLite audit—not the visible UI alone—showed that pause cancelled the in-flight Copilot turn 2 attempt, persisted round 1/turn index 2/version 8, retained the speaker slot, kept the genuine entity-mention steer pending, and associated its consumption with Copilot turn 2 after resume | Pass |
 | Instruction delivery and length compliance | Provider messages addressed the requested WAL and snapshot points, but length adherence was partial. Against the initial ≤60-Han limit, Claude 0 (72 Han) and Copilot 2 (71) violated it; Codex 1 (37), Codex 3 (30), and Copilot 4 (46) complied. Copilot 2 also violated the repeated post-pause limit. `consumed` proves steer delivery and turn association, not full provider compliance | Partial provider compliance; orchestration evidence remains valid |
 | Cross-provider acknowledgement after steer | Resumed Copilot turn 2 explicitly addressed the transaction-start snapshot point. Codex turn 3 corrected the overstrong claim that cross-host/NFS access would `必然损坏`; Copilot turn 4 accepted that correction | Pass; visible consensus, not independent empirical or external technical verification |
@@ -68,10 +75,11 @@ included in this report.
 | Final visible summary | The UI showed the control card render completed and Hub send a separate Unicode-clean summary. The read-only Outbox audit established that the existing card was patched at the same message ID and that the separate summary length was 324 characters | Pass |
 | Unicode integrity | The read-only database/Outbox audit found replacement_count=0 in the question, `summary_text`, all turn text/open questions/steer IDs, both steer texts, and every related payload/delivery effect/result. The separately inspected visible UI segment also had no U+FFFD, and every visible provider/summary Outbox row was sent | Pass |
 | Historical Discussion classification | Discussion `01KXSM5XNX4STNQTPR245H86TY` contains U+FFFD in a Claude turn and Hub summary and is retained only as pre-fix evidence. Earlier Discussion `01KXSCB2AX0GSY6YNT98S8GN61` remains failure-isolation evidence | Historical only; neither is canonical |
+| Current recovery and steer hardening | Deterministic tests cover exact v2/scoped-legacy/minimal-v0 payload replay, Hub-only start, tenant/chat/principal scoping, receipt-first and event-first crash repair, bound legacy-event replay without duplicates, terminal consumed tombstones, live/recovery provider reconciliation, pending-steer summary regeneration, bounded paid retries, and indexed startup plus `(topic_id, seq)` queries. The immutable canonical records remain Unicode-clean and readable under the current schema | Pass |
 | Approval before write | Smoke target absent before approval; approval row was pending | Pass |
 | Approval idempotency | First click created one 18-byte file; second click left the same mtime and stored result | Pass |
 | Secret isolation | `.env.local` ignored; the recorded tracked scan passed for 5 configured keys without exposing a value; child environment tests pass | Pass |
-| Build verification | Fresh root `pnpm test:run`: 23 test files passed and 1 skipped; 221 tests passed and 3 opt-in live tests skipped; duration 5.73 s. The latest recorded typecheck and build runs passed | Pass |
+| Build verification | Fresh root `pnpm test:run`: 23 test files passed and 1 skipped; 343 tests passed and 3 opt-in live tests skipped; duration 8.80 s. The final recorded lint, typecheck, and build runs passed | Pass |
 | Worker lease execution | Deterministic task IDs, heartbeat, terminal state, and expired same-task resume verified automatically | Pass |
 
 ## Redacted excerpts
@@ -83,8 +91,8 @@ apps=[hub,claude,codex,copilot] workers=1 pid=58564
 
 ```text
 cli_smoke=passed tests=3/3
-claude_ms=14283 codex_ms=27676 copilot_ms=31747
-tests_ms=73708 vitest_duration_s=74.61
+claude_ms=16904 codex_ms=24425 copilot_ms=40860
+tests_ms=82192 vitest_duration_s=83.24
 ```
 
 ```text
@@ -155,75 +163,12 @@ Terminal B:
 pnpm smoke:live
 ```
 
-To reproduce the canonical visible-group flow in a dedicated group containing
-all four bots:
-
-1. In Feishu, click the @ toolbar and select the real mention entity whose
-   display name is exactly `MitisMine 总控`. Verify that Feishu inserted an
-   entity mention; do not merely type `@Hub` or plain text. Then type and send:
-
-   ```text
-   请三位各用不超过60个汉字说明 SQLite WAL 的一个适用条件，并互相校验。
-   ```
-
-2. Confirm Hub creates one control card and that Claude and Codex post visible
-   replies under their own App identities. When Copilot begins its next visible
-   activity, click **暂停** and confirm the control card renders a paused state.
-3. While paused, again select the genuine `MitisMine 总控` entity mention and
-   send this natural steer:
-
-   ```text
-   请把后续发言控制在60个汉字内，并明确：读事务看到开始时的已提交快照。
-   ```
-
-4. Click **继续**. In the UI, confirm the next Copilot reply explicitly addresses
-   the transaction-start snapshot point. Confirm the subsequent Codex reply
-   corrects the overstrong statement that cross-host/NFS access would
-   `必然损坏`, then the next Copilot reply accepts that correction. This visible
-   exchange establishes cross-provider acknowledgement and consensus, not
-   independent empirical or external technical verification.
-5. When Claude begins the next visible activity, click **立即总结**. Confirm no
-   additional Claude provider content appears, the control card renders a
-   completed state, and Hub posts its Unicode-clean summary as a separate
-   message rather than inside or on the control card.
-
-Those UI steps establish visible App identities, the rendered pause/completed
-card states, the visible provider exchange, the absence of an additional Claude
-message, and the separate Hub summary. They do not expose exact turn indexes,
-versions, steer database status, cancellation rows, or Outbox target message
-IDs.
-
-The recorded acceptance evidence therefore included a subsequent read-only
-SQLite/Outbox audit. That audit—not UI observation—established all of the
-following:
-
-- pause cancelled the in-flight Copilot attempt and persisted round 1/turn
-  index 2/version 8 while retaining the speaker slot;
-- user steer `om_x100b6a8429f170b0c4afe4588666c37` stayed pending while
-  paused and was consumed by Copilot turn 2 after resume; the separately
-  consumed initial steer represents the start question;
-- the completed/cancelled turn rows, exact provider order, indexes, and lengths;
-- immediate summary persisted round 2/turn index 5/version 18 as summarizing,
-  then version 19 as completed; and
-- every sent or superseded control update targeted
-  `om_x100b6a84163cb4a0c3dadf616c2fcda`, with all visible provider and summary
-  Outbox rows sent.
-
-The persisted Copilot turn 2 text was:
-
-```text
-同意二位。WAL 核心优势：读事务见启动快照，无脏读且并发高效。关键限制是单写者、内存映射依赖。NFS 跨主机访问违反映射前提—确实会导致损坏。建议补充：WAL 文件与数据库需同盘位置。
-```
-
-It followed the snapshot instruction but measured 93 UTF-16 code units, 93
-code points, and 71 Han characters. It therefore violated both the initial and
-repeated 60-Han-character limits. Across all five completed replies, Claude turn
-0 also violated the initial limit at 72 Han characters; Codex turn 1 (37), Codex
-turn 3 (30), and Copilot turn 4 (46) complied. Copilot turn 4 had 66 total code
-points but still met the rule because the request limited Han characters.
-Provider messages addressed the requested WAL and snapshot points, but length
-adherence was partial. The steer row's `consumed` status proves delivery and
-association with Copilot turn 2, not full compliance with every instruction.
+The authoritative visible-group reproduction steps, durable sequence, message
+length analysis, and evidence gaps are maintained in
+[`group-discussion-smoke-report.md`](group-discussion-smoke-report.md). The UI
+establishes visible identities, rendered card states, and visible messages;
+the separate read-only SQLite/Outbox audit establishes exact turn indexes,
+versions, steer status, cancellation rows, and control-message targets.
 
 Real provider start+resume is separate and quota-consuming:
 
@@ -237,8 +182,9 @@ The CLI run passed Claude, Codex, and Copilot 3/3. The complete canonical
 Discussion sequence and scoped evidence gaps are recorded in
 `docs/group-discussion-smoke-report.md`.
 
-For fresh Topic/research/direct-Session/approval evidence, follow section 10 of
-the operator guide. The 2026-07-18 multi-Session recheck itself was read-only:
+For fresh Topic/research/direct-Session/approval evidence, follow
+[section 10 of the operator guide](operator-guide.md#10-reproduce-live-verification).
+The 2026-07-18 multi-Session recheck itself was read-only:
 it verified schema migration, four live connections, readiness, and the existing
 three-provider direct Session continuity; command interaction remains covered by
 deterministic Gateway integration tests.

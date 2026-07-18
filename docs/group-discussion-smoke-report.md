@@ -2,10 +2,21 @@
 
 Date: 2026-07-18 (Asia/Shanghai)
 
-Audited code revision: `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
+Canonical interaction revision: `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
+
+Current audited application revision: `3bd5ac0afe4b5c26d54bcddf9ef0296d1054f73c`
 
 Scope: one real Feishu group Discussion using the rebuilt persistent four-App
 service. This is the canonical Unicode-clean visible-group acceptance run.
+
+The immutable Feishu interaction was recorded on the canonical interaction
+revision. Subsequent code through the current audited application revision was
+verified against the same durable records and adds recovery, identity,
+summary-steer, and startup-query hardening without claiming a second UI run.
+
+Service PID `58564` belongs to the canonical `dcc1df4` Feishu acceptance
+window. The exact CLI durations below come from a separate opt-in run on the
+current `3bd5ac0` application revision.
 
 Discussion `01KXSM5XNX4STNQTPR245H86TY` is retained only as historical pre-fix
 evidence: a Claude turn and the Hub summary contain U+FFFD, so that run is not
@@ -18,7 +29,7 @@ evidence only.
 | Item | Recorded value |
 |---|---|
 | Service readiness | HTTP 200; ready=true; store=true; apps=`hub,claude,codex,copilot`; workers=1 |
-| Rebuilt service PID | `58564` |
+| Canonical interaction service PID | `58564` |
 | Group | `MitisMine Visible Discussion Live Smoke 2026-07-18` |
 | Chat | `oc_87039460e2874be6fbf1f007baa0d848` |
 | Discussion | `01KXSRVC8DFBMTJRSY1KJKCM5C` |
@@ -166,15 +177,25 @@ benchmarking, or verification against an external technical source.
 
 The final verification window recorded:
 
-- fresh root `pnpm test:run`: 23 test files passed, 1 skipped; 221 tests passed,
-  3 opt-in live tests skipped; duration 5.73 s;
-- opt-in real CLI suite: 3/3 passed (Claude 14,283 ms; Codex 27,676 ms;
-  Copilot 31,747 ms; 73,708 ms test total; 74.61 s Vitest duration);
-- the latest recorded typecheck and build runs: passed;
+- fresh root `pnpm test:run`: 23 test files passed, 1 skipped; 343 tests passed,
+  3 opt-in live tests skipped; duration 8.80 s;
+- current-revision opt-in real CLI suite: 3/3 passed (Claude 16,904 ms;
+  Codex 24,425 ms; Copilot 40,860 ms; 82,192 ms test total; 83.24 s Vitest
+  duration);
+- the final recorded lint, typecheck, and build runs: passed;
 - tracked-secret scan: passed for 5 configured keys without exposing a value;
   no stale tracked-file count is asserted; and
 - historical research smoke: completed at round 3 with 18 reviews, 18
   cross-reviews, and important evidence coverage 2/2.
+
+The post-interaction recovery suite additionally covers exact v2, scoped legacy,
+and minimal v0 event replay; Hub-only start; tenant/chat and principal/text
+scoping; failed-turn resume; receipt-first and event-first crash repair; bound
+legacy-event replay without duplicate events; terminal consumed tombstones;
+provider-preference reconciliation; summary inclusion of pending steers;
+steer-arrival regeneration; bounded paid retries; and indexed startup and
+`(topic_id, seq)` lookup. These are deterministic scenario results; they do not
+retroactively turn the canonical UI observation into a new live interaction.
 
 ## Remaining evidence gaps
 
