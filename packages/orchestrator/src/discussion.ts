@@ -708,14 +708,17 @@ export class GroupDiscussionChannel {
   }
 
   async receive(input: GroupDiscussionReceiveInput): Promise<void> {
+    const active = this.#store.activeForChat(input.tenantKey, input.chatId);
     const priorStart = this.#store.discussionForStartMessage(input.messageId);
     if (priorStart !== undefined) {
+      if (input.sourceAppRole !== "hub" && active?.id !== priorStart.id) return;
       await this.#finishStart(input, priorStart);
       return;
     }
 
     const priorReceipt = this.#store.steerForMessage(input.messageId);
     if (priorReceipt !== undefined) {
+      if (input.sourceAppRole !== "hub" && active?.id !== priorReceipt.discussionId) return;
       this.#store.recordSteer({
         id: priorReceipt.id,
         discussionId: priorReceipt.discussionId,
@@ -732,7 +735,6 @@ export class GroupDiscussionChannel {
       return;
     }
 
-    const active = this.#store.activeForChat(input.tenantKey, input.chatId);
     if (active !== undefined) {
       const event = this.#events.append({
         topicId: active.topicId,

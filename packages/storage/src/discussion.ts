@@ -152,6 +152,14 @@ export class SqliteDiscussionStore {
       );
     }
     database.exec(`
+      UPDATE group_discussions
+      SET evaluated_turn_index = turn_index
+      WHERE state = 'paused'
+        AND turn_index > 0
+        AND turn_index % 3 = 0
+        AND evaluated_turn_index = 0
+    `);
+    database.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS group_discussions_start_message_idx
       ON group_discussions (start_message_id)
       WHERE start_message_id IS NOT NULL

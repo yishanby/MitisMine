@@ -209,6 +209,24 @@ describe("SqliteDiscussionStore", () => {
         '["claude","codex","copilot"]', 3, 4, NULL, NULL, NULL, 'Legacy summary',
         '2026-07-17T01:00:00.000Z', '2026-07-17T01:01:00.000Z'
       );
+      INSERT INTO group_discussions VALUES (
+        'legacy-paused-boundary', 'legacy-topic', 'tenant-1', 'chat-2', 'Paused boundary',
+        'tenant-1:user:owner', 'paused', 2, 3, 'codex',
+        '["codex","copilot","claude"]', 3, 4, NULL, NULL, NULL, NULL,
+        '2026-07-17T02:00:00.000Z', '2026-07-17T02:01:00.000Z'
+      );
+      INSERT INTO group_discussions VALUES (
+        'legacy-paused-mid-round', 'legacy-topic', 'tenant-1', 'chat-3', 'Paused mid-round',
+        'tenant-1:user:owner', 'paused', 1, 2, 'copilot',
+        '["claude","codex","copilot"]', 3, 3, NULL, NULL, NULL, NULL,
+        '2026-07-17T03:00:00.000Z', '2026-07-17T03:01:00.000Z'
+      );
+      INSERT INTO group_discussions VALUES (
+        'legacy-active-boundary', 'legacy-topic', 'tenant-1', 'chat-4', 'Active boundary',
+        'tenant-1:user:owner', 'active', 2, 3, 'codex',
+        '["codex","copilot","claude"]', 3, 4, NULL, NULL, NULL, NULL,
+        '2026-07-17T04:00:00.000Z', '2026-07-17T04:01:00.000Z'
+      );
     `);
     legacy.close();
 
@@ -222,6 +240,9 @@ describe("SqliteDiscussionStore", () => {
       });
       expect(store.discussion("legacy-discussion")).not.toHaveProperty("startMessageId");
       expect(store.discussionForStartMessage("legacy-message")).toBeUndefined();
+      expect(store.discussion("legacy-paused-boundary")?.evaluatedTurnIndex).toBe(3);
+      expect(store.discussion("legacy-paused-mid-round")?.evaluatedTurnIndex).toBe(0);
+      expect(store.discussion("legacy-active-boundary")?.evaluatedTurnIndex).toBe(0);
     } finally {
       store.close();
     }

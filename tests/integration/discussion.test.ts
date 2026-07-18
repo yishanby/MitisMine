@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -435,6 +436,93 @@ describe("DiscussionCoordinator", () => {
       test.discussions.close();
       test.events.close();
       test.outbox.close();
+    }
+  });
+
+  it("migrates a legacy paused boundary so resume enters the next round", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-legacy-boundary-resume-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "discussion.db");
+    const topic = createTopic("Legacy paused Discussion", "tenant-1:user:owner", {
+      id: "legacy-topic",
+    });
+    const seedingEvents = EventStore.open(path);
+    seedingEvents.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    seedingEvents.close();
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      ALTER TABLE group_discussions DROP COLUMN start_message_id;
+      ALTER TABLE group_discussions DROP COLUMN evaluated_turn_index;
+      INSERT INTO group_discussions (
+        id, topic_id, tenant_key, chat_id, question, starter_principal_id,
+        state, round, turn_index, next_provider, round_order_json, max_rounds, version,
+        preferred_provider, control_message_id, active_turn_id, summary_text, created_at, updated_at
+      ) VALUES (
+        'legacy-paused', 'legacy-topic', 'tenant-1', 'chat-1', 'Recover the old pause',
+        'tenant-1:user:owner', 'paused', 2, 3, 'codex',
+        '["codex","copilot","claude"]', 3, 4, NULL, 'legacy-control', NULL, NULL,
+        '2026-07-17T01:00:00.000Z', '2026-07-17T01:03:00.000Z'
+      );
+      INSERT INTO discussion_turns (
+        id, discussion_id, provider, round, turn_index, state, external_session_id,
+        text, continue_discussion, open_questions_json, steer_ids_json, started_at, completed_at
+      ) VALUES
+        ('legacy-turn-0', 'legacy-paused', 'claude', 1, 0, 'completed', 'legacy-claude',
+         'Legacy success', 1, '[]', '[]', '2026-07-17T01:00:00.000Z', '2026-07-17T01:01:00.000Z'),
+        ('legacy-turn-1', 'legacy-paused', 'codex', 1, 1, 'failed', NULL,
+         NULL, NULL, '[]', '[]', '2026-07-17T01:01:00.000Z', '2026-07-17T01:02:00.000Z'),
+        ('legacy-turn-2', 'legacy-paused', 'copilot', 1, 2, 'failed', NULL,
+         NULL, NULL, '[]', '[]', '2026-07-17T01:02:00.000Z', '2026-07-17T01:03:00.000Z');
+    `);
+    legacy.close();
+
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    let turnCalls = 0;
+    const adapter = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
+      if (task.prompt.includes("PHASE: discussion_summary")) {
+        return JSON.stringify({ summary: "Legacy pause recovered" });
+      }
+      turnCalls += 1;
+      return JSON.stringify({
+        message: `${provider} resumed after migration`,
+        continueDiscussion: false,
+        openQuestions: [],
+      });
+    });
+    const coordinator = new DiscussionCoordinator({
+      store: discussions,
+      events,
+      outbox,
+      adapters: {
+        claude: adapter("claude"),
+        codex: adapter("codex"),
+        copilot: adapter("copilot"),
+      },
+      workspaceRoot: directory,
+      idFactory: (() => {
+        let id = 0;
+        return () => `legacy-generated-${++id}`;
+      })(),
+    });
+    const migratedMarker = discussions.discussion("legacy-paused")?.evaluatedTurnIndex;
+    try {
+      await coordinator.control("legacy-paused", "resume", topic.ownerPrincipalId);
+      await coordinator.waitForIdle("legacy-paused");
+
+      expect(turnCalls).toBe(3);
+      expect(migratedMarker).toBe(3);
+      expect(discussions.discussion("legacy-paused")).toMatchObject({
+        state: "completed",
+        turnIndex: 6,
+        evaluatedTurnIndex: 6,
+      });
+    } finally {
+      await coordinator.shutdown();
+      discussions.close();
+      events.close();
+      outbox.close();
     }
   });
 
