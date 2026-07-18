@@ -60,7 +60,7 @@ describe("group discussion state", () => {
       continueDiscussion: true,
     });
     expect(completed.preferredProvider).toBeUndefined();
-    expect(nextDiscussionProvider(completed)).toBe("codex");
+    expect(nextDiscussionProvider(completed)).toBe("claude");
   });
 
   it("summarizes on unanimous convergence or the round limit", () => {

@@ -23,6 +23,7 @@ export interface GroupDiscussion {
   readonly round: number;
   readonly turnIndex: number;
   readonly nextProvider: ProviderName;
+  readonly roundOrder: readonly ProviderName[];
   readonly maxRounds: number;
   readonly version: number;
   readonly preferredProvider?: ProviderName;
@@ -74,7 +75,8 @@ export function createDiscussion(input: CreateDiscussionInput): GroupDiscussion 
     state: "active",
     round: 1,
     turnIndex: 0,
-    nextProvider: providerForTurn(0),
+    nextProvider: "claude",
+    roundOrder: [...roundOrderFor(0)],
     maxRounds,
     version: 0,
     createdAt: now,
@@ -83,7 +85,9 @@ export function createDiscussion(input: CreateDiscussionInput): GroupDiscussion 
 }
 
 export function nextDiscussionProvider(discussion: GroupDiscussion): ProviderName {
-  return discussion.preferredProvider ?? providerForTurn(discussion.turnIndex);
+  return discussion.preferredProvider
+    ?? discussion.roundOrder[discussion.turnIndex % 3]
+    ?? discussion.nextProvider;
 }
 
 export function completeDiscussionTurn(
@@ -98,6 +102,17 @@ export function completeDiscussionTurn(
     throw new Error(`Discussion turn provider mismatch: expected ${expected}`);
   }
   const turnIndex = discussion.turnIndex + 1;
+  const slot = discussion.turnIndex % 3;
+  const currentRoundOrder = discussion.preferredProvider === undefined
+    ? [...discussion.roundOrder]
+    : [
+        ...discussion.roundOrder.slice(0, slot),
+        result.provider,
+        ...discussion.roundOrder.slice(slot).filter((provider) => provider !== result.provider),
+      ];
+  const roundOrder = turnIndex % 3 === 0
+    ? [...roundOrderFor(Math.floor(turnIndex / 3))]
+    : currentRoundOrder;
   const {
     preferredProvider: _preferredProvider,
     activeTurnId: _activeTurnId,
@@ -107,7 +122,8 @@ export function completeDiscussionTurn(
     ...base,
     turnIndex,
     round: Math.min(discussion.maxRounds, Math.floor(turnIndex / 3) + 1),
-    nextProvider: providerForTurn(turnIndex),
+    nextProvider: roundOrder[turnIndex % 3] ?? "claude",
+    roundOrder,
     version: discussion.version + 1,
     updatedAt: result.now ?? new Date().toISOString(),
   };
@@ -149,8 +165,6 @@ export function transitionDiscussion(
   return { ...discussion, state, version: discussion.version + 1, updatedAt: now };
 }
 
-function providerForTurn(turnIndex: number): ProviderName {
-  const order = ROUND_ORDERS[Math.floor(turnIndex / 3) % ROUND_ORDERS.length]
-    ?? ROUND_ORDERS[0];
-  return order?.[turnIndex % 3] ?? "claude";
+function roundOrderFor(roundIndex: number): readonly ProviderName[] {
+  return ROUND_ORDERS[roundIndex % ROUND_ORDERS.length] ?? ROUND_ORDERS[0] ?? DISCUSSION_PROVIDERS;
 }

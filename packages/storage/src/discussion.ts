@@ -77,6 +77,7 @@ interface DiscussionRow {
   round: number;
   turn_index: number;
   next_provider: ProviderName;
+  round_order_json: string;
   max_rounds: number;
   version: number;
   preferred_provider: ProviderName | null;
@@ -155,9 +156,9 @@ export class SqliteDiscussionStore {
       this.#database.prepare(`
         INSERT INTO group_discussions (
           id, topic_id, tenant_key, chat_id, question, starter_principal_id,
-          state, round, turn_index, next_provider, max_rounds, version,
+          state, round, turn_index, next_provider, round_order_json, max_rounds, version,
           preferred_provider, control_message_id, active_turn_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         discussion.id,
         discussion.topicId,
@@ -169,6 +170,7 @@ export class SqliteDiscussionStore {
         discussion.round,
         discussion.turnIndex,
         discussion.nextProvider,
+        JSON.stringify(discussion.roundOrder),
         discussion.maxRounds,
         discussion.version,
         discussion.preferredProvider ?? null,
@@ -208,7 +210,8 @@ export class SqliteDiscussionStore {
       const result = this.#database.prepare(`
         UPDATE group_discussions SET
           topic_id = ?, tenant_key = ?, chat_id = ?, question = ?, starter_principal_id = ?,
-          state = ?, round = ?, turn_index = ?, next_provider = ?, max_rounds = ?, version = ?,
+          state = ?, round = ?, turn_index = ?, next_provider = ?, round_order_json = ?,
+          max_rounds = ?, version = ?,
           preferred_provider = ?, control_message_id = ?, active_turn_id = ?, updated_at = ?
         WHERE id = ?
       `).run(
@@ -221,6 +224,7 @@ export class SqliteDiscussionStore {
         discussion.round,
         discussion.turnIndex,
         discussion.nextProvider,
+        JSON.stringify(discussion.roundOrder),
         discussion.maxRounds,
         discussion.version,
         discussion.preferredProvider ?? null,
@@ -447,7 +451,7 @@ export class SqliteDiscussionStore {
 
 const DISCUSSION_SELECT = `
   SELECT id, topic_id, tenant_key, chat_id, question, starter_principal_id,
-         state, round, turn_index, next_provider, max_rounds, version,
+         state, round, turn_index, next_provider, round_order_json, max_rounds, version,
          preferred_provider, control_message_id, active_turn_id, created_at, updated_at
   FROM group_discussions
 `;
@@ -471,6 +475,7 @@ function mapDiscussion(row: DiscussionRow): GroupDiscussion {
     round: Number(row.round),
     turnIndex: Number(row.turn_index),
     nextProvider: row.next_provider,
+    roundOrder: parseProviderArray(row.round_order_json),
     maxRounds: Number(row.max_rounds),
     version: Number(row.version),
     createdAt: row.created_at,
@@ -521,4 +526,16 @@ function parseStringArray(json: string): string[] {
     throw new Error("Stored Discussion open questions are invalid");
   }
   return value;
+}
+
+function parseProviderArray(json: string): ProviderName[] {
+  const values = parseStringArray(json);
+  if (
+    values.length !== 3
+    || new Set(values).size !== 3
+    || values.some((provider) => provider !== "claude" && provider !== "codex" && provider !== "copilot")
+  ) {
+    throw new Error("Stored Discussion round order is invalid");
+  }
+  return values as ProviderName[];
 }

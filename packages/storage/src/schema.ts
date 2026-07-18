@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS group_discussions (
   round INTEGER NOT NULL,
   turn_index INTEGER NOT NULL,
   next_provider TEXT NOT NULL,
+  round_order_json TEXT NOT NULL DEFAULT '["claude","codex","copilot"]',
   max_rounds INTEGER NOT NULL,
   version INTEGER NOT NULL DEFAULT 0,
   preferred_provider TEXT,

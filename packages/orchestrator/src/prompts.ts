@@ -27,6 +27,53 @@ Question: ${question}
 CONTEXT_PACK: ${contextPack}`;
 }
 
+export interface DiscussionPromptInput {
+  readonly provider: ProviderName;
+  readonly question: string;
+  readonly round: number;
+  readonly transcript: readonly {
+    readonly provider: ProviderName;
+    readonly text: string;
+  }[];
+  readonly pendingSteers: readonly {
+    readonly principalId: string;
+    readonly text: string;
+  }[];
+  readonly sharedContext: readonly string[];
+}
+
+export function discussionTurnPrompt(input: DiscussionPromptInput): string {
+  return `PHASE: discussion_turn
+ROLE: ${input.provider}
+ROUND: ${input.round}
+QUESTION: ${input.question}
+Human steer has priority over the earlier transcript. Respond to the group as yourself.
+Advance the discussion: support, correct, or challenge prior claims and identify concrete risks.
+Return only JSON: {"message":"concise visible group reply","continueDiscussion":true,"openQuestions":["..."]}
+PENDING_STEERS: ${JSON.stringify(input.pendingSteers)}
+PUBLIC_TRANSCRIPT: ${JSON.stringify(input.transcript)}
+SHARED_TOPIC_CONTEXT: ${JSON.stringify(input.sharedContext)}`;
+}
+
+export interface DiscussionSummaryInput {
+  readonly question: string;
+  readonly transcript: readonly {
+    readonly provider: ProviderName;
+    readonly text: string;
+    readonly openQuestions: readonly string[];
+  }[];
+  readonly reachedRoundLimit: boolean;
+}
+
+export function discussionSummaryPrompt(input: DiscussionSummaryInput): string {
+  return `PHASE: discussion_summary
+QUESTION: ${input.question}
+Synthesize the visible roundtable without hiding disagreement.
+Return only JSON: {"summary":"decision-ready group summary with consensus, disagreements, evidence gaps, and next actions"}
+ROUND_LIMIT_REACHED: ${String(input.reachedRoundLimit)}
+PUBLIC_TRANSCRIPT: ${JSON.stringify(input.transcript)}`;
+}
+
 export function repairReportPrompt(raw: string): string {
   return `PHASE: normalize_evidence
 Repair the previous response into the required JSON contract. Do not add unsupported facts.
