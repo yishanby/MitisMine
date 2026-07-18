@@ -50,6 +50,7 @@ export class OutboxDispatcher {
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
     await this.#flushTask;
+    await this.flushOnce();
   }
 
   flushOnce(now?: Date): Promise<void> {

@@ -1,9 +1,8 @@
 # MitisMine completion audit
 
 Audit date: 2026-07-18 (Asia/Shanghai)
-Branch: `feat/multi-agent-feishu-research`
-Audited code revision: `a74ca6d` (`feat: add standalone agent multi-session support`)
-Approval-template hardening revision: `325d305`
+Branch: `feat/visible-group-discussion`
+Audited through revision: `1da4c4d` plus the final visible-discussion hardening in this handoff
 
 The documentation commit follows the audited code revision; the final handoff
 SHA is reported by the agent after commit.
@@ -15,6 +14,7 @@ SHA is reported by the agent after commit.
 | Four Apps identify one user and share a cursor | Config identity-observation tests; startup verifier ordering; Gateway cross-App tests | Four persisted App observations resolve to one union principal; new preflight startup reached ready=200 | Pass |
 | Topic create/switch/restore/share/archive/history | Topic and Feishu integration suites; durable inbox failure injection | Live Topic survived restarts; `/status` and `/report` reload | Pass |
 | Standalone Agent multi-Session | Parser/Gateway/Store/Dispatcher tests cover create/list/use/show/rename/archive, lazy `main`, per-user/provider cursors, start/resume, isolation, serialization, cross-Session concurrency, restart and legacy migration | Updated control plane loaded the live database, migrated all three legacy provider direct Sessions, reached four-App ready=200, and the read-only live audit retained all three external IDs | Pass; fresh command-card interaction remains optional |
+| Visible group Discussion with natural steer | Domain, Gateway, coordinator, card, store, recovery and Outbox suites cover one-active-per-chat, three unique speakers per round, same-card patching, steer consumption, pause/resume/summarize/stop, failed providers, turn-index 3/9 crash boundaries and fenced JSON | Real group `MitisMine Visible Discussion Live Smoke 2026-07-18`: Hub created and patched one control card; Claude spoke; Codex exposed its provider error without stopping the round; Copilot spoke after absorbing steer; pause/resume and immediate summary completed; Hub posted a decision-ready final summary | Pass; Codex content generation awaits CLI reauthentication, while failure isolation is verified |
 | Owner/editor/viewer enforcement | `canReadTopic`/`canEditTopic`; viewer command matrix | Viewer rules reflected in deployed command path | Pass |
 | Three CLIs and Topic sessions | Adapter contracts; cross-Run/restart Topic-session tests | Recorded Claude/Codex/Copilot research and direct session IDs persisted | Pass; current Codex login needs renewal for a fresh quota smoke |
 | Context reaches every agent | Context Pack unit test; real Gateway→ChannelDispatcher note/watermark test | Historical Topic/Run remains queryable | Pass |
@@ -27,16 +27,16 @@ SHA is reported by the agent after commit.
 | Privileged work waits for approval | Approval/Gateway tests, orphaned-executing recovery test | Target absent before click; double click preserved one write/mtime | Pass |
 | `/stop` cancels real work | Abort propagation, stale-save guard, process-tree/grandchild test, lease requeue test | Not used on the evidence Run | Pass (automated) |
 | Secrets do not reach Git/logs/children | Synthetic secret isolation; redaction; least-privilege adapter contracts; tracked-value scan | `.env.local` ignored/untracked; no Secret in live report | Pass |
-| Health, safe shutdown, delivery replay | Readiness, all-hook cleanup, startup unwind, pending-call cancel/drain, Outbox stable UUID, active-flush drain, periodic lease recovery tests | New preflight startup: HTTP 200, 4 Apps, 1 Worker | Pass |
-| Deterministic and live verification | 158 deterministic tests pass; 3 live tests opt-in | `pnpm smoke:live` returned `ok:true` after the multi-Session migration | Pass, with Codex reauthentication noted below |
+| Health, safe shutdown, delivery replay | Readiness, all-hook cleanup, startup unwind, pending-call cancel/drain, Outbox stable UUID, active-flush plus newly-queued-output drain, periodic lease recovery tests | Final service PID `41672`: HTTP 200, 4 Apps, 1 Worker | Pass |
+| Deterministic and live verification | 207 deterministic tests pass; 3 live tests opt-in | Prior `pnpm smoke:live` returned `ok:true`; fresh visible-group browser acceptance reached `completed` with the same control message ID | Pass, with Codex reauthentication noted below |
 
 ## Verification snapshot
 
 Fresh deterministic run on 2026-07-18:
 
 ```text
-Test Files  15 passed | 1 skipped (16)
-Tests       158 passed | 3 skipped (161)
+Test Files  22 passed | 1 skipped (23)
+Tests       207 passed | 3 skipped (210)
 ```
 
 The three skipped cases are the explicit `MITISMINE_LIVE_CLI=1` suite. During
@@ -51,6 +51,8 @@ The recorded four-App audit after identity preflight returned:
 ready=200 apps=4 workers=1
 ok=true state=completed round=3 reviews=18 crossReviews=18
 claims=4 evidence=5 importantCoverage=2/2 approval=completed
+discussion=01KXSCB2AX0GSY6YNT98S8GN61 state=completed turns=3
+control_message=om_x100b6a996bdb50a8def36113e8c89be
 ```
 
 ## Requirement-to-component map

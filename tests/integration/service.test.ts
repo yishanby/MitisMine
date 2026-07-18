@@ -1146,6 +1146,59 @@ describe("OutboxDispatcher", () => {
     }
   });
 
+  it("flushes output queued while an in-flight send is draining", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-outbox-drain-"));
+    temporaryDirectories.push(directory);
+    const outbox = DurableOutbox.open(join(directory, "outbox.db"));
+    outbox.enqueue({
+      id: "first",
+      appRole: "hub",
+      receiveId: "chat",
+      payload: { text: "first" },
+      idempotencyKey: "drain-first",
+    });
+    let firstStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+    let releaseFirst: (() => void) | undefined;
+    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const sent: string[] = [];
+    const dispatcher = new OutboxDispatcher({
+      outbox,
+      pollIntervalMs: 60_000,
+      sender: {
+        send: async (message) => {
+          sent.push(message.id);
+          if (message.id === "first") {
+            firstStarted?.();
+            await release;
+          }
+        },
+      },
+    });
+    try {
+      dispatcher.start();
+      await started;
+      outbox.enqueue({
+        id: "second",
+        appRole: "hub",
+        receiveId: "chat",
+        payload: { text: "second" },
+        idempotencyKey: "drain-second",
+      });
+
+      const stopping = dispatcher.stop();
+      releaseFirst?.();
+      await stopping;
+
+      expect(sent).toEqual(["first", "second"]);
+      expect(outbox.pending()).toEqual([]);
+    } finally {
+      releaseFirst?.();
+      await dispatcher.stop();
+      outbox.close();
+    }
+  });
+
   it("marks successful sends and schedules failed sends for retry", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-outbox-"));
     temporaryDirectories.push(directory);

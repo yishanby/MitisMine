@@ -63,6 +63,43 @@ describe("group discussion state", () => {
     expect(nextDiscussionProvider(completed)).toBe("claude");
   });
 
+  it("defers a preference for an Agent that already spoke until the next round", () => {
+    let discussion = createDiscussion({
+      id: "discussion-1",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Question",
+      starterPrincipalId: "tenant-1:user:owner",
+    });
+    discussion = completeDiscussionTurn(discussion, {
+      provider: "claude",
+      continueDiscussion: true,
+    });
+    discussion = { ...discussion, preferredProvider: "claude" };
+
+    expect(nextDiscussionProvider(discussion)).toBe("codex");
+    discussion = {
+      ...completeDiscussionTurn(discussion, {
+        provider: "codex",
+        continueDiscussion: true,
+      }),
+      preferredProvider: "claude",
+    };
+    expect(nextDiscussionProvider(discussion)).toBe("copilot");
+    discussion = {
+      ...completeDiscussionTurn(discussion, {
+        provider: "copilot",
+        continueDiscussion: true,
+      }),
+      preferredProvider: "claude",
+    };
+
+    expect(discussion.roundOrder).toHaveLength(3);
+    expect(new Set(discussion.roundOrder).size).toBe(3);
+    expect(nextDiscussionProvider(discussion)).toBe("claude");
+  });
+
   it("summarizes on unanimous convergence or the round limit", () => {
     expect(shouldSummarize([false, false, false], 1, 3)).toBe(true);
     expect(shouldSummarize([false, true, false], 1, 3)).toBe(false);

@@ -76,6 +76,13 @@ interface DiscussionAgentOutput {
   readonly openQuestions: readonly string[];
 }
 
+class DiscussionInterruption extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DiscussionInterruption";
+  }
+}
+
 export class DiscussionCoordinator {
   readonly #store: SqliteDiscussionStore;
   readonly #events: EventStore;
@@ -116,7 +123,8 @@ export class DiscussionCoordinator {
   }
 
   kick(discussionId: string): void {
-    void this.run(discussionId).catch(async (error: unknown) => {
+    const recovery = this.run(discussionId).catch(async (error: unknown) => {
+      if (error instanceof DiscussionInterruption) return;
       this.#onError(discussionId, error);
       try {
         for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -130,6 +138,10 @@ export class DiscussionCoordinator {
         this.#onError(discussionId, recoveryError);
       }
     });
+    const tracked = recovery.finally(() => {
+      if (this.#loops.get(discussionId) === tracked) this.#loops.delete(discussionId);
+    });
+    this.#loops.set(discussionId, tracked);
   }
 
   async waitForIdle(discussionId: string): Promise<void> {
@@ -185,9 +197,11 @@ export class DiscussionCoordinator {
       idempotencyKey: `discussion:${discussionId}:control:${updated.version}:${action}`,
     });
     if (action === "pause" || action === "stop" || action === "summarize") {
-      this.#controllers.get(discussionId)?.abort(new Error(`Discussion ${action} requested`));
+      this.#controllers.get(discussionId)?.abort(
+        new DiscussionInterruption(`Discussion ${action} requested`),
+      );
     }
-    if (action === "summarize") await activeLoop?.catch(() => {});
+    if (action === "resume" || action === "summarize") await activeLoop?.catch(() => {});
     await this.refreshControl(discussionId);
     if (action === "resume" || action === "summarize") this.kick(discussionId);
   }
@@ -238,7 +252,7 @@ export class DiscussionCoordinator {
   async shutdown(): Promise<void> {
     this.#shuttingDown = true;
     for (const controller of this.#controllers.values()) {
-      controller.abort(new Error("Discussion coordinator is shutting down"));
+      controller.abort(new DiscussionInterruption("Discussion coordinator is shutting down"));
     }
     await Promise.allSettled(this.#loops.values());
   }
@@ -250,6 +264,10 @@ export class DiscussionCoordinator {
       this.#repairSummaryEffect(discussion);
       await this.refreshControl(discussionId);
       if (discussion.state === "active") {
+        if (discussion.turnIndex > 0 && discussion.turnIndex % 3 === 0) {
+          await this.#afterTurn(discussion);
+          if (this.#requireDiscussion(discussionId).state !== "active") continue;
+        }
         if (await this.#reconcileCompletedTurn(discussion)) continue;
         await this.#executeTurn(discussion);
         continue;
@@ -325,7 +343,7 @@ export class DiscussionCoordinator {
       if (this.#controllers.get(discussion.id) === controller) {
         this.#controllers.delete(discussion.id);
       }
-      throw error;
+      throw interruptionReason(controller.signal, error);
     }
     try {
       const session = this.#events.agentSession(
@@ -512,7 +530,7 @@ export class DiscussionCoordinator {
           summary = parseDiscussionSummary(raw);
           break;
         } catch (error) {
-          if (controller.signal.aborted) throw error;
+          if (controller.signal.aborted) throw interruptionReason(controller.signal, error);
           failures.push(`${providerLabel(provider)}: ${errorMessage(error)}`);
         }
       }
@@ -775,7 +793,7 @@ export class GroupDiscussionChannel {
 
 export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
   try {
-    const value = asRecord(JSON.parse(raw) as unknown);
+    const value = asRecord(JSON.parse(unwrapJsonFence(raw)) as unknown);
     if (
       typeof value.message !== "string"
       || !value.message.trim()
@@ -799,7 +817,7 @@ export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
 
 function parseDiscussionSummary(raw: string): string {
   try {
-    const value = asRecord(JSON.parse(raw) as unknown);
+    const value = asRecord(JSON.parse(unwrapJsonFence(raw)) as unknown);
     if (typeof value.summary === "string" && value.summary.trim()) return value.summary.trim();
   } catch {
     // Fall back to the provider's visible text.
@@ -807,6 +825,15 @@ function parseDiscussionSummary(raw: string): string {
   const summary = raw.trim();
   if (!summary) throw new Error("Discussion summary is empty");
   return summary;
+}
+
+function unwrapJsonFence(raw: string): string {
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(raw.trim());
+  return fenced?.[1] ?? raw;
+}
+
+function interruptionReason(signal: AbortSignal, fallback: unknown): unknown {
+  return signal.reason instanceof DiscussionInterruption ? signal.reason : fallback;
 }
 
 function finalText(events: readonly { readonly type: string; readonly [key: string]: unknown }[]): string {

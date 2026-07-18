@@ -86,8 +86,14 @@ export function createDiscussion(input: CreateDiscussionInput): GroupDiscussion 
 }
 
 export function nextDiscussionProvider(discussion: GroupDiscussion): ProviderName {
-  return discussion.preferredProvider
-    ?? discussion.roundOrder[discussion.turnIndex % 3]
+  const slot = discussion.turnIndex % DISCUSSION_PROVIDERS.length;
+  const alreadySpoken = discussion.roundOrder.slice(0, slot);
+  const eligiblePreference = discussion.preferredProvider !== undefined
+      && !alreadySpoken.includes(discussion.preferredProvider)
+    ? discussion.preferredProvider
+    : undefined;
+  return eligiblePreference
+    ?? discussion.roundOrder[slot]
     ?? discussion.nextProvider;
 }
 
@@ -106,11 +112,11 @@ export function completeDiscussionTurn(
   const slot = discussion.turnIndex % 3;
   const currentRoundOrder = discussion.preferredProvider === undefined
     ? [...discussion.roundOrder]
-    : [
+    : [...new Set([
         ...discussion.roundOrder.slice(0, slot),
         result.provider,
-        ...discussion.roundOrder.slice(slot).filter((provider) => provider !== result.provider),
-      ];
+        ...discussion.roundOrder,
+      ])];
   const roundOrder = turnIndex % 3 === 0
     ? [...roundOrderFor(Math.floor(turnIndex / 3))]
     : currentRoundOrder;

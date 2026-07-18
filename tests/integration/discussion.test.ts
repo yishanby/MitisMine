@@ -11,7 +11,12 @@ import type {
   ProviderName,
   ResumeAgentTask,
 } from "../../packages/agent-adapters/src/index.js";
-import { createDiscussion } from "../../packages/domain/src/discussion.js";
+import {
+  completeDiscussionTurn,
+  createDiscussion,
+  nextDiscussionProvider,
+  type GroupDiscussion,
+} from "../../packages/domain/src/discussion.js";
 import { createTopic } from "../../packages/domain/src/topic.js";
 import { DiscussionCoordinator } from "../../packages/orchestrator/src/discussion.js";
 import { parseDiscussionAgentOutput } from "../../packages/orchestrator/src/discussion.js";
@@ -27,7 +32,10 @@ afterEach(() => {
   }
 });
 
-function harness(adapters: AdapterRegistry) {
+function harness(
+  adapters: AdapterRegistry,
+  onError?: (discussionId: string, error: unknown) => void,
+) {
   const directory = mkdtempSync(join(tmpdir(), "mitismine-discussion-"));
   temporaryDirectories.push(directory);
   const path = join(directory, "discussion.db");
@@ -57,6 +65,7 @@ function harness(adapters: AdapterRegistry) {
     adapters,
     workspaceRoot: directory,
     idFactory: () => `generated-${++nextId}`,
+    ...(onError === undefined ? {} : { onError }),
   });
   return { directory, events, discussions, outbox, topic, discussion, coordinator };
 }
@@ -434,6 +443,117 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("re-evaluates an unevaluated failed round boundary after a crash", async () => {
+    let calls = 0;
+    const counting = (provider: ProviderName) => deterministicAdapter(provider, [], async () => {
+      calls += 1;
+      return JSON.stringify({ message: "must not run", continueDiscussion: true, openQuestions: [] });
+    });
+    const test = harness({
+      claude: counting("claude"),
+      codex: counting("codex"),
+      copilot: counting("copilot"),
+    });
+    try {
+      let discussion: GroupDiscussion = test.discussion;
+      for (let index = 0; index < 3; index += 1) {
+        const provider = nextDiscussionProvider(discussion);
+        const turnId = `crashed-round-turn-${index}`;
+        test.discussions.claimTurn({
+          id: turnId,
+          discussionId: discussion.id,
+          provider,
+          round: discussion.round,
+          turnIndex: discussion.turnIndex,
+        });
+        if (index === 0) {
+          test.discussions.completeTurn({
+            id: turnId,
+            externalSessionId: `${provider}-external`,
+            text: `${provider} completed`,
+            continueDiscussion: true,
+            openQuestions: [],
+          });
+        } else {
+          test.discussions.failTurn(turnId, "failed");
+        }
+        discussion = completeDiscussionTurn(discussion, {
+          provider,
+          continueDiscussion: true,
+        });
+      }
+      test.discussions.saveDiscussion(discussion);
+
+      await test.coordinator.run(test.discussion.id);
+
+      expect(calls).toBe(0);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "paused",
+        turnIndex: 3,
+      });
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("re-evaluates the round limit at turn nine after a crash", async () => {
+    let turnCalls = 0;
+    const adapter = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
+      if (!task.prompt.includes("PHASE: discussion_summary")) turnCalls += 1;
+      return task.prompt.includes("PHASE: discussion_summary")
+        ? JSON.stringify({ summary: "Recovered round-limit summary" })
+        : JSON.stringify({ message: "must not run", continueDiscussion: true, openQuestions: [] });
+    });
+    const test = harness({
+      claude: adapter("claude"),
+      codex: adapter("codex"),
+      copilot: adapter("copilot"),
+    });
+    try {
+      let discussion: GroupDiscussion = test.discussion;
+      for (let index = 0; index < 9; index += 1) {
+        const provider = nextDiscussionProvider(discussion);
+        const turnId = `crashed-limit-turn-${index}`;
+        test.discussions.claimTurn({
+          id: turnId,
+          discussionId: discussion.id,
+          provider,
+          round: discussion.round,
+          turnIndex: discussion.turnIndex,
+        });
+        test.discussions.completeTurn({
+          id: turnId,
+          externalSessionId: `${provider}-external`,
+          text: `${provider} completed`,
+          continueDiscussion: true,
+          openQuestions: [],
+        });
+        discussion = completeDiscussionTurn(discussion, {
+          provider,
+          continueDiscussion: true,
+        });
+      }
+      test.discussions.saveDiscussion(discussion);
+
+      await test.coordinator.run(test.discussion.id);
+
+      expect(turnCalls).toBe(0);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        turnIndex: 9,
+        summaryText: "Recovered round-limit summary",
+      });
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
   it("falls back to visible text when an Agent does not return JSON", () => {
     expect(parseDiscussionAgentOutput("A plain but useful response")).toEqual({
       message: "A plain but useful response",
@@ -442,7 +562,17 @@ describe("DiscussionCoordinator", () => {
     });
   });
 
-  it("cancels an active turn on pause and resumes the same speaker slot", async () => {
+  it("parses an Agent contract wrapped in a JSON markdown fence", () => {
+    expect(parseDiscussionAgentOutput(`\`\`\`json
+{"message":"Structured response","continueDiscussion":false,"openQuestions":["One risk"]}
+\`\`\``)).toEqual({
+      message: "Structured response",
+      continueDiscussion: false,
+      openQuestions: ["One risk"],
+    });
+  });
+
+  it("cancels an active turn and resumes immediately in the same speaker slot", async () => {
     let first = true;
     let started: (() => void) | undefined;
     const firstStarted = new Promise<void>((resolve) => { started = resolve; });
@@ -474,6 +604,7 @@ describe("DiscussionCoordinator", () => {
       copilot: deterministicAdapter("copilot"),
     });
     const running = test.coordinator.run(test.discussion.id);
+    const firstLoopSettled = running.catch(() => {});
     try {
       await firstStarted;
       await test.coordinator.control(
@@ -481,17 +612,14 @@ describe("DiscussionCoordinator", () => {
         "pause",
         "tenant-1:user:member",
       );
-      await running.catch(() => {});
       expect(test.discussions.discussion(test.discussion.id)?.state).toBe("paused");
-      expect(test.discussions.turns(test.discussion.id)).toEqual([
-        expect.objectContaining({ provider: "claude", turnIndex: 0, state: "cancelled" }),
-      ]);
 
       await test.coordinator.control(
         test.discussion.id,
         "resume",
         "tenant-1:user:member",
       );
+      await firstLoopSettled;
       await test.coordinator.waitForIdle(test.discussion.id);
       expect(test.discussions.discussion(test.discussion.id)?.state).toBe("completed");
       expect(test.discussions.turns(test.discussion.id).map((turn) => [turn.provider, turn.state]))
@@ -508,7 +636,7 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
-  it("cancels an active turn and summarizes immediately without advancing speakers", async () => {
+  it("keeps summarize state when a kicked active turn is cancelled", async () => {
     let started: (() => void) | undefined;
     const firstStarted = new Promise<void>((resolve) => { started = resolve; });
     let first = true;
@@ -532,12 +660,13 @@ describe("DiscussionCoordinator", () => {
       },
       resume: async () => { throw new Error("unexpected resume"); },
     };
+    const errors: unknown[] = [];
     const test = harness({
       claude,
       codex: deterministicAdapter("codex", [], async () => { throw new Error("Codex must not run"); }),
       copilot: deterministicAdapter("copilot", [], async () => { throw new Error("Copilot must not run"); }),
-    });
-    const running = test.coordinator.run(test.discussion.id);
+    }, (_discussionId, error) => { errors.push(error); });
+    test.coordinator.kick(test.discussion.id);
     try {
       await firstStarted;
       await test.coordinator.control(
@@ -545,7 +674,6 @@ describe("DiscussionCoordinator", () => {
         "summarize",
         "tenant-1:user:member",
       );
-      await running.catch(() => {});
       await test.coordinator.waitForIdle(test.discussion.id);
 
       expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
@@ -558,6 +686,68 @@ describe("DiscussionCoordinator", () => {
       ]);
       expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
         .toContain("Immediate summary");
+      expect(errors).toEqual([]);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("pauses a kicked Discussion after an unexpected summarizing failure", async () => {
+    const errors: unknown[] = [];
+    const test = harness({
+      claude: deterministicAdapter("claude"),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    }, (_discussionId, error) => { errors.push(error); });
+    const originalTurns = test.discussions.turns.bind(test.discussions);
+    let summarizingReads = 0;
+    test.discussions.turns = (discussionId: string) => {
+      if (test.discussions.discussion(discussionId)?.state === "summarizing") {
+        summarizingReads += 1;
+        if (summarizingReads === 2) throw new Error("unexpected summary storage failure");
+      }
+      return originalTurns(discussionId);
+    };
+    try {
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:member");
+      await test.coordinator.waitForIdle(test.discussion.id);
+
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("paused");
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toEqual(expect.objectContaining({
+        message: "unexpected summary storage failure",
+      }));
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("extracts a final summary wrapped in a JSON markdown fence", async () => {
+    const fencedSummary = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
+      expect(task.prompt).toContain("PHASE: discussion_summary");
+      return `\`\`\`json\n{"summary":"Fenced final summary"}\n\`\`\``;
+    });
+    const test = harness({
+      claude: fencedSummary("claude"),
+      codex: fencedSummary("codex"),
+      copilot: fencedSummary("copilot"),
+    });
+    try {
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:member");
+      await test.coordinator.waitForIdle(test.discussion.id);
+
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        summaryText: "Fenced final summary",
+      });
+      expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
+        .not.toContain("```json");
     } finally {
       await test.coordinator.shutdown();
       test.discussions.close();
