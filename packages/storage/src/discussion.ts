@@ -78,6 +78,7 @@ interface DiscussionRow {
   turn_index: number;
   next_provider: ProviderName;
   max_rounds: number;
+  version: number;
   preferred_provider: ProviderName | null;
   control_message_id: string | null;
   active_turn_id: string | null;
@@ -154,9 +155,9 @@ export class SqliteDiscussionStore {
       this.#database.prepare(`
         INSERT INTO group_discussions (
           id, topic_id, tenant_key, chat_id, question, starter_principal_id,
-          state, round, turn_index, next_provider, max_rounds,
+          state, round, turn_index, next_provider, max_rounds, version,
           preferred_provider, control_message_id, active_turn_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         discussion.id,
         discussion.topicId,
@@ -169,6 +170,7 @@ export class SqliteDiscussionStore {
         discussion.turnIndex,
         discussion.nextProvider,
         discussion.maxRounds,
+        discussion.version,
         discussion.preferredProvider ?? null,
         discussion.controlMessageId ?? null,
         discussion.activeTurnId ?? null,
@@ -206,7 +208,7 @@ export class SqliteDiscussionStore {
       const result = this.#database.prepare(`
         UPDATE group_discussions SET
           topic_id = ?, tenant_key = ?, chat_id = ?, question = ?, starter_principal_id = ?,
-          state = ?, round = ?, turn_index = ?, next_provider = ?, max_rounds = ?,
+          state = ?, round = ?, turn_index = ?, next_provider = ?, max_rounds = ?, version = ?,
           preferred_provider = ?, control_message_id = ?, active_turn_id = ?, updated_at = ?
         WHERE id = ?
       `).run(
@@ -220,6 +222,7 @@ export class SqliteDiscussionStore {
         discussion.turnIndex,
         discussion.nextProvider,
         discussion.maxRounds,
+        discussion.version,
         discussion.preferredProvider ?? null,
         discussion.controlMessageId ?? null,
         discussion.activeTurnId ?? null,
@@ -258,7 +261,7 @@ export class SqliteDiscussionStore {
             UPDATE discussion_steers SET preferred_provider = ? WHERE id = ?
           `).run(input.preferredProvider, existing.id);
           this.#database.prepare(`
-            UPDATE group_discussions SET preferred_provider = ?, updated_at = ?
+            UPDATE group_discussions SET preferred_provider = ?, version = version + 1, updated_at = ?
             WHERE id = ? AND state IN ('active', 'paused')
           `).run(input.preferredProvider, createdAt, existing.discussion_id);
         }
@@ -283,7 +286,7 @@ export class SqliteDiscussionStore {
       );
       if (input.preferredProvider !== undefined) {
         this.#database.prepare(`
-          UPDATE group_discussions SET preferred_provider = ?, updated_at = ?
+          UPDATE group_discussions SET preferred_provider = ?, version = version + 1, updated_at = ?
           WHERE id = ? AND state IN ('active', 'paused')
         `).run(input.preferredProvider, createdAt, input.discussionId);
       }
@@ -444,7 +447,7 @@ export class SqliteDiscussionStore {
 
 const DISCUSSION_SELECT = `
   SELECT id, topic_id, tenant_key, chat_id, question, starter_principal_id,
-         state, round, turn_index, next_provider, max_rounds,
+         state, round, turn_index, next_provider, max_rounds, version,
          preferred_provider, control_message_id, active_turn_id, created_at, updated_at
   FROM group_discussions
 `;
@@ -469,6 +472,7 @@ function mapDiscussion(row: DiscussionRow): GroupDiscussion {
     turnIndex: Number(row.turn_index),
     nextProvider: row.next_provider,
     maxRounds: Number(row.max_rounds),
+    version: Number(row.version),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...(row.preferred_provider === null ? {} : { preferredProvider: row.preferred_provider }),

@@ -24,6 +24,7 @@ export interface GroupDiscussion {
   readonly turnIndex: number;
   readonly nextProvider: ProviderName;
   readonly maxRounds: number;
+  readonly version: number;
   readonly preferredProvider?: ProviderName;
   readonly controlMessageId?: string;
   readonly activeTurnId?: string;
@@ -75,6 +76,7 @@ export function createDiscussion(input: CreateDiscussionInput): GroupDiscussion 
     turnIndex: 0,
     nextProvider: providerForTurn(0),
     maxRounds,
+    version: 0,
     createdAt: now,
     updatedAt: now,
   };
@@ -106,6 +108,7 @@ export function completeDiscussionTurn(
     turnIndex,
     round: Math.min(discussion.maxRounds, Math.floor(turnIndex / 3) + 1),
     nextProvider: providerForTurn(turnIndex),
+    version: discussion.version + 1,
     updatedAt: result.now ?? new Date().toISOString(),
   };
 }
@@ -143,7 +146,7 @@ export function transitionDiscussion(
       : action === "summarize"
         ? "summarizing"
         : "stopped";
-  return { ...discussion, state, updatedAt: now };
+  return { ...discussion, state, version: discussion.version + 1, updatedAt: now };
 }
 
 function providerForTurn(turnIndex: number): ProviderName {

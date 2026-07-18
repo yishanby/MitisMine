@@ -38,6 +38,7 @@ describe("group discussion state", () => {
     ]);
     expect(discussion.turnIndex).toBe(9);
     expect(discussion.round).toBe(3);
+    expect(discussion.version).toBe(9);
   });
 
   it("uses a steer preference for the next turn and then returns to rotation", () => {
@@ -80,6 +81,7 @@ describe("group discussion state", () => {
     });
     const paused = transitionDiscussion(active, "pause");
     expect(paused.state).toBe("paused");
+    expect(paused.version).toBe(active.version + 1);
     expect(transitionDiscussion(paused, "resume").state).toBe("active");
     expect(transitionDiscussion(paused, "summarize").state).toBe("summarizing");
     expect(transitionDiscussion(active, "stop").state).toBe("stopped");
