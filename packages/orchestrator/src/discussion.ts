@@ -712,6 +712,12 @@ export class GroupDiscussionChannel {
     const priorStart = this.#store.discussionForStartMessage(input.messageId);
     if (priorStart !== undefined) {
       if (priorStart.tenantKey !== input.tenantKey || priorStart.chatId !== input.chatId) return;
+      if (
+        priorStart.starterPrincipalId !== input.principalId
+        || priorStart.question !== input.text
+      ) {
+        throw new Error("Inconsistent Discussion start replay");
+      }
       if (input.sourceAppRole !== "hub" && active?.id !== priorStart.id) return;
       await this.#finishStart(input, priorStart);
       return;
@@ -725,6 +731,9 @@ export class GroupDiscussionChannel {
         || receiptDiscussion.tenantKey !== input.tenantKey
         || receiptDiscussion.chatId !== input.chatId
       ) return;
+      if (priorReceipt.principalId !== input.principalId || priorReceipt.text !== input.text) {
+        throw new Error("Inconsistent Discussion steer replay");
+      }
       if (input.sourceAppRole !== "hub" && active?.id !== priorReceipt.discussionId) return;
       this.#store.recordSteer({
         id: priorReceipt.id,
@@ -749,6 +758,7 @@ export class GroupDiscussionChannel {
         actorPrincipalId: input.principalId,
         payload: {
           discussionId: active.id,
+          principalId: input.principalId,
           tenantKey: input.tenantKey,
           chatId: input.chatId,
           messageId: input.messageId,
@@ -798,6 +808,8 @@ export class GroupDiscussionChannel {
         actorPrincipalId: input.principalId,
         payload: {
           topic,
+          principalId: input.principalId,
+          question: input.text,
           tenantKey: input.tenantKey,
           chatId: input.chatId,
           messageId: input.messageId,
@@ -831,6 +843,12 @@ export class GroupDiscussionChannel {
     const priorReceipt = this.#store.steerForMessage(input.messageId);
     let topicEventSeq: number;
     if (priorReceipt?.discussionId === discussion.id) {
+      if (
+        priorReceipt.principalId !== discussion.starterPrincipalId
+        || priorReceipt.text !== discussion.question
+      ) {
+        throw new Error("Inconsistent Discussion start receipt");
+      }
       topicEventSeq = priorReceipt.topicEventSeq;
     } else {
       const started = this.#events.append({
@@ -839,6 +857,7 @@ export class GroupDiscussionChannel {
         actorPrincipalId: discussion.starterPrincipalId,
         payload: {
           discussionId: discussion.id,
+          starterPrincipalId: discussion.starterPrincipalId,
           tenantKey: discussion.tenantKey,
           chatId: discussion.chatId,
           messageId: input.messageId,
@@ -1003,7 +1022,12 @@ function assertTopicCreatedEvent(
   if (
     event.type !== "topic.created"
     || topic?.id !== event.topicId
+    || event.actorPrincipalId !== input.principalId
+    || topic.ownerPrincipalId !== input.principalId
     || topic.tenantKey !== input.tenantKey
+    || topic.title !== summarizeQuestion(input.text)
+    || payload?.principalId !== input.principalId
+    || payload.question !== input.text
     || payload?.tenantKey !== input.tenantKey
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId
@@ -1021,10 +1045,14 @@ function assertDiscussionStartedEvent(
   if (
     event.type !== "discussion.started"
     || event.topicId !== discussion.topicId
+    || event.actorPrincipalId !== discussion.starterPrincipalId
     || discussion.tenantKey !== input.tenantKey
     || discussion.chatId !== input.chatId
     || discussion.startMessageId !== input.messageId
+    || discussion.starterPrincipalId !== input.principalId
+    || discussion.question !== input.text
     || payload?.discussionId !== discussion.id
+    || payload.starterPrincipalId !== discussion.starterPrincipalId
     || payload.tenantKey !== input.tenantKey
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId
@@ -1043,10 +1071,12 @@ function assertDiscussionSteerAddedEvent(
   if (
     event.type !== "discussion.steer.added"
     || event.topicId !== discussion.topicId
+    || event.actorPrincipalId !== input.principalId
     || !["active", "paused", "summarizing"].includes(discussion.state)
     || discussion.tenantKey !== input.tenantKey
     || discussion.chatId !== input.chatId
     || payload?.discussionId !== discussion.id
+    || payload.principalId !== input.principalId
     || payload.tenantKey !== input.tenantKey
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId

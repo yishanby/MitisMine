@@ -65,8 +65,10 @@ describe("GroupDiscussionChannel", () => {
         id: "generated-2",
         topicId,
         question: "Choose the architecture",
+        starterPrincipalId: "tenant-1:user:owner",
         state: "active",
       });
+      expect(events.topic(topicId ?? "")?.ownerPrincipalId).toBe(active?.starterPrincipalId);
       expect(discussions.pendingSteers(active?.id ?? "")).toEqual([]);
 
       await channel.receive({
@@ -104,16 +106,30 @@ describe("GroupDiscussionChannel", () => {
       expect(discussions.pendingSteers(active?.id ?? "")).toEqual([
         expect.objectContaining({
           messageId: "message-steer",
+          principalId: "tenant-1:user:member",
           text: "Prioritize migration cost",
           preferredProvider: "claude",
           status: "pending",
         }),
       ]);
-      expect(events.events(topicId ?? "").map((event) => event.type)).toEqual([
+      const topicEvents = events.events(topicId ?? "");
+      expect(topicEvents.map((event) => event.type)).toEqual([
         "topic.created",
         "discussion.started",
         "discussion.steer.added",
       ]);
+      expect(topicEvents[0]?.payload).toMatchObject({
+        principalId: "tenant-1:user:owner",
+        question: "Choose the architecture",
+      });
+      expect(topicEvents[1]?.payload).toMatchObject({
+        starterPrincipalId: "tenant-1:user:owner",
+        question: "Choose the architecture",
+      });
+      expect(topicEvents[2]?.payload).toMatchObject({
+        principalId: "tenant-1:user:member",
+        text: "Prioritize migration cost",
+      });
       expect(refreshed).toEqual([active?.id, active?.id, active?.id, active?.id]);
       expect(kicked).toEqual([active?.id, active?.id, active?.id, active?.id]);
     } finally {
@@ -145,6 +161,8 @@ describe("GroupDiscussionChannel", () => {
       actorPrincipalId: topic.ownerPrincipalId,
       payload: {
         topic,
+        principalId: topic.ownerPrincipalId,
+        question: "Choose the architecture",
         tenantKey: "tenant-1",
         chatId: "chat-1",
         messageId,
@@ -176,6 +194,7 @@ describe("GroupDiscussionChannel", () => {
         actorPrincipalId: topic.ownerPrincipalId,
         payload: {
           discussionId: "discussion-from-start-message",
+          starterPrincipalId: topic.ownerPrincipalId,
           tenantKey: "tenant-1",
           chatId: "chat-1",
           messageId,
@@ -449,6 +468,8 @@ describe("GroupDiscussionChannel", () => {
       actorPrincipalId: topic.ownerPrincipalId,
       payload: {
         topic,
+        principalId: topic.ownerPrincipalId,
+        question: topic.title,
         tenantKey: "tenant-1",
         chatId: "chat-1",
         messageId,
@@ -473,9 +494,25 @@ describe("GroupDiscussionChannel", () => {
         sourceAppRole: "hub",
         idempotencyKey: "hub-scoped-topic",
       });
+      await channel.receive({
+        tenantKey: "tenant-1",
+        principalId: topic.ownerPrincipalId,
+        chatId: "chat-1",
+        messageId,
+        text: "Scoped Topic",
+        sourceAppRole: "codex",
+        preferredProvider: "codex",
+        idempotencyKey: "codex-scoped-topic",
+      });
 
       expect(discussions.chatTopic("tenant-1", "chat-1")).toBe(topic.id);
-      expect(discussions.activeForChat("tenant-1", "chat-1")?.topicId).toBe(topic.id);
+      expect(discussions.activeForChat("tenant-1", "chat-1")).toMatchObject({
+        topicId: topic.id,
+        starterPrincipalId: topic.ownerPrincipalId,
+        question: "Scoped Topic",
+        preferredProvider: "codex",
+      });
+      expect(events.topic(topic.id)?.ownerPrincipalId).toBe(topic.ownerPrincipalId);
       expect(events.events(topic.id).map(({ type }) => type)).toEqual([
         "topic.created",
         "discussion.started",
@@ -485,6 +522,76 @@ describe("GroupDiscussionChannel", () => {
       events.close();
     }
   });
+
+  it.each(["principal", "question"] as const)(
+    "rejects a same-scope %s conflict at the topic-created boundary",
+    async (mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-topic-author-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const principalId = "tenant-1:user:original";
+      const sharedPrefix = "Q".repeat(59);
+      const question = mismatch === "question"
+        ? `${sharedPrefix} original full question`
+        : "Original question";
+      const replayQuestion = mismatch === "question"
+        ? `${sharedPrefix} conflicting full question`
+        : question;
+      const topic = createTopic(
+        mismatch === "question" ? `${sharedPrefix}…` : question,
+        principalId,
+        { id: `topic-${mismatch}-conflict` },
+      );
+      const messageId = `topic-${mismatch}-message`;
+      events.append({
+        topicId: topic.id,
+        type: "topic.created",
+        actorPrincipalId: principalId,
+        payload: {
+          topic,
+          principalId,
+          question,
+          tenantKey: "tenant-1",
+          chatId: "chat-1",
+          messageId,
+        },
+        idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
+      });
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => "must-not-create-conflicting-discussion",
+      });
+
+      try {
+        await expect(channel.receive({
+          tenantKey: "tenant-1",
+          principalId: mismatch === "principal" ? "tenant-1:user:conflict" : principalId,
+          chatId: "chat-1",
+          messageId,
+          text: replayQuestion,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-topic-${mismatch}-conflict`,
+        })).rejects.toThrow(/inconsistent topic\.created event/i);
+        expect(events.topic(topic.id)?.ownerPrincipalId).toBe(principalId);
+        expect(discussions.chatTopic("tenant-1", "chat-1")).toBeUndefined();
+        expect(discussions.activeForChat("tenant-1", "chat-1")).toBeUndefined();
+        expect(refreshed).toEqual([]);
+        expect(kicked).toEqual([]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
 
   it("rejects an inconsistent returned scoped topic event before binding", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-group-topic-validation-"));
@@ -601,6 +708,86 @@ describe("GroupDiscussionChannel", () => {
       events.close();
     }
   });
+
+  it.each(["principal", "question"] as const)(
+    "rejects a same-scope %s conflict at the Discussion-started-before-receipt boundary",
+    async (mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-started-author-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const principalId = "tenant-1:user:original";
+      const topic = createTopic("Started author", principalId, {
+        id: `started-${mismatch}-topic`,
+      });
+      events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+      discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
+      const messageId = `started-${mismatch}-message`;
+      const discussion = discussions.createDiscussion(createDiscussion({
+        id: `started-${mismatch}-discussion`,
+        topicId: topic.id,
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        question: "Original started question",
+        starterPrincipalId: principalId,
+        startMessageId: messageId,
+      }));
+      const eventPrincipalId = mismatch === "principal"
+        ? "tenant-1:user:conflict"
+        : principalId;
+      events.append({
+        topicId: topic.id,
+        type: "discussion.started",
+        actorPrincipalId: eventPrincipalId,
+        payload: {
+          discussionId: discussion.id,
+          starterPrincipalId: eventPrincipalId,
+          tenantKey: discussion.tenantKey,
+          chatId: discussion.chatId,
+          messageId,
+          question: discussion.question,
+        },
+        idempotencyKey: groupEffectKey(
+          discussion.tenantKey,
+          discussion.chatId,
+          messageId,
+          "discussion-started",
+        ),
+      });
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => "must-not-record-started-conflict",
+      });
+
+      try {
+        await expect(channel.receive({
+          tenantKey: discussion.tenantKey,
+          principalId,
+          chatId: discussion.chatId,
+          messageId,
+          text: mismatch === "question" ? "Conflicting started question" : discussion.question,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-started-${mismatch}-conflict`,
+        })).rejects.toThrow(/inconsistent discussion(?:\.started| start replay)/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+        expect(discussions.discussion(discussion.id)?.starterPrincipalId).toBe(principalId);
+        expect(events.topic(topic.id)?.ownerPrincipalId).toBe(principalId);
+        expect(refreshed).toEqual([]);
+        expect(kicked).toEqual([]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
 
   it.each(["tenant", "chat"] as const)(
     "does not reuse a foreign %s steer effect before its receipt",
@@ -729,8 +916,10 @@ describe("GroupDiscussionChannel", () => {
       const committed = events.append({
         topicId: discussion!.topicId,
         type: "discussion.steer.added",
+        actorPrincipalId: scope.principalId,
         payload: {
           discussionId: discussion!.id,
+          principalId: scope.principalId,
           tenantKey: scope.tenantKey,
           chatId: scope.chatId,
           messageId,
@@ -760,6 +949,86 @@ describe("GroupDiscussionChannel", () => {
       events.close();
     }
   });
+
+  it.each(["principal", "text"] as const)(
+    "rejects a same-scope %s conflict at the steer-event-before-receipt boundary",
+    async (mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-author-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => `steer-author-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `steer-${mismatch}-start`,
+          text: "Steer author Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-steer-${mismatch}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        const principalId = "tenant-1:user:member";
+        const messageId = `steer-${mismatch}-message`;
+        const text = "Original steer text";
+        events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: principalId,
+          payload: {
+            discussionId: discussion!.id,
+            principalId,
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        refreshed.length = 0;
+        kicked.length = 0;
+
+        await expect(channel.receive({
+          tenantKey: scope.tenantKey,
+          principalId: mismatch === "principal" ? "tenant-1:user:conflict" : principalId,
+          chatId: scope.chatId,
+          messageId,
+          text: mismatch === "text" ? "Conflicting steer text" : text,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-steer-${mismatch}-conflict`,
+        })).rejects.toThrow(/inconsistent discussion\.steer\.added event/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+        expect(discussions.discussion(discussion!.id)?.starterPrincipalId)
+          .toBe(scope.principalId);
+        expect(events.topic(discussion!.topicId)?.ownerPrincipalId).toBe(scope.principalId);
+        expect(events.events(discussion!.topicId)
+          .filter(({ type }) => type === "discussion.steer.added")).toHaveLength(1);
+        expect(refreshed).toEqual([]);
+        expect(kicked).toEqual([]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
 
   it.each([
     ["paused", "delivery"],
@@ -818,6 +1087,7 @@ describe("GroupDiscussionChannel", () => {
             actorPrincipalId: scope.principalId,
             payload: {
               discussionId: discussion.id,
+              principalId: scope.principalId,
               tenantKey: scope.tenantKey,
               chatId: scope.chatId,
               messageId,
@@ -997,6 +1267,87 @@ describe("GroupDiscussionChannel", () => {
         } finally {
           inspection.close();
         }
+        expect(refreshed).toEqual([]);
+        expect(kicked).toEqual([]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each([
+    ["start", "principal"],
+    ["start", "text"],
+    ["steer", "principal"],
+    ["steer", "text"],
+  ] as const)(
+    "rejects a same-scope persisted %s receipt replay with conflicting %s",
+    async (receiptKind, mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-receipt-author-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => `receipt-author-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const start = {
+        ...scope,
+        messageId: `receipt-author-${receiptKind}-start`,
+        text: "Receipt author Discussion",
+        sourceAppRole: "hub" as const,
+        idempotencyKey: `hub-receipt-author-${receiptKind}-start`,
+      };
+
+      try {
+        await channel.receive(start);
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        const original = receiptKind === "start"
+          ? start
+          : {
+              ...scope,
+              principalId: "tenant-1:user:member",
+              messageId: "receipt-author-steer-message",
+              text: "Original receipt steer",
+              sourceAppRole: "hub" as const,
+              idempotencyKey: "hub-receipt-author-steer",
+            };
+        if (receiptKind === "steer") await channel.receive(original);
+        const beforeDiscussion = discussions.discussion(discussion!.id);
+        const beforeReceipt = discussions.steerForMessage(original.messageId);
+        const beforeEvents = events.events(discussion!.topicId);
+        refreshed.length = 0;
+        kicked.length = 0;
+
+        await expect(channel.receive({
+          ...original,
+          principalId: mismatch === "principal"
+            ? "tenant-1:user:conflict"
+            : original.principalId,
+          text: mismatch === "text" ? "Conflicting replay text" : original.text,
+          sourceAppRole: "codex",
+          preferredProvider: "codex",
+          idempotencyKey: `codex-${receiptKind}-${mismatch}-conflict`,
+        })).rejects.toThrow(new RegExp(`inconsistent Discussion ${receiptKind} replay`, "i"));
+        expect(discussions.discussion(discussion!.id)).toEqual(beforeDiscussion);
+        expect(discussions.steerForMessage(original.messageId)).toEqual(beforeReceipt);
+        expect(events.events(discussion!.topicId)).toEqual(beforeEvents);
         expect(refreshed).toEqual([]);
         expect(kicked).toEqual([]);
       } finally {
