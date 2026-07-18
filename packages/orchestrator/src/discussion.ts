@@ -757,6 +757,7 @@ export class GroupDiscussionChannel {
         type: "discussion.steer.added",
         actorPrincipalId: input.principalId,
         payload: {
+          schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
           discussionId: active.id,
           principalId: input.principalId,
           tenantKey: input.tenantKey,
@@ -807,6 +808,7 @@ export class GroupDiscussionChannel {
         type: "topic.created",
         actorPrincipalId: input.principalId,
         payload: {
+          schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
           topic,
           principalId: input.principalId,
           question: input.text,
@@ -856,6 +858,7 @@ export class GroupDiscussionChannel {
         type: "discussion.started",
         actorPrincipalId: discussion.starterPrincipalId,
         payload: {
+          schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
           discussionId: discussion.id,
           starterPrincipalId: discussion.starterPrincipalId,
           tenantKey: discussion.tenantKey,
@@ -1003,6 +1006,7 @@ function summarizeQuestion(text: string): string {
 }
 
 type GroupEffectOperation = "topic" | "discussion-started" | "steer";
+const GROUP_EFFECT_SCHEMA_VERSION = 2;
 
 function groupEffectKey(
   tenantKey: string,
@@ -1019,15 +1023,21 @@ function assertTopicCreatedEvent(
 ): void {
   const payload = recordValue(event.payload);
   const topic = recordValue(payload?.topic);
+  const currentPayload = payload?.schemaVersion === GROUP_EFFECT_SCHEMA_VERSION;
+  const legacyPayload = hasExactLegacyPayloadShape(
+    payload,
+    ["topic", "tenantKey", "chatId", "messageId"],
+  );
   if (
     event.type !== "topic.created"
+    || (!currentPayload && !legacyPayload)
     || topic?.id !== event.topicId
     || event.actorPrincipalId !== input.principalId
     || topic.ownerPrincipalId !== input.principalId
     || topic.tenantKey !== input.tenantKey
     || topic.title !== summarizeQuestion(input.text)
-    || payload?.principalId !== input.principalId
-    || payload.question !== input.text
+    || (currentPayload && payload?.principalId !== input.principalId)
+    || (currentPayload && payload?.question !== input.text)
     || payload?.tenantKey !== input.tenantKey
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId
@@ -1042,8 +1052,14 @@ function assertDiscussionStartedEvent(
   discussion: GroupDiscussion,
 ): void {
   const payload = recordValue(event.payload);
+  const currentPayload = payload?.schemaVersion === GROUP_EFFECT_SCHEMA_VERSION;
+  const legacyPayload = hasExactLegacyPayloadShape(
+    payload,
+    ["discussionId", "tenantKey", "chatId", "messageId", "question"],
+  );
   if (
     event.type !== "discussion.started"
+    || (!currentPayload && !legacyPayload)
     || event.topicId !== discussion.topicId
     || event.actorPrincipalId !== discussion.starterPrincipalId
     || discussion.tenantKey !== input.tenantKey
@@ -1052,7 +1068,7 @@ function assertDiscussionStartedEvent(
     || discussion.starterPrincipalId !== input.principalId
     || discussion.question !== input.text
     || payload?.discussionId !== discussion.id
-    || payload.starterPrincipalId !== discussion.starterPrincipalId
+    || (currentPayload && payload?.starterPrincipalId !== discussion.starterPrincipalId)
     || payload.tenantKey !== input.tenantKey
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId
@@ -1068,15 +1084,22 @@ function assertDiscussionSteerAddedEvent(
   discussion: GroupDiscussion,
 ): void {
   const payload = recordValue(event.payload);
+  const currentPayload = payload?.schemaVersion === GROUP_EFFECT_SCHEMA_VERSION;
+  const legacyPayload = hasExactLegacyPayloadShape(
+    payload,
+    ["discussionId", "tenantKey", "chatId", "messageId", "text"],
+    ["preferredProvider"],
+  );
   if (
     event.type !== "discussion.steer.added"
+    || (!currentPayload && !legacyPayload)
     || event.topicId !== discussion.topicId
     || event.actorPrincipalId !== input.principalId
     || !["active", "paused", "summarizing"].includes(discussion.state)
     || discussion.tenantKey !== input.tenantKey
     || discussion.chatId !== input.chatId
     || payload?.discussionId !== discussion.id
-    || payload.principalId !== input.principalId
+    || (currentPayload && payload?.principalId !== input.principalId)
     || payload.tenantKey !== input.tenantKey
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId
@@ -1090,4 +1113,15 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function hasExactLegacyPayloadShape(
+  payload: Record<string, unknown> | undefined,
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = [],
+): boolean {
+  if (payload === undefined) return false;
+  const allowedKeys = new Set([...requiredKeys, ...optionalKeys]);
+  return requiredKeys.every((key) => key in payload)
+    && Object.keys(payload).every((key) => allowedKeys.has(key));
 }

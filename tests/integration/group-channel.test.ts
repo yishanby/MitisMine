@@ -119,14 +119,17 @@ describe("GroupDiscussionChannel", () => {
         "discussion.steer.added",
       ]);
       expect(topicEvents[0]?.payload).toMatchObject({
+        schemaVersion: 2,
         principalId: "tenant-1:user:owner",
         question: "Choose the architecture",
       });
       expect(topicEvents[1]?.payload).toMatchObject({
+        schemaVersion: 2,
         starterPrincipalId: "tenant-1:user:owner",
         question: "Choose the architecture",
       });
       expect(topicEvents[2]?.payload).toMatchObject({
+        schemaVersion: 2,
         principalId: "tenant-1:user:member",
         text: "Prioritize migration cost",
       });
@@ -160,6 +163,7 @@ describe("GroupDiscussionChannel", () => {
       type: "topic.created",
       actorPrincipalId: topic.ownerPrincipalId,
       payload: {
+        schemaVersion: 2,
         topic,
         principalId: topic.ownerPrincipalId,
         question: "Choose the architecture",
@@ -193,6 +197,7 @@ describe("GroupDiscussionChannel", () => {
         type: "discussion.started",
         actorPrincipalId: topic.ownerPrincipalId,
         payload: {
+          schemaVersion: 2,
           discussionId: "discussion-from-start-message",
           starterPrincipalId: topic.ownerPrincipalId,
           tenantKey: "tenant-1",
@@ -467,6 +472,7 @@ describe("GroupDiscussionChannel", () => {
       type: "topic.created",
       actorPrincipalId: topic.ownerPrincipalId,
       payload: {
+        schemaVersion: 2,
         topic,
         principalId: topic.ownerPrincipalId,
         question: topic.title,
@@ -523,6 +529,188 @@ describe("GroupDiscussionChannel", () => {
     }
   });
 
+  it("recovers an exact legacy scoped topic effect once", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-topic-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const principalId = "tenant-1:user:owner";
+    const question = "Legacy scoped Topic";
+    const topic = createTopic(question, principalId, { id: "legacy-scoped-topic" });
+    const messageId = "legacy-scoped-topic-message";
+    events.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: principalId,
+      payload: {
+        topic,
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        messageId,
+      },
+      idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
+    });
+    let id = 0;
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `legacy-topic-${++id}`,
+    });
+    const input = {
+      tenantKey: "tenant-1",
+      principalId,
+      chatId: "chat-1",
+      messageId,
+      text: question,
+      sourceAppRole: "hub" as const,
+      idempotencyKey: "hub-legacy-scoped-topic",
+    };
+
+    try {
+      await channel.receive(input);
+      await channel.receive({
+        ...input,
+        sourceAppRole: "codex",
+        preferredProvider: "codex",
+        idempotencyKey: "codex-legacy-scoped-topic",
+      });
+
+      const discussion = discussions.activeForChat(input.tenantKey, input.chatId);
+      expect(discussions.chatTopic(input.tenantKey, input.chatId)).toBe(topic.id);
+      expect(discussion).toMatchObject({
+        topicId: topic.id,
+        starterPrincipalId: principalId,
+        question,
+        preferredProvider: "codex",
+      });
+      expect(events.topic(topic.id)?.ownerPrincipalId).toBe(principalId);
+      expect(events.events(topic.id).map(({ type }) => type)).toEqual([
+        "topic.created",
+        "discussion.started",
+      ]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it.each(["principal", "summary"] as const)(
+    "rejects a legacy scoped topic effect with a %s mismatch",
+    async (mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-topic-mismatch-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const principalId = "tenant-1:user:owner";
+      const question = "Legacy Topic question";
+      const topic = createTopic(question, principalId, { id: `legacy-topic-${mismatch}` });
+      const messageId = `legacy-topic-${mismatch}-message`;
+      events.append({
+        topicId: topic.id,
+        type: "topic.created",
+        actorPrincipalId: principalId,
+        payload: {
+          topic,
+          tenantKey: "tenant-1",
+          chatId: "chat-1",
+          messageId,
+        },
+        idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
+      });
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => "must-not-bind-legacy-topic-mismatch",
+      });
+
+      try {
+        await expect(channel.receive({
+          tenantKey: "tenant-1",
+          principalId: mismatch === "principal" ? "tenant-1:user:conflict" : principalId,
+          chatId: "chat-1",
+          messageId,
+          text: mismatch === "summary" ? "Different Topic summary" : question,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-legacy-topic-${mismatch}`,
+        })).rejects.toThrow(/inconsistent topic\.created event/i);
+        expect(discussions.chatTopic("tenant-1", "chat-1")).toBeUndefined();
+        expect(discussions.activeForChat("tenant-1", "chat-1")).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each([
+    "unversioned-author-fields",
+    "unversioned-principal-only",
+    "unversioned-question-only",
+    "version-2-missing-question",
+  ] as const)(
+    "rejects a malformed scoped topic payload with %s",
+    async (malformation) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-topic-schema-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const principalId = "tenant-1:user:owner";
+      const question = "Topic schema validation";
+      const topic = createTopic(question, principalId, { id: `topic-${malformation}` });
+      const messageId = `topic-${malformation}-message`;
+      events.append({
+        topicId: topic.id,
+        type: "topic.created",
+        actorPrincipalId: principalId,
+        payload: malformation.startsWith("unversioned-")
+          ? {
+              topic,
+              ...(malformation === "unversioned-question-only" ? {} : { principalId }),
+              ...(malformation === "unversioned-principal-only" ? {} : { question }),
+              tenantKey: "tenant-1",
+              chatId: "chat-1",
+              messageId,
+            }
+          : {
+              schemaVersion: 2,
+              topic,
+              principalId,
+              tenantKey: "tenant-1",
+              chatId: "chat-1",
+              messageId,
+            },
+        idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
+      });
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => "must-not-bind-malformed-topic",
+      });
+
+      try {
+        await expect(channel.receive({
+          tenantKey: "tenant-1",
+          principalId,
+          chatId: "chat-1",
+          messageId,
+          text: question,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-${malformation}`,
+        })).rejects.toThrow(/inconsistent topic\.created event/i);
+        expect(discussions.chatTopic("tenant-1", "chat-1")).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it.each(["principal", "question"] as const)(
     "rejects a same-scope %s conflict at the topic-created boundary",
     async (mismatch) => {
@@ -550,6 +738,7 @@ describe("GroupDiscussionChannel", () => {
         type: "topic.created",
         actorPrincipalId: principalId,
         payload: {
+          schemaVersion: 2,
           topic,
           principalId,
           question,
@@ -709,6 +898,222 @@ describe("GroupDiscussionChannel", () => {
     }
   });
 
+  it("recovers an exact legacy scoped Discussion-started effect once", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-started-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const principalId = "tenant-1:user:owner";
+    const topic = createTopic("Legacy started", principalId, { id: "legacy-started-topic" });
+    events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
+    const messageId = "legacy-started-message";
+    const discussion = discussions.createDiscussion(createDiscussion({
+      id: "legacy-started-discussion",
+      topicId: topic.id,
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Legacy started question",
+      starterPrincipalId: principalId,
+      startMessageId: messageId,
+    }));
+    const started = events.append({
+      topicId: topic.id,
+      type: "discussion.started",
+      actorPrincipalId: principalId,
+      payload: {
+        discussionId: discussion.id,
+        tenantKey: discussion.tenantKey,
+        chatId: discussion.chatId,
+        messageId,
+        question: discussion.question,
+      },
+      idempotencyKey: groupEffectKey(
+        discussion.tenantKey,
+        discussion.chatId,
+        messageId,
+        "discussion-started",
+      ),
+    });
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => "legacy-started-receipt",
+    });
+    const input = {
+      tenantKey: discussion.tenantKey,
+      principalId,
+      chatId: discussion.chatId,
+      messageId,
+      text: discussion.question,
+      sourceAppRole: "hub" as const,
+      idempotencyKey: "hub-legacy-started",
+    };
+
+    try {
+      await channel.receive(input);
+      await channel.receive({
+        ...input,
+        sourceAppRole: "codex",
+        preferredProvider: "codex",
+        idempotencyKey: "codex-legacy-started",
+      });
+
+      expect(events.events(topic.id).filter(({ type }) => type === "discussion.started"))
+        .toEqual([started]);
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        discussionId: discussion.id,
+        topicEventSeq: started.seq,
+        principalId,
+        text: discussion.question,
+        preferredProvider: "codex",
+      });
+      expect(discussions.discussion(discussion.id)?.starterPrincipalId).toBe(principalId);
+      expect(events.topic(topic.id)?.ownerPrincipalId).toBe(principalId);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it.each(["principal", "question"] as const)(
+    "rejects a legacy scoped Discussion-started effect with a %s mismatch",
+    async (mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-started-mismatch-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const principalId = "tenant-1:user:owner";
+      const topic = createTopic("Legacy started mismatch", principalId, {
+        id: `legacy-started-${mismatch}-topic`,
+      });
+      events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+      discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
+      const messageId = `legacy-started-${mismatch}-message`;
+      const discussion = discussions.createDiscussion(createDiscussion({
+        id: `legacy-started-${mismatch}-discussion`,
+        topicId: topic.id,
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        question: "Legacy started mismatch question",
+        starterPrincipalId: principalId,
+        startMessageId: messageId,
+      }));
+      events.append({
+        topicId: topic.id,
+        type: "discussion.started",
+        actorPrincipalId: mismatch === "principal" ? "tenant-1:user:conflict" : principalId,
+        payload: {
+          discussionId: discussion.id,
+          tenantKey: discussion.tenantKey,
+          chatId: discussion.chatId,
+          messageId,
+          question: mismatch === "question" ? "Conflicting legacy question" : discussion.question,
+        },
+        idempotencyKey: groupEffectKey(
+          discussion.tenantKey,
+          discussion.chatId,
+          messageId,
+          "discussion-started",
+        ),
+      });
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => "must-not-record-legacy-started-mismatch",
+      });
+
+      try {
+        await expect(channel.receive({
+          tenantKey: discussion.tenantKey,
+          principalId,
+          chatId: discussion.chatId,
+          messageId,
+          text: discussion.question,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-legacy-started-${mismatch}`,
+        })).rejects.toThrow(/inconsistent discussion\.started event/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each(["unversioned-starter", "version-2-missing-starter"] as const)(
+    "rejects a malformed scoped Discussion-started payload with %s",
+    async (malformation) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-started-schema-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const principalId = "tenant-1:user:owner";
+      const topic = createTopic("Started schema", principalId, {
+        id: `started-${malformation}-topic`,
+      });
+      events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+      discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
+      const messageId = `started-${malformation}-message`;
+      const discussion = discussions.createDiscussion(createDiscussion({
+        id: `started-${malformation}-discussion`,
+        topicId: topic.id,
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        question: "Started schema question",
+        starterPrincipalId: principalId,
+        startMessageId: messageId,
+      }));
+      events.append({
+        topicId: topic.id,
+        type: "discussion.started",
+        actorPrincipalId: principalId,
+        payload: {
+          ...(malformation === "version-2-missing-starter" ? { schemaVersion: 2 } : {}),
+          discussionId: discussion.id,
+          ...(malformation === "unversioned-starter" ? { starterPrincipalId: principalId } : {}),
+          tenantKey: discussion.tenantKey,
+          chatId: discussion.chatId,
+          messageId,
+          question: discussion.question,
+        },
+        idempotencyKey: groupEffectKey(
+          discussion.tenantKey,
+          discussion.chatId,
+          messageId,
+          "discussion-started",
+        ),
+      });
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => "must-not-record-malformed-started",
+      });
+
+      try {
+        await expect(channel.receive({
+          tenantKey: discussion.tenantKey,
+          principalId,
+          chatId: discussion.chatId,
+          messageId,
+          text: discussion.question,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-started-${malformation}`,
+        })).rejects.toThrow(/inconsistent discussion\.started event/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it.each(["principal", "question"] as const)(
     "rejects a same-scope %s conflict at the Discussion-started-before-receipt boundary",
     async (mismatch) => {
@@ -741,6 +1146,7 @@ describe("GroupDiscussionChannel", () => {
         type: "discussion.started",
         actorPrincipalId: eventPrincipalId,
         payload: {
+          schemaVersion: 2,
           discussionId: discussion.id,
           starterPrincipalId: eventPrincipalId,
           tenantKey: discussion.tenantKey,
@@ -918,6 +1324,7 @@ describe("GroupDiscussionChannel", () => {
         type: "discussion.steer.added",
         actorPrincipalId: scope.principalId,
         payload: {
+          schemaVersion: 2,
           discussionId: discussion!.id,
           principalId: scope.principalId,
           tenantKey: scope.tenantKey,
@@ -949,6 +1356,228 @@ describe("GroupDiscussionChannel", () => {
       events.close();
     }
   });
+
+  it.each(["active", "paused"] as const)(
+    "recovers an exact legacy scoped steer effect once while %s",
+    async (state) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-steer-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `legacy-steer-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `legacy-steer-${state}-start`,
+          text: "Legacy steer Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-legacy-steer-${state}-start`,
+        });
+        const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(active).toBeDefined();
+        const discussion = state === "paused"
+          ? discussions.saveDiscussion({ ...active!, state, version: active!.version + 1 })
+          : active!;
+        const principalId = "tenant-1:user:member";
+        const messageId = `legacy-steer-${state}-message`;
+        const text = "Legacy scoped steer";
+        const committed = events.append({
+          topicId: discussion.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: principalId,
+          payload: {
+            discussionId: discussion.id,
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        const input = {
+          tenantKey: scope.tenantKey,
+          principalId,
+          chatId: scope.chatId,
+          messageId,
+          text,
+          sourceAppRole: "hub" as const,
+          idempotencyKey: `hub-legacy-steer-${state}`,
+        };
+
+        await channel.receive(input);
+        const firstReceipt = discussions.steerForMessage(messageId);
+        await channel.receive({
+          ...input,
+          sourceAppRole: "codex",
+          preferredProvider: "codex",
+          idempotencyKey: `codex-legacy-steer-${state}`,
+        });
+
+        expect(events.events(discussion.topicId)
+          .filter(({ type }) => type === "discussion.steer.added")).toEqual([committed]);
+        expect(discussions.steerForMessage(messageId)).toMatchObject({
+          id: firstReceipt?.id,
+          discussionId: discussion.id,
+          topicEventSeq: committed.seq,
+          principalId,
+          text,
+          preferredProvider: "codex",
+          status: "pending",
+        });
+        expect(discussions.pendingSteers(discussion.id)
+          .filter((steer) => steer.messageId === messageId)).toHaveLength(1);
+        expect(discussions.discussion(discussion.id)?.state).toBe(state);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each(["principal", "text"] as const)(
+    "rejects a legacy scoped steer effect with a %s mismatch",
+    async (mismatch) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-steer-mismatch-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `legacy-steer-mismatch-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `legacy-steer-${mismatch}-start`,
+          text: "Legacy steer mismatch Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-legacy-steer-${mismatch}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        const principalId = "tenant-1:user:member";
+        const messageId = `legacy-steer-${mismatch}-message`;
+        const text = "Legacy steer mismatch";
+        events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: mismatch === "principal" ? "tenant-1:user:conflict" : principalId,
+          payload: {
+            discussionId: discussion!.id,
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text: mismatch === "text" ? "Conflicting legacy steer" : text,
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+
+        await expect(channel.receive({
+          tenantKey: scope.tenantKey,
+          principalId,
+          chatId: scope.chatId,
+          messageId,
+          text,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-legacy-steer-${mismatch}`,
+        })).rejects.toThrow(/inconsistent discussion\.steer\.added event/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each(["unversioned-principal", "version-2-missing-principal"] as const)(
+    "rejects a malformed scoped steer payload with %s",
+    async (malformation) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-schema-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `steer-schema-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `steer-${malformation}-start`,
+          text: "Steer schema Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-steer-${malformation}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        const principalId = "tenant-1:user:member";
+        const messageId = `steer-${malformation}-message`;
+        const text = "Steer schema validation";
+        events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: principalId,
+          payload: {
+            ...(malformation === "version-2-missing-principal" ? { schemaVersion: 2 } : {}),
+            discussionId: discussion!.id,
+            ...(malformation === "unversioned-principal" ? { principalId } : {}),
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+
+        await expect(channel.receive({
+          tenantKey: scope.tenantKey,
+          principalId,
+          chatId: scope.chatId,
+          messageId,
+          text,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-steer-${malformation}`,
+        })).rejects.toThrow(/inconsistent discussion\.steer\.added event/i);
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
 
   it.each(["principal", "text"] as const)(
     "rejects a same-scope %s conflict at the steer-event-before-receipt boundary",
@@ -994,6 +1623,7 @@ describe("GroupDiscussionChannel", () => {
           type: "discussion.steer.added",
           actorPrincipalId: principalId,
           payload: {
+            schemaVersion: 2,
             discussionId: discussion!.id,
             principalId,
             tenantKey: scope.tenantKey,
@@ -1086,6 +1716,7 @@ describe("GroupDiscussionChannel", () => {
             type: "discussion.steer.added",
             actorPrincipalId: scope.principalId,
             payload: {
+              schemaVersion: 2,
               discussionId: discussion.id,
               principalId: scope.principalId,
               tenantKey: scope.tenantKey,
