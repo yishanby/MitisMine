@@ -5,7 +5,7 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import type { OutboxMessage } from "../../storage/src/outbox.js";
 import type { AppConnectionRegistry } from "../../../apps/control-plane/src/health.js";
 import type { FeishuGateway } from "./gateway.js";
-import type { OutboxSender } from "./outbox-dispatcher.js";
+import type { OutboxSender, OutboxSendResult } from "./outbox-dispatcher.js";
 import {
   APP_ROLES,
   type AppRegistration,
@@ -69,12 +69,19 @@ export class FeishuLongConnections implements OutboxSender {
     }
   }
 
-  async send(message: OutboxMessage): Promise<void> {
+  async send(message: OutboxMessage): Promise<OutboxSendResult> {
     if (!APP_ROLES.includes(message.appRole as AppRole)) {
       throw new Error(`Unknown Feishu App role: ${message.appRole}`);
     }
     const client = this.#clients.get(message.appRole as AppRole);
     if (client === undefined) throw new Error(`Feishu client not ready: ${message.appRole}`);
+    if (message.operation === "update") {
+      const response = await client.im.v1.message.patch(feishuPatchData(message));
+      if (response.code !== undefined && response.code !== 0) {
+        throw new Error(`Feishu message API failed with code ${response.code}: ${response.msg ?? "unknown"}`);
+      }
+      return {};
+    }
     const response = await client.im.v1.message.create({
       params: { receive_id_type: "chat_id" },
       data: feishuMessageData(message),
@@ -82,6 +89,8 @@ export class FeishuLongConnections implements OutboxSender {
     if (response.code !== undefined && response.code !== 0) {
       throw new Error(`Feishu message API failed with code ${response.code}: ${response.msg ?? "unknown"}`);
     }
+    const messageId = response.data?.message_id;
+    return messageId === undefined ? {} : { messageId };
   }
 }
 
@@ -96,6 +105,19 @@ export function feishuMessageData(message: OutboxMessage): {
     msg_type: "interactive",
     content: JSON.stringify(message.payload),
     uuid: stableFeishuUuid(message.idempotencyKey),
+  };
+}
+
+export function feishuPatchData(message: OutboxMessage): {
+  path: { message_id: string };
+  data: { content: string };
+} {
+  if (message.operation !== "update" || message.targetMessageId === undefined) {
+    throw new Error("Feishu card patch requires an update target");
+  }
+  return {
+    path: { message_id: message.targetMessageId },
+    data: { content: JSON.stringify(message.payload) },
   };
 }
 

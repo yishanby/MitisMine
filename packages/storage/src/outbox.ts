@@ -11,6 +11,20 @@ export interface EnqueueOutboxInput {
   readonly payload: unknown;
   readonly idempotencyKey: string;
   readonly nextAttemptAt?: string;
+  readonly operation?: OutboxOperation;
+  readonly targetMessageId?: string;
+  readonly deliveryEffect?: OutboxDeliveryEffect;
+}
+
+export type OutboxOperation = "create" | "update";
+
+export interface OutboxDeliveryEffect {
+  readonly kind: "discussion.control.created";
+  readonly discussionId: string;
+}
+
+export interface OutboxSendResult {
+  readonly messageId?: string;
 }
 
 export interface OutboxMessage {
@@ -22,6 +36,10 @@ export interface OutboxMessage {
   readonly nextAttemptAt: string;
   readonly status: string;
   readonly idempotencyKey: string;
+  readonly operation: OutboxOperation;
+  readonly targetMessageId?: string;
+  readonly deliveryEffect?: OutboxDeliveryEffect;
+  readonly result?: OutboxSendResult;
 }
 
 export interface OutboxPort {
@@ -37,6 +55,10 @@ interface OutboxRow {
   next_attempt_at: string;
   status: string;
   idempotency_key: string;
+  operation: OutboxOperation;
+  target_message_id: string | null;
+  delivery_effect_json: string | null;
+  result_json: string | null;
 }
 
 export class DurableOutbox implements OutboxPort {
@@ -51,6 +73,15 @@ export class DurableOutbox implements OutboxPort {
     const database = new DatabaseSync(path);
     database.exec("PRAGMA journal_mode = WAL;");
     database.exec(SCHEMA_SQL);
+    const columns = database.prepare("PRAGMA table_info(outbox_messages)").all() as unknown as
+      Array<{ name: string }>;
+    const addColumn = (name: string, sql: string): void => {
+      if (!columns.some((column) => column.name === name)) database.exec(sql);
+    };
+    addColumn("operation", "ALTER TABLE outbox_messages ADD COLUMN operation TEXT NOT NULL DEFAULT 'create'");
+    addColumn("target_message_id", "ALTER TABLE outbox_messages ADD COLUMN target_message_id TEXT");
+    addColumn("delivery_effect_json", "ALTER TABLE outbox_messages ADD COLUMN delivery_effect_json TEXT");
+    addColumn("result_json", "ALTER TABLE outbox_messages ADD COLUMN result_json TEXT");
     return new DurableOutbox(database);
   }
 
@@ -59,18 +90,26 @@ export class DurableOutbox implements OutboxPort {
   }
 
   enqueue(input: EnqueueOutboxInput): boolean {
+    const operation = input.operation ?? "create";
+    if (operation === "update" && input.targetMessageId === undefined) {
+      throw new Error("Outbox update requires a target message ID");
+    }
     const result = this.#database
       .prepare(`
         INSERT OR IGNORE INTO outbox_messages (
-          id, app_role, receive_id, payload_json, attempts,
+          id, app_role, receive_id, payload_json, operation,
+          target_message_id, delivery_effect_json, result_json, attempts,
           next_attempt_at, status, idempotency_key
-        ) VALUES (?, ?, ?, ?, 0, ?, 'pending', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 'pending', ?)
       `)
       .run(
         input.id,
         input.appRole,
         input.receiveId,
         JSON.stringify(input.payload),
+        operation,
+        input.targetMessageId ?? null,
+        input.deliveryEffect === undefined ? null : JSON.stringify(input.deliveryEffect),
         input.nextAttemptAt ?? new Date().toISOString(),
         input.idempotencyKey,
       );
@@ -80,10 +119,11 @@ export class DurableOutbox implements OutboxPort {
   pending(now = new Date().toISOString()): OutboxMessage[] {
     const rows = this.#database
       .prepare(`
-        SELECT id, app_role, receive_id, payload_json, attempts,
+        SELECT id, app_role, receive_id, payload_json, operation,
+               target_message_id, delivery_effect_json, result_json, attempts,
                next_attempt_at, status, idempotency_key
         FROM outbox_messages
-        WHERE status IN ('pending', 'retry') AND next_attempt_at <= ?
+        WHERE status IN ('pending', 'retry', 'delivered') AND next_attempt_at <= ?
         ORDER BY next_attempt_at, id
       `)
       .all(now) as unknown as OutboxRow[];
@@ -94,14 +134,31 @@ export class DurableOutbox implements OutboxPort {
     this.#database.prepare("UPDATE outbox_messages SET status = 'sent' WHERE id = ?").run(id);
   }
 
+  markDelivered(id: string, result: OutboxSendResult): void {
+    this.#database.prepare(`
+      UPDATE outbox_messages SET status = 'delivered', result_json = ? WHERE id = ?
+    `).run(JSON.stringify(result), id);
+  }
+
   markRetry(id: string, nextAttemptAt: string): void {
     this.#database
       .prepare(`
         UPDATE outbox_messages
-        SET status = 'retry', attempts = attempts + 1, next_attempt_at = ?
+        SET status = CASE WHEN status = 'delivered' THEN 'delivered' ELSE 'retry' END,
+            attempts = attempts + 1, next_attempt_at = ?
         WHERE id = ?
       `)
       .run(nextAttemptAt, id);
+  }
+
+  message(id: string): OutboxMessage | undefined {
+    const row = this.#database.prepare(`
+      SELECT id, app_role, receive_id, payload_json, operation,
+             target_message_id, delivery_effect_json, result_json, attempts,
+             next_attempt_at, status, idempotency_key
+      FROM outbox_messages WHERE id = ?
+    `).get(id) as OutboxRow | undefined;
+    return row === undefined ? undefined : mapRow(row);
   }
 }
 
@@ -115,5 +172,31 @@ function mapRow(row: OutboxRow): OutboxMessage {
     nextAttemptAt: row.next_attempt_at,
     status: row.status,
     idempotencyKey: row.idempotency_key,
+    operation: row.operation,
+    ...(row.target_message_id === null ? {} : { targetMessageId: row.target_message_id }),
+    ...(row.delivery_effect_json === null
+      ? {}
+      : { deliveryEffect: parseDeliveryEffect(row.delivery_effect_json) }),
+    ...(row.result_json === null ? {} : { result: parseSendResult(row.result_json) }),
   };
+}
+
+function parseDeliveryEffect(json: string): OutboxDeliveryEffect {
+  const value = JSON.parse(json) as Partial<OutboxDeliveryEffect>;
+  if (value.kind !== "discussion.control.created" || typeof value.discussionId !== "string") {
+    throw new Error("Stored Outbox delivery effect is invalid");
+  }
+  return { kind: value.kind, discussionId: value.discussionId };
+}
+
+function parseSendResult(json: string): OutboxSendResult {
+  const value = JSON.parse(json) as unknown;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Stored Outbox send result is invalid");
+  }
+  const messageId = (value as { messageId?: unknown }).messageId;
+  if (messageId !== undefined && typeof messageId !== "string") {
+    throw new Error("Stored Outbox message ID is invalid");
+  }
+  return messageId === undefined ? {} : { messageId };
 }
