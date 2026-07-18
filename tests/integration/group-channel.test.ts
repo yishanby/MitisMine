@@ -1789,6 +1789,281 @@ describe("GroupDiscussionChannel", () => {
     },
   );
 
+  it("does not append a steer event when summary finalization wins at ingress", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-terminal-steer-race-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `terminal-steer-race-${++id}`,
+    });
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "terminal-steer-race-start",
+        text: "Terminal steer race Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-terminal-steer-race-start",
+      });
+      const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(active).toBeDefined();
+      const summarizing = discussions.saveDiscussion({
+        ...active!,
+        state: "summarizing",
+        version: active!.version + 1,
+      });
+      const recordSteer = discussions.recordSteer.bind(discussions);
+      let finalizeAtReservation = true;
+      discussions.recordSteer = (input) => {
+        if (input.messageId === "terminal-steer-race-message" && finalizeAtReservation) {
+          finalizeAtReservation = false;
+          expect(discussions.finalizeSummary(summarizing.id, "Terminal winner", []).status)
+            .toBe("completed");
+        }
+        return recordSteer(input);
+      };
+
+      await expect(channel.receive({
+        ...scope,
+        messageId: "terminal-steer-race-message",
+        text: "Do not strand this steer",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-terminal-steer-race-message",
+      })).rejects.toThrow(/no longer accepts steers/i);
+
+      expect(discussions.discussion(summarizing.id)).toMatchObject({
+        state: "completed",
+        summaryText: "Terminal winner",
+      });
+      expect(discussions.steerForMessage("terminal-steer-race-message")).toBeUndefined();
+      expect(events.events(summarizing.topicId).filter((event) => {
+        const payload = event.payload as { messageId?: string };
+        return event.type === "discussion.steer.added"
+          && payload.messageId === "terminal-steer-race-message";
+      })).toEqual([]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("repairs a receipt-first steer after a crash before event publication", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-receipt-recovery-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const options = {
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `receipt-recovery-${++id}`,
+    };
+    const channel = new GroupDiscussionChannel(options);
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "receipt-recovery-start",
+        text: "Receipt recovery Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-receipt-recovery-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      const append = events.append.bind(events);
+      let crashBeforePublication = true;
+      events.append = (input) => {
+        if (input.type === "discussion.steer.added" && crashBeforePublication) {
+          crashBeforePublication = false;
+          throw new Error("crash before steer event publication");
+        }
+        return append(input);
+      };
+
+      await expect(channel.receive({
+        ...scope,
+        messageId: "receipt-recovery-message",
+        text: "Recover this accepted steer",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-receipt-recovery-message",
+      })).rejects.toThrow(/crash before steer event publication/i);
+
+      expect(discussions.steerForMessage("receipt-recovery-message")).toMatchObject({
+        discussionId: discussion!.id,
+        topicEventSeq: 0,
+        status: "pending",
+      });
+      expect(events.events(discussion!.topicId)
+        .filter(({ type }) => type === "discussion.steer.added")).toEqual([]);
+
+      events.append = append;
+      const recoveryChannel = new GroupDiscussionChannel(options);
+      recoveryChannel.recoverPendingSteerEvents();
+
+      const steerEvents = events.events(discussion!.topicId)
+        .filter(({ type }) => type === "discussion.steer.added");
+      expect(steerEvents).toHaveLength(1);
+      expect(discussions.steerForMessage("receipt-recovery-message")).toMatchObject({
+        discussionId: discussion!.id,
+        topicEventSeq: steerEvents[0]?.seq,
+        status: "pending",
+      });
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it.each(["active", "paused", "summarizing"] as const)(
+    "projects an exact event-before-receipt orphan at startup while %s",
+    async (state) => {
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-event-orphan-${state}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const options = {
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `event-orphan-${state}-${++id}`,
+      };
+      const channel = new GroupDiscussionChannel(options);
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `event-orphan-${state}-start`,
+          text: `${state} orphan recovery Discussion`,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-event-orphan-${state}-start`,
+        });
+        const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(active).toBeDefined();
+        const discussion = state === "active"
+          ? active!
+          : discussions.saveDiscussion({
+              ...active!,
+              state,
+              version: active!.version + 1,
+            });
+        const messageId = `event-orphan-${state}-message`;
+        const event = events.append({
+          topicId: discussion.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: "tenant-1:user:member",
+          payload: {
+            schemaVersion: 2,
+            discussionId: discussion.id,
+            principalId: "tenant-1:user:member",
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text: `Recover orphan while ${state}`,
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        expect(discussions.steerForMessage(messageId)).toBeUndefined();
+
+        new GroupDiscussionChannel(options).recoverPendingSteerEvents();
+
+        expect(discussions.steerForMessage(messageId)).toMatchObject({
+          discussionId: discussion.id,
+          topicEventSeq: event.seq,
+          principalId: "tenant-1:user:member",
+          text: `Recover orphan while ${state}`,
+          status: "pending",
+        });
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it("fails closed on a malformed event-before-receipt orphan at startup", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-malformed-event-orphan-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const options = {
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `malformed-event-orphan-${++id}`,
+    };
+    const channel = new GroupDiscussionChannel(options);
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "malformed-event-orphan-start",
+        text: "Malformed orphan recovery Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-malformed-event-orphan-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      events.append({
+        topicId: discussion!.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: {
+          schemaVersion: 2,
+          discussionId: discussion!.id,
+          tenantKey: scope.tenantKey,
+          chatId: scope.chatId,
+          messageId: "malformed-event-orphan-message",
+          text: "Missing versioned principal",
+        },
+        idempotencyKey: groupEffectKey(
+          scope.tenantKey,
+          scope.chatId,
+          "malformed-event-orphan-message",
+          "steer",
+        ),
+      });
+
+      expect(() => new GroupDiscussionChannel(options).recoverPendingSteerEvents())
+        .toThrow(/inconsistent discussion\.steer\.added event/i);
+      expect(discussions.steerForMessage("malformed-event-orphan-message")).toBeUndefined();
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
   it("rejects an inconsistent returned scoped steer event before recording receipt", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-validation-"));
     temporaryDirectories.push(directory);

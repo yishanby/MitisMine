@@ -703,6 +703,76 @@ export class GroupDiscussionChannel {
     this.#idFactory = options.idFactory;
   }
 
+  recoverPendingSteerEvents(): void {
+    for (const event of this.#events.eventsByType("discussion.steer.added")) {
+      if (this.#store.steerForTopicEvent(event.topicId, event.seq) !== undefined) continue;
+      const input = recoveryInputForSteerEvent(event);
+      const payload = recordValue(event.payload);
+      const discussionId = payload?.discussionId;
+      if (typeof discussionId !== "string") {
+        throw new Error("Inconsistent discussion.steer.added event");
+      }
+      const discussion = this.#store.discussion(discussionId);
+      if (discussion === undefined) {
+        throw new Error("Inconsistent discussion.steer.added event");
+      }
+      assertDiscussionSteerAddedEvent(event, input, discussion, true);
+      const existing = this.#store.steerForMessage(input.messageId);
+      if (existing !== undefined) {
+        if (
+          existing.discussionId !== discussion.id
+          || existing.principalId !== input.principalId
+          || existing.text !== input.text
+        ) {
+          throw new Error("Inconsistent Discussion steer receipt");
+        }
+        this.#store.recordSteer({
+          id: existing.id,
+          discussionId: discussion.id,
+          messageId: input.messageId,
+          topicEventSeq: event.seq,
+          principalId: input.principalId,
+          text: input.text,
+          ...(input.preferredProvider === undefined
+            ? {}
+            : { preferredProvider: input.preferredProvider }),
+        });
+        continue;
+      }
+      if (!["active", "paused", "summarizing"].includes(discussion.state)) continue;
+      this.#store.recordSteer({
+        id: this.#idFactory(),
+        discussionId: discussion.id,
+        messageId: input.messageId,
+        topicEventSeq: event.seq,
+        principalId: input.principalId,
+        text: input.text,
+        ...(input.preferredProvider === undefined
+          ? {}
+          : { preferredProvider: input.preferredProvider }),
+        createdAt: event.createdAt,
+      });
+    }
+    for (const steer of this.#store.unpublishedSteers()) {
+      const discussion = this.#store.discussion(steer.discussionId);
+      if (discussion === undefined) {
+        throw new Error(`Discussion not found for unpublished steer: ${steer.id}`);
+      }
+      this.#publishSteerEvent({
+        tenantKey: discussion.tenantKey,
+        principalId: steer.principalId,
+        chatId: discussion.chatId,
+        messageId: steer.messageId,
+        text: steer.text,
+        sourceAppRole: "hub",
+        idempotencyKey: `discussion-steer-recovery:${steer.id}`,
+        ...(steer.preferredProvider === undefined
+          ? {}
+          : { preferredProvider: steer.preferredProvider }),
+      }, discussion, steer.id, true);
+    }
+  }
+
   async receive(input: GroupDiscussionReceiveInput): Promise<void> {
     const active = this.#store.activeForChat(input.tenantKey, input.chatId);
     const priorStart = this.#store.discussionForStartMessage(input.messageId);
@@ -730,59 +800,42 @@ export class GroupDiscussionChannel {
       if (priorReceipt.principalId !== input.principalId || priorReceipt.text !== input.text) {
         throw new Error("Inconsistent Discussion steer replay");
       }
-      if (input.sourceAppRole !== "hub" && active?.id !== priorReceipt.discussionId) return;
-      this.#store.recordSteer({
-        id: priorReceipt.id,
-        discussionId: priorReceipt.discussionId,
-        messageId: input.messageId,
-        topicEventSeq: priorReceipt.topicEventSeq,
-        principalId: input.principalId,
-        text: input.text,
-        ...(input.preferredProvider === undefined
-          ? {}
-          : { preferredProvider: input.preferredProvider }),
-      });
+      if (
+        input.sourceAppRole !== "hub"
+        && active?.id !== priorReceipt.discussionId
+        && priorReceipt.topicEventSeq !== 0
+      ) return;
+      this.#publishSteerEvent(input, receiptDiscussion, priorReceipt.id, true);
       await this.#coordinator.refreshControl(priorReceipt.discussionId);
       this.#coordinator.kick(priorReceipt.discussionId);
       return;
     }
 
     if (active !== undefined) {
-      const event = this.#events.append({
-        topicId: active.topicId,
-        type: "discussion.steer.added",
-        actorPrincipalId: input.principalId,
-        payload: {
-          schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
-          discussionId: active.id,
-          principalId: input.principalId,
-          tenantKey: input.tenantKey,
-          chatId: input.chatId,
-          messageId: input.messageId,
-          text: input.text,
-          ...(input.preferredProvider === undefined
-            ? {}
-            : { preferredProvider: input.preferredProvider }),
-        },
-        idempotencyKey: groupEffectKey(
-          input.tenantKey,
-          input.chatId,
-          input.messageId,
-          "steer",
-        ),
-      });
-      assertDiscussionSteerAddedEvent(event, input, active);
-      this.#store.recordSteer({
+      const effectKey = groupEffectKey(
+        input.tenantKey,
+        input.chatId,
+        input.messageId,
+        "steer",
+      );
+      const priorEvent = this.#events.eventForEffect(effectKey);
+      if (priorEvent !== undefined) {
+        assertDiscussionSteerAddedEvent(priorEvent, input, active);
+      }
+      const receipt = this.#store.recordSteer({
         id: this.#idFactory(),
         discussionId: active.id,
         messageId: input.messageId,
-        topicEventSeq: event.seq,
+        ...(priorEvent === undefined ? {} : { topicEventSeq: priorEvent.seq }),
         principalId: input.principalId,
         text: input.text,
         ...(input.preferredProvider === undefined
           ? {}
           : { preferredProvider: input.preferredProvider }),
-      });
+      }).steer;
+      if (priorEvent === undefined) {
+        this.#publishSteerEvent(input, active, receipt.id, false);
+      }
       await this.#coordinator.refreshControl(active.id);
       this.#coordinator.kick(active.id);
       return;
@@ -886,6 +939,49 @@ export class GroupDiscussionChannel {
     this.#store.consumeSteers(discussion.id, [initialReceipt.id]);
     await this.#coordinator.refreshControl(discussion.id);
     this.#coordinator.kick(discussion.id);
+  }
+
+  #publishSteerEvent(
+    input: GroupDiscussionReceiveInput,
+    discussion: GroupDiscussion,
+    steerId: string,
+    allowTerminal: boolean,
+  ): void {
+    const event = this.#events.append({
+      topicId: discussion.topicId,
+      type: "discussion.steer.added",
+      actorPrincipalId: input.principalId,
+      payload: {
+        schemaVersion: GROUP_EFFECT_SCHEMA_VERSION,
+        discussionId: discussion.id,
+        principalId: input.principalId,
+        tenantKey: input.tenantKey,
+        chatId: input.chatId,
+        messageId: input.messageId,
+        text: input.text,
+        ...(input.preferredProvider === undefined
+          ? {}
+          : { preferredProvider: input.preferredProvider }),
+      },
+      idempotencyKey: groupEffectKey(
+        input.tenantKey,
+        input.chatId,
+        input.messageId,
+        "steer",
+      ),
+    });
+    assertDiscussionSteerAddedEvent(event, input, discussion, allowTerminal);
+    this.#store.recordSteer({
+      id: steerId,
+      discussionId: discussion.id,
+      messageId: input.messageId,
+      topicEventSeq: event.seq,
+      principalId: input.principalId,
+      text: input.text,
+      ...(input.preferredProvider === undefined
+        ? {}
+        : { preferredProvider: input.preferredProvider }),
+    });
   }
 }
 
@@ -1078,6 +1174,7 @@ function assertDiscussionSteerAddedEvent(
   event: TopicEvent,
   input: GroupDiscussionReceiveInput,
   discussion: GroupDiscussion,
+  allowTerminal = false,
 ): void {
   const payload = recordValue(event.payload);
   const currentPayload = payload?.schemaVersion === GROUP_EFFECT_SCHEMA_VERSION;
@@ -1091,7 +1188,7 @@ function assertDiscussionSteerAddedEvent(
     || (!currentPayload && !legacyPayload)
     || event.topicId !== discussion.topicId
     || event.actorPrincipalId !== input.principalId
-    || !["active", "paused", "summarizing"].includes(discussion.state)
+    || (!allowTerminal && !["active", "paused", "summarizing"].includes(discussion.state))
     || discussion.tenantKey !== input.tenantKey
     || discussion.chatId !== input.chatId
     || payload?.discussionId !== discussion.id
@@ -1103,6 +1200,36 @@ function assertDiscussionSteerAddedEvent(
   ) {
     throw new Error("Inconsistent discussion.steer.added event");
   }
+}
+
+function recoveryInputForSteerEvent(event: TopicEvent): GroupDiscussionReceiveInput {
+  const payload = recordValue(event.payload);
+  const preferredProvider = payload?.preferredProvider;
+  if (
+    event.actorPrincipalId === undefined
+    || typeof payload?.tenantKey !== "string"
+    || typeof payload.chatId !== "string"
+    || typeof payload.messageId !== "string"
+    || typeof payload.text !== "string"
+    || (
+      preferredProvider !== undefined
+      && preferredProvider !== "claude"
+      && preferredProvider !== "codex"
+      && preferredProvider !== "copilot"
+    )
+  ) {
+    throw new Error("Inconsistent discussion.steer.added event");
+  }
+  return {
+    tenantKey: payload.tenantKey,
+    principalId: event.actorPrincipalId,
+    chatId: payload.chatId,
+    messageId: payload.messageId,
+    text: payload.text,
+    sourceAppRole: "hub",
+    idempotencyKey: `discussion-steer-event-recovery:${event.topicId}:${event.seq}`,
+    ...(preferredProvider === undefined ? {} : { preferredProvider }),
+  };
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {

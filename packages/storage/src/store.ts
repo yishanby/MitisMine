@@ -149,6 +149,16 @@ export class EventStore {
     this.#database.close();
   }
 
+  eventForEffect(idempotencyKey: string): TopicEvent | undefined {
+    const row = this.#database.prepare(`
+      SELECT e.topic_id, e.seq, e.type, e.actor_principal_id, e.payload_json, e.created_at
+      FROM topic_event_effects i
+      JOIN topic_events e ON e.topic_id = i.topic_id AND e.seq = i.seq
+      WHERE i.effect_key = ?
+    `).get(idempotencyKey) as EventRow | undefined;
+    return row === undefined ? undefined : mapEvent(row);
+  }
+
   append(input: AppendEventInput): TopicEvent {
     const createdAt = input.createdAt ?? new Date().toISOString();
     this.#database.exec("BEGIN IMMEDIATE");
@@ -270,6 +280,16 @@ export class EventStore {
         ? {}
         : { actorPrincipalId: row.actor_principal_id }),
     }));
+  }
+
+  eventsByType(type: string): TopicEvent[] {
+    const rows = this.#database
+      .prepare(`
+        SELECT topic_id, seq, type, actor_principal_id, payload_json, created_at
+        FROM topic_events WHERE type = ? ORDER BY topic_id, seq
+      `)
+      .all(type) as unknown as EventRow[];
+    return rows.map(mapEvent);
   }
 
   topic(topicId: string): Topic | undefined {

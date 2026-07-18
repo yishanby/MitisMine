@@ -26,7 +26,7 @@ export interface DiscussionSteerInput {
   readonly id: string;
   readonly discussionId: string;
   readonly messageId: string;
-  readonly topicEventSeq: number;
+  readonly topicEventSeq?: number;
   readonly principalId: string;
   readonly text: string;
   readonly preferredProvider?: ProviderName;
@@ -437,6 +437,15 @@ export class SqliteDiscussionStore {
         FROM discussion_steers WHERE message_id = ?
       `).get(input.messageId) as SteerRow | undefined;
       if (existing !== undefined) {
+        if (input.topicEventSeq !== undefined && input.topicEventSeq > 0) {
+          if (existing.topic_event_seq === 0) {
+            this.#database.prepare(`
+              UPDATE discussion_steers SET topic_event_seq = ? WHERE id = ?
+            `).run(input.topicEventSeq, existing.id);
+          } else if (existing.topic_event_seq !== input.topicEventSeq) {
+            throw new Error(`Discussion steer is already bound to another TopicEvent: ${existing.id}`);
+          }
+        }
         if (input.preferredProvider !== undefined && existing.preferred_provider === null) {
           this.#database.prepare(`
             UPDATE discussion_steers SET preferred_provider = ? WHERE id = ?
@@ -472,7 +481,7 @@ export class SqliteDiscussionStore {
         input.id,
         input.discussionId,
         input.messageId,
-        input.topicEventSeq,
+        input.topicEventSeq ?? 0,
         input.principalId,
         input.text,
         input.preferredProvider ?? null,
@@ -504,12 +513,34 @@ export class SqliteDiscussionStore {
     return rows.map(mapSteer);
   }
 
+  unpublishedSteers(): DiscussionSteer[] {
+    const rows = this.#database.prepare(`
+      SELECT id, discussion_id, message_id, topic_event_seq, principal_id, text,
+             preferred_provider, status, created_at, consumed_at
+      FROM discussion_steers
+      WHERE topic_event_seq = 0
+      ORDER BY created_at, id
+    `).all() as unknown as SteerRow[];
+    return rows.map(mapSteer);
+  }
+
   steerForMessage(messageId: string): DiscussionSteer | undefined {
     const row = this.#database.prepare(`
       SELECT id, discussion_id, message_id, topic_event_seq, principal_id, text,
              preferred_provider, status, created_at, consumed_at
       FROM discussion_steers WHERE message_id = ?
     `).get(messageId) as SteerRow | undefined;
+    return row === undefined ? undefined : mapSteer(row);
+  }
+
+  steerForTopicEvent(topicId: string, topicEventSeq: number): DiscussionSteer | undefined {
+    const row = this.#database.prepare(`
+      SELECT s.id, s.discussion_id, s.message_id, s.topic_event_seq, s.principal_id, s.text,
+             s.preferred_provider, s.status, s.created_at, s.consumed_at
+      FROM discussion_steers s
+      JOIN group_discussions d ON d.id = s.discussion_id
+      WHERE d.topic_id = ? AND s.topic_event_seq = ?
+    `).get(topicId, topicEventSeq) as SteerRow | undefined;
     return row === undefined ? undefined : mapSteer(row);
   }
 

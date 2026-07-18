@@ -463,6 +463,7 @@ export async function startControlPlane(
       coordinator: discussionCoordinator,
       idFactory: ulid,
     });
+    groupDiscussions.recoverPendingSteerEvents();
     const gateway = new FeishuGateway({
       store,
       outbox,
