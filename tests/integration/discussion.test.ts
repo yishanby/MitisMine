@@ -562,6 +562,23 @@ describe("DiscussionCoordinator", () => {
     });
   });
 
+  it.each([
+    ["raw text", (replacementCharacter: string) => `Corrupt ${replacementCharacter} response`],
+    ["message", (replacementCharacter: string) => JSON.stringify({
+      message: `Corrupt ${replacementCharacter} response`,
+      continueDiscussion: true,
+      openQuestions: [],
+    }).replace(replacementCharacter, "\\ufffd")],
+    ["open question", (replacementCharacter: string) => JSON.stringify({
+      message: "Clean response",
+      continueDiscussion: true,
+      openQuestions: [`Corrupt ${replacementCharacter} question`],
+    }).replace(replacementCharacter, "\\ufffd")],
+  ])("rejects invalid Unicode in Discussion Agent %s", (_case, response) => {
+    expect(() => parseDiscussionAgentOutput(response(String.fromCodePoint(0xfffd))))
+      .toThrow(/invalid Unicode.*provider output/i);
+  });
+
   it("parses an Agent contract wrapped in a JSON markdown fence", () => {
     expect(parseDiscussionAgentOutput(`\`\`\`json
 {"message":"Structured response","continueDiscussion":false,"openQuestions":["One risk"]}
@@ -748,6 +765,44 @@ describe("DiscussionCoordinator", () => {
       });
       expect(JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z")))
         .not.toContain("```json");
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("falls through from an invalid-Unicode summary to the next clean provider", async () => {
+    const replacementCharacter = String.fromCodePoint(0xfffd);
+    const attempts: ProviderName[] = [];
+    const summaryAdapter = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
+      expect(task.prompt).toContain("PHASE: discussion_summary");
+      attempts.push(provider);
+      if (provider === "claude") {
+        return JSON.stringify({ summary: `Corrupt ${replacementCharacter} summary` })
+          .replace(replacementCharacter, "\\ufffd");
+      }
+      if (provider === "codex") return JSON.stringify({ summary: "Clean fallback summary" });
+      throw new Error("Copilot must not run after a clean fallback");
+    });
+    const test = harness({
+      claude: summaryAdapter("claude"),
+      codex: summaryAdapter("codex"),
+      copilot: summaryAdapter("copilot"),
+    });
+    try {
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:member");
+      await test.coordinator.waitForIdle(test.discussion.id);
+
+      expect(attempts).toEqual(["claude", "codex"]);
+      expect(test.discussions.discussion(test.discussion.id)).toMatchObject({
+        state: "completed",
+        summaryText: "Clean fallback summary",
+      });
+      const published = JSON.stringify(test.outbox.pending("2099-01-01T00:00:00.000Z"));
+      expect(published).toContain("Clean fallback summary");
+      expect(published).not.toContain(replacementCharacter);
     } finally {
       await test.coordinator.shutdown();
       test.discussions.close();

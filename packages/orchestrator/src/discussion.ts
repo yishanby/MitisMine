@@ -1,10 +1,11 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 
-import type {
-  AdapterRegistry,
-  AgentTask,
-  ProviderName,
+import {
+  assertValidProviderText,
+  type AdapterRegistry,
+  type AgentTask,
+  type ProviderName,
 } from "../../agent-adapters/src/index.js";
 import {
   completeDiscussionTurn,
@@ -792,6 +793,8 @@ export class GroupDiscussionChannel {
 }
 
 export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
+  assertValidProviderText(raw);
+  let output: DiscussionAgentOutput;
   try {
     const value = asRecord(JSON.parse(unwrapJsonFence(raw)) as unknown);
     if (
@@ -803,7 +806,7 @@ export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
     ) {
       throw new Error("invalid contract");
     }
-    return {
+    output = {
       message: value.message.trim(),
       continueDiscussion: value.continueDiscussion,
       openQuestions: value.openQuestions as string[],
@@ -813,17 +816,23 @@ export function parseDiscussionAgentOutput(raw: string): DiscussionAgentOutput {
     if (!message) throw new Error("Discussion Agent returned an empty response");
     return { message, continueDiscussion: true, openQuestions: [] };
   }
+  assertValidProviderText(output.message);
+  for (const question of output.openQuestions) assertValidProviderText(question);
+  return output;
 }
 
 function parseDiscussionSummary(raw: string): string {
+  assertValidProviderText(raw);
+  let summary: string | undefined;
   try {
     const value = asRecord(JSON.parse(unwrapJsonFence(raw)) as unknown);
-    if (typeof value.summary === "string" && value.summary.trim()) return value.summary.trim();
+    if (typeof value.summary === "string" && value.summary.trim()) summary = value.summary.trim();
   } catch {
     // Fall back to the provider's visible text.
   }
-  const summary = raw.trim();
+  summary ??= raw.trim();
   if (!summary) throw new Error("Discussion summary is empty");
+  assertValidProviderText(summary);
   return summary;
 }
 

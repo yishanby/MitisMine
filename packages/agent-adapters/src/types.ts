@@ -29,6 +29,12 @@ export interface AgentAdapter {
   resume(task: ResumeAgentTask): Promise<AdapterResult>;
 }
 
+export function assertValidProviderText(text: string): void {
+  if (text.includes("\ufffd")) {
+    throw new Error("Invalid Unicode in provider output");
+  }
+}
+
 export async function collectNormalized(
   provider: ProviderName,
   runner: AgentRunner,
@@ -53,7 +59,13 @@ export async function collectNormalized(
     const code = typeof fatal.code === "string" ? fatal.code : "provider_error";
     throw new Error(`${provider} failed with ${code}`);
   }
-  if (!events.some((event) => event.type === "final" && typeof event.text === "string")) {
+  let hasFinal = false;
+  for (const event of events) {
+    if (event.type !== "final" || typeof event.text !== "string") continue;
+    hasFinal = true;
+    assertValidProviderText(event.text);
+  }
+  if (!hasFinal) {
     throw new Error(`${provider} did not emit a final event`);
   }
   if (externalSessionId === undefined) {

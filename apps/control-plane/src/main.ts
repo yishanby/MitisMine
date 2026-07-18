@@ -187,7 +187,7 @@ export class ChannelDispatcher implements FeishuDispatcher {
       this.#enqueue(
         input,
         result.run.state === "cancelled"
-          ? "调���已停止"
+          ? "调研已停止"
           : result.run.state === "paused"
             ? "调研已暂停"
             : result.run.unresolved

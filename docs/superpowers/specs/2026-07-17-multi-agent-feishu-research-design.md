@@ -9,7 +9,7 @@
 MitisMine 让小团队只通过飞书即可随时发起、继续和审阅多 Agent 调研。系统必须满足：
 
 1. 四个真实飞书机器人分别作为总控、Claude、Codex、Copilot 入口。
-2. Topic 是跨机器��共享的持久化调研空间，支持创建、切换、恢复、共享和归档。
+2. Topic 是跨机器共享的持久化调研空间，支持创建、切换、恢复、共享和归档。
 3. Claude Code、Codex、Copilot CLI 先独立调研，再互相校验并按争议继续深挖。
 4. 最终报告中的重要主张必须绑定证据片段、来源、获取时间和可信度。
 5. 每个顶层 Agent 可提出子 Agent 任务；总并发不超过 6，每个顶层 Agent 最多 2 个子任务。
@@ -35,7 +35,7 @@ MitisMine 让小团队只通过飞书即可随时发起、继续和审阅多 Age
 | MitisMine Codex | `cli_aad0b6053e78dd01` | 当前 Topic 内的 Codex 深挖 |
 | MitisMine Copilot | `cli_aad0b65c14f8dd24` | 当前 Topic 内的 Copilot CLI 深挖 |
 
-四个 App 连接同一控制面。系统优先以租户内稳定的 `(tenant_key, user_id)` 识别同一飞书用户；事件未提供 `user_id` 时回退到 `(tenant_key, union_id)`。`open_id` 是 App 相关标识，仅用于向对应 App 会话回发消息。启动时必须验证四个 App 对测试用户解析到��一主体，否则拒绝启用跨 App Topic 游标并报告配置错误。
+四个 App 连接同一控制面。系统优先以租户内稳定的 `(tenant_key, user_id)` 识别同一飞书用户；事件未提供 `user_id` 时回退到 `(tenant_key, union_id)`。`open_id` 是 App 相关标识，仅用于向对应 App 会话回发消息。启动时必须验证四个 App 对测试用户解析到同一主体，否则拒绝启用跨 App Topic 游标并报告配置错误。
 
 ### 3.2 Topic 命令
 
@@ -51,7 +51,7 @@ MitisMine 让小团队只通过飞书即可随时发起、继续和审阅多 Age
 - `/research <问题>`：启动完整三 Agent 调研。
 - `/status`、`/stop`、`/report`：查看状态、停止活动 Run、获取最新报告。
 
-总控机器人的普通消息等价于 `/research`；三个 Agent 机器人的普通消息只进入对应 Agent 的当前 Topic Session。若用户尚未选择 Topic，机器人先创建一个以消息摘要命名的 Topic，��继续执行。
+总控机器人的普通消息等价于 `/research`；三个 Agent 机器人的普通消息只进入对应 Agent 的当前 Topic Session。若用户尚未选择 Topic，机器人先创建一个以消息摘要命名的 Topic，并继续执行。
 
 ## 4. 总体架构
 
@@ -193,7 +193,7 @@ queued -> independent_research -> normalize_evidence
 
 ### 9.3 Copilot CLI
 
-使用 `copilot -p --output-format json --session-id <uuid> --no-ask-user`；通过 `--available-tools` 和细粒度 allow/deny 约束工具，并用 `--secret-env-vars` 去除敏感环境变��。
+使用 `copilot -p --output-format json --session-id <uuid> --no-ask-user`；通过 `--available-tools` 和细粒度 allow/deny 约束工具，并用 `--secret-env-vars` 去除敏感环境变量。
 
 所有 Adapter 把原始 JSONL 保存到受限日志，再转换为统一事件：`session_started`、`delta`、`tool_call`、`tool_result`、`final`、`usage`、`error`。
 

@@ -83,6 +83,21 @@ describe("CLI adapters", () => {
     expect(result.events).toContainEqual({ type: "final", text: "answer" });
   });
 
+  it("rejects a final event containing invalid Unicode", async () => {
+    const replacementCharacter = String.fromCodePoint(0xfffd);
+    const runner: AgentRunner = async function* () {
+      yield { type: "session", externalSessionId: "session-corrupt" };
+      yield { type: "final", text: `corrupt ${replacementCharacter} answer` };
+    };
+
+    await expect(collectNormalized(
+      "claude",
+      runner,
+      { command: "synthetic" },
+      (event) => [event],
+    )).rejects.toThrow(/invalid Unicode.*provider output/i);
+  });
+
   it.each(["claude", "codex", "copilot"] as const)(
     "%s starts and resumes the same Topic session",
     async (provider) => {

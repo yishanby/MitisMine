@@ -195,7 +195,7 @@ export class FeishuGateway {
     if (event.appRole !== "hub" && isHubOnly(command)) {
       this.#respond(
         event,
-        textCard("请使用 Hub App", "该命令会修改 Topic 或启动/��止任务，只能在 Hub App 中执行。"),
+        textCard("请使用 Hub App", "该命令会修改 Topic 或启动/停止任务，只能在 Hub App 中执行。"),
       );
       return;
     }
