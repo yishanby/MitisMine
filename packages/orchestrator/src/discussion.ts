@@ -759,7 +759,7 @@ export class GroupDiscussionChannel {
       const linkedReceipt = linkedReceipts[0];
       if (linkedReceipt !== undefined) {
         assertSteerReceiptMatchesEvent(linkedReceipt, input, discussion);
-        this.#store.recordSteer({
+        const receiptInput = {
           id: linkedReceipt.id,
           discussionId: discussion.id,
           messageId: input.messageId,
@@ -769,13 +769,18 @@ export class GroupDiscussionChannel {
           ...(input.preferredProvider === undefined
             ? {}
             : { preferredProvider: input.preferredProvider }),
-        });
+        };
+        if (["active", "paused", "summarizing"].includes(discussion.state)) {
+          this.#store.recordSteer(receiptInput);
+        } else {
+          this.#store.recordTerminalSteerTombstone(receiptInput, event.createdAt);
+        }
         continue;
       }
       const existing = this.#store.steerForMessage(input.messageId);
       if (existing !== undefined) {
         assertSteerReceiptMatchesEvent(existing, input, discussion);
-        this.#store.recordSteer({
+        const receiptInput = {
           id: existing.id,
           discussionId: discussion.id,
           messageId: input.messageId,
@@ -785,7 +790,12 @@ export class GroupDiscussionChannel {
           ...(input.preferredProvider === undefined
             ? {}
             : { preferredProvider: input.preferredProvider }),
-        });
+        };
+        if (["active", "paused", "summarizing"].includes(discussion.state)) {
+          this.#store.recordSteer(receiptInput);
+        } else {
+          this.#store.recordTerminalSteerTombstone(receiptInput, event.createdAt);
+        }
         continue;
       }
       const recoveredInput = {
@@ -1038,7 +1048,7 @@ export class GroupDiscussionChannel {
       steerEventPreferredProvider(event),
       input.preferredProvider,
     );
-    this.#store.recordSteer({
+    const receiptInput = {
       id: steerId,
       discussionId: discussion.id,
       messageId: input.messageId,
@@ -1048,7 +1058,15 @@ export class GroupDiscussionChannel {
       ...(preferredProvider === undefined
         ? {}
         : { preferredProvider }),
-    });
+    };
+    if (
+      allowTerminal
+      && !["active", "paused", "summarizing"].includes(discussion.state)
+    ) {
+      this.#store.recordTerminalSteerTombstone(receiptInput);
+    } else {
+      this.#store.recordSteer(receiptInput);
+    }
   }
 }
 

@@ -2723,6 +2723,197 @@ describe("GroupDiscussionChannel", () => {
     },
   );
 
+  it.each(["completed", "stopped"] as const)(
+    "converts a terminal %s receipt-first crash into a consumed tombstone",
+    async (state) => {
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-terminal-receipt-${state}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `terminal-receipt-${state}-message`;
+      const text = `Terminal receipt while ${state}`;
+      let id = 0;
+      const seedEvents = EventStore.open(path);
+      const seedDiscussions = SqliteDiscussionStore.open(path);
+      const seedChannel = new GroupDiscussionChannel({
+        store: seedDiscussions,
+        events: seedEvents,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `terminal-receipt-${state}-${++id}`,
+      });
+      await seedChannel.receive({
+        ...scope,
+        messageId: `terminal-receipt-${state}-start`,
+        text: "Terminal receipt Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: `hub-terminal-receipt-${state}-start`,
+      });
+      const active = seedDiscussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(active).toBeDefined();
+      seedDiscussions.recordSteer({
+        id: `terminal-receipt-${state}-receipt`,
+        discussionId: active!.id,
+        messageId,
+        principalId: scope.principalId,
+        text,
+        preferredProvider: "codex",
+      });
+      const current = seedDiscussions.discussion(active!.id);
+      expect(current).toBeDefined();
+      seedDiscussions.saveDiscussion({
+        ...current!,
+        state,
+        version: current!.version + 1,
+        ...(state === "completed" ? { summaryText: "Already complete" } : {}),
+      });
+      seedDiscussions.close();
+      seedEvents.close();
+
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const pendingAtRefresh: number[] = [];
+      const options = {
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId: string) => {
+            pendingAtRefresh.push(discussions.pendingSteers(discussionId).length);
+          },
+          kick: () => {},
+        },
+        idFactory: () => `terminal-receipt-${state}-${++id}`,
+      };
+      try {
+        const channel = new GroupDiscussionChannel(options);
+        channel.recoverPendingSteerEvents();
+        channel.recoverPendingSteerEvents();
+
+        const receipt = discussions.steerForMessage(messageId);
+        expect(receipt).toMatchObject({
+          discussionId: active!.id,
+          preferredProvider: "codex",
+          status: "consumed",
+        });
+        expect(receipt?.topicEventSeq).toBeGreaterThan(0);
+        expect(discussions.pendingSteers(active!.id)).toEqual([]);
+
+        await channel.receive({
+          ...scope,
+          messageId,
+          text,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-terminal-receipt-${state}-replay`,
+        });
+        expect(discussions.steerForMessage(messageId)).toMatchObject({
+          topicEventSeq: receipt?.topicEventSeq,
+          preferredProvider: "codex",
+          status: "consumed",
+        });
+        expect(pendingAtRefresh).toEqual([0]);
+        expect(events.events(active!.topicId).filter((event) => {
+          const payload = event.payload as { messageId?: string };
+          return event.type === "discussion.steer.added" && payload.messageId === messageId;
+        })).toHaveLength(1);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each([
+    [undefined, "codex", false],
+    ["claude", "claude", true],
+  ] as const)(
+    "reconciles terminal receipt provider %s with existing codex event",
+    async (receiptProvider, expectedProvider, rejects) => {
+      const label = receiptProvider ?? "none";
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-terminal-combined-${label}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const options = {
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `terminal-combined-${label}-${++id}`,
+      };
+      const channel = new GroupDiscussionChannel(options);
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `terminal-combined-${label}-message`;
+      const text = "Terminal combined provider";
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `terminal-combined-${label}-start`,
+          text: "Terminal combined Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-terminal-combined-${label}-start`,
+        });
+        const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(active).toBeDefined();
+        discussions.recordSteer({
+          id: `terminal-combined-${label}-receipt`,
+          discussionId: active!.id,
+          messageId,
+          principalId: scope.principalId,
+          text,
+          ...(receiptProvider === undefined ? {} : { preferredProvider: receiptProvider }),
+        });
+        const event = events.append({
+          topicId: active!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: scope.principalId,
+          payload: {
+            schemaVersion: 2,
+            discussionId: active!.id,
+            principalId: scope.principalId,
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+            preferredProvider: "codex",
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        const current = discussions.discussion(active!.id);
+        discussions.saveDiscussion({
+          ...current!,
+          state: "stopped",
+          version: current!.version + 1,
+        });
+        const before = discussions.steerForMessage(messageId);
+
+        if (rejects) {
+          expect(() => new GroupDiscussionChannel(options).recoverPendingSteerEvents())
+            .toThrow(/inconsistent discussion steer receipt/i);
+          expect(discussions.steerForMessage(messageId)).toEqual(before);
+        } else {
+          new GroupDiscussionChannel(options).recoverPendingSteerEvents();
+          expect(discussions.steerForMessage(messageId)).toMatchObject({
+            topicEventSeq: event.seq,
+            preferredProvider: expectedProvider,
+            status: "consumed",
+          });
+          expect(discussions.pendingSteers(active!.id)).toEqual([]);
+        }
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it("rejects an inconsistent returned scoped steer event before recording receipt", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-validation-"));
     temporaryDirectories.push(directory);

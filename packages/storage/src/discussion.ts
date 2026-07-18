@@ -586,15 +586,31 @@ export class SqliteDiscussionStore {
       if (existing !== undefined) {
         if (
           existing.discussion_id !== input.discussionId
-          || existing.topic_event_seq !== input.topicEventSeq
           || existing.principal_id !== input.principalId
           || existing.text !== input.text
-          || existing.status !== "consumed"
         ) {
           throw new Error(`Inconsistent Discussion steer tombstone: ${input.messageId}`);
         }
+        if (existing.topic_event_seq !== 0 && existing.topic_event_seq !== input.topicEventSeq) {
+          throw new Error(`Discussion steer tombstone is bound to another TopicEvent: ${input.messageId}`);
+        }
+        if (
+          existing.preferred_provider !== null
+          && input.preferredProvider !== undefined
+          && existing.preferred_provider !== input.preferredProvider
+        ) {
+          throw new Error(`Conflicting preferred provider for Discussion steer: ${input.messageId}`);
+        }
+        const preferredProvider = existing.preferred_provider ?? input.preferredProvider ?? null;
+        this.#database.prepare(`
+          UPDATE discussion_steers SET
+            topic_event_seq = ?, preferred_provider = ?, status = 'consumed',
+            consumed_at = COALESCE(consumed_at, ?)
+          WHERE id = ?
+        `).run(input.topicEventSeq, preferredProvider, consumedAt, existing.id);
+        const tombstone = this.#steer(existing.id);
         this.#database.exec("COMMIT");
-        return mapSteer(existing);
+        return tombstone as DiscussionSteer;
       }
       this.#database.prepare(`
         INSERT INTO discussion_steers (
