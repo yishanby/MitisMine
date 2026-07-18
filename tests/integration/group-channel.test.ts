@@ -2378,6 +2378,89 @@ describe("GroupDiscussionChannel", () => {
     },
   );
 
+  it("enriches an undefined receipt from an existing provider event before Hub refresh", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-live-combined-provider-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const messageId = "live-combined-provider-message";
+    const refreshedPreferences: Array<string | undefined> = [];
+    const kicked: string[] = [];
+    let id = 0;
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: {
+        refreshControl: async () => {
+          refreshedPreferences.push(discussions.steerForMessage(messageId)?.preferredProvider);
+        },
+        kick: (discussionId) => { kicked.push(discussionId); },
+      },
+      idFactory: () => `live-combined-provider-${++id}`,
+    });
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+    const text = "Recover combined provider preference";
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "live-combined-provider-start",
+        text: "Combined provider Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-live-combined-provider-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      discussions.recordSteer({
+        id: "live-combined-provider-receipt",
+        discussionId: discussion!.id,
+        messageId,
+        principalId: "tenant-1:user:member",
+        text,
+      });
+      events.append({
+        topicId: discussion!.topicId,
+        type: "discussion.steer.added",
+        actorPrincipalId: "tenant-1:user:member",
+        payload: {
+          schemaVersion: 2,
+          discussionId: discussion!.id,
+          principalId: "tenant-1:user:member",
+          tenantKey: scope.tenantKey,
+          chatId: scope.chatId,
+          messageId,
+          text,
+          preferredProvider: "codex",
+        },
+        idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+      });
+      refreshedPreferences.length = 0;
+      kicked.length = 0;
+
+      await channel.receive({
+        ...scope,
+        principalId: "tenant-1:user:member",
+        messageId,
+        text,
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-live-combined-provider-replay",
+      });
+
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        preferredProvider: "codex",
+      });
+      expect(refreshedPreferences).toEqual(["codex"]);
+      expect(kicked).toEqual([discussion!.id]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
   it.each(["unpublished", "linked"] as const)(
     "enriches an exact %s receipt from its provider steer event during recovery",
     async (boundary) => {

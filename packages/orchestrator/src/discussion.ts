@@ -1034,6 +1034,10 @@ export class GroupDiscussionChannel {
       ),
     });
     assertDiscussionSteerAddedEvent(event, input, discussion, allowTerminal);
+    const preferredProvider = reconcilePreferredProvider(
+      steerEventPreferredProvider(event),
+      input.preferredProvider,
+    );
     this.#store.recordSteer({
       id: steerId,
       discussionId: discussion.id,
@@ -1041,9 +1045,9 @@ export class GroupDiscussionChannel {
       topicEventSeq: event.seq,
       principalId: input.principalId,
       text: input.text,
-      ...(input.preferredProvider === undefined
+      ...(preferredProvider === undefined
         ? {}
-        : { preferredProvider: input.preferredProvider }),
+        : { preferredProvider }),
     });
   }
 }
