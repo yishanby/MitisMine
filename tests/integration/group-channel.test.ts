@@ -13,6 +13,15 @@ import { EventStore } from "../../packages/storage/src/store.js";
 
 const temporaryDirectories: string[] = [];
 
+function groupEffectKey(
+  tenantKey: string,
+  chatId: string,
+  messageId: string,
+  operation: "topic" | "discussion-started" | "steer",
+): string {
+  return `group-message:${JSON.stringify([tenantKey, chatId, messageId, operation])}`;
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -134,9 +143,14 @@ describe("GroupDiscussionChannel", () => {
       topicId: topic.id,
       type: "topic.created",
       actorPrincipalId: topic.ownerPrincipalId,
-      payload: { topic },
+      payload: {
+        topic,
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        messageId,
+      },
       createdAt: topic.createdAt,
-      idempotencyKey: `group-message:${messageId}:topic`,
+      idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
     });
     if (boundary !== "topic-created") {
       discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
@@ -162,11 +176,17 @@ describe("GroupDiscussionChannel", () => {
         actorPrincipalId: topic.ownerPrincipalId,
         payload: {
           discussionId: "discussion-from-start-message",
+          tenantKey: "tenant-1",
           chatId: "chat-1",
           messageId,
           question: "Choose the architecture",
         },
-        idempotencyKey: `group-message:${messageId}:discussion-started`,
+        idempotencyKey: groupEffectKey(
+          "tenant-1",
+          "chat-1",
+          messageId,
+          "discussion-started",
+        ),
       });
     }
     if (boundary === "initial-receipt" || boundary === "initial-consumed") {
@@ -223,6 +243,584 @@ describe("GroupDiscussionChannel", () => {
         "topic.created",
         "discussion.started",
       ]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("rejects a bound group Topic owned by another tenant", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-bound-topic-tenant-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const foreignTopic = createTopic("Foreign tenant Topic", "tenant-2:user:owner", {
+      id: "foreign-tenant-bound-topic",
+    });
+    events.append({
+      topicId: foreignTopic.id,
+      type: "topic.created",
+      payload: { topic: foreignTopic },
+    });
+    discussions.bindChatTopic("tenant-1", "chat-1", foreignTopic.id);
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => "must-not-create-an-id",
+    });
+
+    try {
+      await expect(channel.receive({
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+        messageId: "foreign-tenant-bound-message",
+        text: "Do not cross tenants",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-foreign-tenant-bound",
+      })).rejects.toThrow(/group Topic tenant/i);
+      expect(discussions.activeForChat("tenant-1", "chat-1")).toBeUndefined();
+      expect(events.events(foreignTopic.id).map(({ type }) => type)).toEqual(["topic.created"]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("reuses a legacy started event when its initial receipt already exists", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-legacy-start-receipt-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const topic = createTopic("Legacy receipt", "tenant-1:user:owner", {
+      id: "legacy-receipt-topic",
+    });
+    events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
+    const messageId = "legacy-receipt-message";
+    const discussion = discussions.createDiscussion(createDiscussion({
+      id: "legacy-receipt-discussion",
+      topicId: topic.id,
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Reuse the receipt boundary",
+      starterPrincipalId: topic.ownerPrincipalId,
+      startMessageId: messageId,
+    }));
+    const started = events.append({
+      topicId: topic.id,
+      type: "discussion.started",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: {
+        discussionId: discussion.id,
+        chatId: discussion.chatId,
+        messageId,
+        question: discussion.question,
+      },
+      idempotencyKey: `group-message:${messageId}:discussion-started`,
+    });
+    discussions.recordSteer({
+      id: "legacy-initial-receipt",
+      discussionId: discussion.id,
+      messageId,
+      topicEventSeq: started.seq,
+      principalId: discussion.starterPrincipalId,
+      text: discussion.question,
+    });
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => "legacy-retry-id",
+    });
+
+    try {
+      await channel.receive({
+        tenantKey: discussion.tenantKey,
+        principalId: discussion.starterPrincipalId,
+        chatId: discussion.chatId,
+        messageId,
+        text: discussion.question,
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-legacy-start-retry",
+      });
+
+      expect(events.events(topic.id).map(({ type }) => type)).toEqual([
+        "topic.created",
+        "discussion.started",
+      ]);
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        discussionId: discussion.id,
+        topicEventSeq: started.seq,
+      });
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it.each([
+    ["tenant", "topic-created"],
+    ["tenant", "topic-bound"],
+    ["chat", "topic-created"],
+    ["chat", "topic-bound"],
+  ] as const)(
+    "does not reuse a foreign %s scope at the %s boundary",
+    async (wrongScope, boundary) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-topic-scope-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const foreignTopic = createTopic("Foreign Topic", "tenant-1:user:owner", {
+        id: "foreign-topic",
+      });
+      const messageId = "shared-earliest-message";
+      events.append({
+        topicId: foreignTopic.id,
+        type: "topic.created",
+        actorPrincipalId: foreignTopic.ownerPrincipalId,
+        payload: { topic: foreignTopic },
+        idempotencyKey: `group-message:${messageId}:topic`,
+      });
+      if (boundary === "topic-bound") {
+        discussions.bindChatTopic("tenant-1", "chat-1", foreignTopic.id);
+      }
+      const target = wrongScope === "tenant"
+        ? {
+            tenantKey: "tenant-2",
+            principalId: "tenant-2:user:owner",
+            chatId: "chat-1",
+          }
+        : {
+            tenantKey: "tenant-1",
+            principalId: "tenant-1:user:owner",
+            chatId: "chat-2",
+          };
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `target-${wrongScope}-${boundary}-${++id}`,
+      });
+
+      try {
+        await channel.receive({
+          ...target,
+          messageId,
+          text: "Target Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `target-${wrongScope}-${boundary}`,
+        });
+
+        const targetTopicId = discussions.chatTopic(target.tenantKey, target.chatId);
+        const targetDiscussion = discussions.activeForChat(target.tenantKey, target.chatId);
+        expect(targetTopicId).toBeDefined();
+        expect(targetTopicId).not.toBe(foreignTopic.id);
+        expect(events.topic(targetTopicId ?? "")?.tenantKey).toBe(target.tenantKey);
+        expect(targetDiscussion?.topicId).toBe(targetTopicId);
+        expect(events.events(foreignTopic.id).map(({ type }) => type)).toEqual(["topic.created"]);
+        expect(events.events(targetTopicId ?? "").map(({ type }) => type)).toEqual([
+          "topic.created",
+          "discussion.started",
+        ]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it("reuses one scoped topic effect for the same tenant/chat across Apps", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-topic-dedup-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const topic = createTopic("Scoped Topic", "tenant-1:user:owner", { id: "scoped-topic" });
+    const messageId = "scoped-topic-message";
+    events.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: {
+        topic,
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        messageId,
+      },
+      idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
+    });
+    let id = 0;
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `scoped-topic-generated-${++id}`,
+    });
+
+    try {
+      await channel.receive({
+        tenantKey: "tenant-1",
+        principalId: topic.ownerPrincipalId,
+        chatId: "chat-1",
+        messageId,
+        text: "Scoped Topic",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-scoped-topic",
+      });
+
+      expect(discussions.chatTopic("tenant-1", "chat-1")).toBe(topic.id);
+      expect(discussions.activeForChat("tenant-1", "chat-1")?.topicId).toBe(topic.id);
+      expect(events.events(topic.id).map(({ type }) => type)).toEqual([
+        "topic.created",
+        "discussion.started",
+      ]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("rejects an inconsistent returned scoped topic event before binding", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-topic-validation-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const topic = createTopic("Mismatched Topic", "tenant-1:user:owner", {
+      id: "mismatched-topic",
+    });
+    const messageId = "mismatched-topic-message";
+    events.append({
+      topicId: topic.id,
+      type: "topic.created",
+      payload: {
+        topic,
+        tenantKey: "tenant-1",
+        chatId: "chat-other",
+        messageId,
+      },
+      idempotencyKey: groupEffectKey("tenant-1", "chat-1", messageId, "topic"),
+    });
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => "unused-validation-id",
+    });
+
+    try {
+      await expect(channel.receive({
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+        messageId,
+        text: "Mismatched Topic",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-mismatched-topic",
+      })).rejects.toThrow(/inconsistent topic\.created event/i);
+      expect(discussions.chatTopic("tenant-1", "chat-1")).toBeUndefined();
+      expect(discussions.activeForChat("tenant-1", "chat-1")).toBeUndefined();
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("rejects an inconsistent returned scoped Discussion-started event before receipt", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-started-validation-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    const topic = createTopic("Started validation", "tenant-1:user:owner", {
+      id: "started-validation-topic",
+    });
+    events.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    discussions.bindChatTopic("tenant-1", "chat-1", topic.id);
+    const messageId = "started-validation-message";
+    const discussion = createDiscussion({
+      id: "started-validation-discussion",
+      topicId: topic.id,
+      tenantKey: "tenant-1",
+      chatId: "chat-1",
+      question: "Validate started event",
+      starterPrincipalId: topic.ownerPrincipalId,
+      startMessageId: messageId,
+    });
+    discussions.createDiscussion(discussion);
+    events.append({
+      topicId: topic.id,
+      type: "discussion.started",
+      payload: {
+        discussionId: "different-discussion",
+        tenantKey: "tenant-1",
+        chatId: "chat-1",
+        messageId,
+        question: discussion.question,
+      },
+      idempotencyKey: groupEffectKey(
+        "tenant-1",
+        "chat-1",
+        messageId,
+        "discussion-started",
+      ),
+    });
+    const refreshed: string[] = [];
+    const kicked: string[] = [];
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: {
+        refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+        kick: (discussionId) => { kicked.push(discussionId); },
+      },
+      idFactory: () => "unused-started-validation-id",
+    });
+
+    try {
+      await expect(channel.receive({
+        tenantKey: "tenant-1",
+        principalId: topic.ownerPrincipalId,
+        chatId: "chat-1",
+        messageId,
+        text: discussion.question,
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-started-validation",
+      })).rejects.toThrow(/inconsistent discussion\.started event/i);
+      expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      expect(refreshed).toEqual([]);
+      expect(kicked).toEqual([]);
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it.each(["tenant", "chat"] as const)(
+    "does not reuse a foreign %s steer effect before its receipt",
+    async (wrongScope) => {
+      const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-scope-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: { refreshControl: async () => {}, kick: () => {} },
+        idFactory: () => `steer-scope-${++id}`,
+      });
+      const foreign = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const target = wrongScope === "tenant"
+        ? {
+            tenantKey: "tenant-2",
+            principalId: "tenant-2:user:owner",
+            chatId: "chat-1",
+          }
+        : {
+            tenantKey: "tenant-1",
+            principalId: "tenant-1:user:owner",
+            chatId: "chat-2",
+          };
+
+      try {
+        await channel.receive({
+          ...foreign,
+          messageId: "foreign-steer-start",
+          text: "Foreign Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: "hub-foreign-steer-start",
+        });
+        await channel.receive({
+          ...target,
+          messageId: `target-${wrongScope}-steer-start`,
+          text: "Target Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-target-${wrongScope}-steer-start`,
+        });
+        const foreignDiscussion = discussions.activeForChat(foreign.tenantKey, foreign.chatId);
+        const targetDiscussion = discussions.activeForChat(target.tenantKey, target.chatId);
+        expect(foreignDiscussion).toBeDefined();
+        expect(targetDiscussion).toBeDefined();
+        const messageId = "shared-steer-before-receipt";
+        events.append({
+          topicId: foreignDiscussion!.topicId,
+          type: "discussion.steer.added",
+          payload: {
+            discussionId: foreignDiscussion!.id,
+            messageId,
+            text: "Shared steer",
+          },
+          idempotencyKey: `group-message:${messageId}:steer`,
+        });
+
+        await channel.receive({
+          ...target,
+          messageId,
+          text: "Shared steer",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-target-${wrongScope}-steer`,
+        });
+
+        const targetEvents = events.events(targetDiscussion!.topicId)
+          .filter(({ type }) => type === "discussion.steer.added");
+        expect(targetEvents).toHaveLength(1);
+        expect(targetEvents[0]).toMatchObject({
+          topicId: targetDiscussion!.topicId,
+          payload: expect.objectContaining({
+            discussionId: targetDiscussion!.id,
+            messageId,
+          }),
+        });
+        expect(discussions.steerForMessage(messageId)).toMatchObject({
+          discussionId: targetDiscussion!.id,
+          topicEventSeq: targetEvents[0]?.seq,
+        });
+        expect(events.events(foreignDiscussion!.topicId)
+          .filter(({ type }) => type === "discussion.steer.added")).toHaveLength(1);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it("deduplicates a same-scope cross-App steer event committed before its receipt", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-dedup-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: { refreshControl: async () => {}, kick: () => {} },
+      idFactory: () => `steer-dedup-${++id}`,
+    });
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "steer-dedup-start",
+        text: "Steer dedup Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-steer-dedup-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      const messageId = "steer-dedup-message";
+      const committed = events.append({
+        topicId: discussion!.topicId,
+        type: "discussion.steer.added",
+        payload: {
+          discussionId: discussion!.id,
+          tenantKey: scope.tenantKey,
+          chatId: scope.chatId,
+          messageId,
+          text: "Deduplicate this steer",
+        },
+        idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+      });
+
+      await channel.receive({
+        ...scope,
+        messageId,
+        text: "Deduplicate this steer",
+        sourceAppRole: "codex",
+        preferredProvider: "codex",
+        idempotencyKey: "codex-steer-dedup",
+      });
+
+      expect(events.events(discussion!.topicId)
+        .filter(({ type }) => type === "discussion.steer.added")).toEqual([committed]);
+      expect(discussions.steerForMessage(messageId)).toMatchObject({
+        discussionId: discussion!.id,
+        topicEventSeq: committed.seq,
+        preferredProvider: "codex",
+      });
+    } finally {
+      discussions.close();
+      events.close();
+    }
+  });
+
+  it("rejects an inconsistent returned scoped steer event before recording receipt", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-validation-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "group.db");
+    const events = EventStore.open(path);
+    const discussions = SqliteDiscussionStore.open(path);
+    let id = 0;
+    const refreshed: string[] = [];
+    const kicked: string[] = [];
+    const channel = new GroupDiscussionChannel({
+      store: discussions,
+      events,
+      coordinator: {
+        refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+        kick: (discussionId) => { kicked.push(discussionId); },
+      },
+      idFactory: () => `steer-validation-${++id}`,
+    });
+    const scope = {
+      tenantKey: "tenant-1",
+      principalId: "tenant-1:user:owner",
+      chatId: "chat-1",
+    };
+
+    try {
+      await channel.receive({
+        ...scope,
+        messageId: "steer-validation-start",
+        text: "Steer validation Discussion",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-steer-validation-start",
+      });
+      const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+      expect(discussion).toBeDefined();
+      const messageId = "steer-validation-message";
+      events.append({
+        topicId: discussion!.topicId,
+        type: "discussion.steer.added",
+        payload: {
+          discussionId: "different-discussion",
+          tenantKey: scope.tenantKey,
+          chatId: scope.chatId,
+          messageId,
+          text: "Validate steer",
+        },
+        idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+      });
+      refreshed.length = 0;
+      kicked.length = 0;
+
+      await expect(channel.receive({
+        ...scope,
+        messageId,
+        text: "Validate steer",
+        sourceAppRole: "hub",
+        idempotencyKey: "hub-steer-validation",
+      })).rejects.toThrow(/inconsistent discussion\.steer\.added event/i);
+      expect(discussions.steerForMessage(messageId)).toBeUndefined();
+      expect(refreshed).toEqual([]);
+      expect(kicked).toEqual([]);
     } finally {
       discussions.close();
       events.close();

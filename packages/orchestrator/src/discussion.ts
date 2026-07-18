@@ -27,7 +27,7 @@ import {
   type DiscussionTurn,
   SqliteDiscussionStore,
 } from "../../storage/src/discussion.js";
-import type { EventStore } from "../../storage/src/store.js";
+import type { EventStore, TopicEvent } from "../../storage/src/store.js";
 import {
   AgentConcurrencyLimiter,
   type AgentCallLimiter,
@@ -749,14 +749,22 @@ export class GroupDiscussionChannel {
         actorPrincipalId: input.principalId,
         payload: {
           discussionId: active.id,
+          tenantKey: input.tenantKey,
+          chatId: input.chatId,
           messageId: input.messageId,
           text: input.text,
           ...(input.preferredProvider === undefined
             ? {}
             : { preferredProvider: input.preferredProvider }),
         },
-        idempotencyKey: `group-message:${input.messageId}:steer`,
+        idempotencyKey: groupEffectKey(
+          input.tenantKey,
+          input.chatId,
+          input.messageId,
+          "steer",
+        ),
       });
+      assertDiscussionSteerAddedEvent(event, input, active);
       this.#store.recordSteer({
         id: this.#idFactory(),
         discussionId: active.id,
@@ -777,6 +785,9 @@ export class GroupDiscussionChannel {
 
     let topicId = this.#store.chatTopic(input.tenantKey, input.chatId);
     const boundTopic = topicId === undefined ? undefined : this.#events.topic(topicId);
+    if (boundTopic !== undefined && boundTopic.tenantKey !== input.tenantKey) {
+      throw new Error("Group Topic tenant does not match chat tenant");
+    }
     if (boundTopic === undefined || boundTopic.status !== "active") {
       const topic = createTopic(summarizeQuestion(input.text), input.principalId, {
         id: this.#idFactory(),
@@ -785,10 +796,21 @@ export class GroupDiscussionChannel {
         topicId: topic.id,
         type: "topic.created",
         actorPrincipalId: input.principalId,
-        payload: { topic },
+        payload: {
+          topic,
+          tenantKey: input.tenantKey,
+          chatId: input.chatId,
+          messageId: input.messageId,
+        },
         createdAt: topic.createdAt,
-        idempotencyKey: `group-message:${input.messageId}:topic`,
+        idempotencyKey: groupEffectKey(
+          input.tenantKey,
+          input.chatId,
+          input.messageId,
+          "topic",
+        ),
       });
+      assertTopicCreatedEvent(created, input);
       topicId = created.topicId;
       this.#store.bindChatTopic(input.tenantKey, input.chatId, created.topicId);
     }
@@ -806,23 +828,37 @@ export class GroupDiscussionChannel {
   }
 
   async #finishStart(input: GroupDiscussionReceiveInput, discussion: GroupDiscussion): Promise<void> {
-    const started = this.#events.append({
-      topicId: discussion.topicId,
-      type: "discussion.started",
-      actorPrincipalId: discussion.starterPrincipalId,
-      payload: {
-        discussionId: discussion.id,
-        chatId: discussion.chatId,
-        messageId: input.messageId,
-        question: discussion.question,
-      },
-      idempotencyKey: `group-message:${input.messageId}:discussion-started`,
-    });
+    const priorReceipt = this.#store.steerForMessage(input.messageId);
+    let topicEventSeq: number;
+    if (priorReceipt?.discussionId === discussion.id) {
+      topicEventSeq = priorReceipt.topicEventSeq;
+    } else {
+      const started = this.#events.append({
+        topicId: discussion.topicId,
+        type: "discussion.started",
+        actorPrincipalId: discussion.starterPrincipalId,
+        payload: {
+          discussionId: discussion.id,
+          tenantKey: discussion.tenantKey,
+          chatId: discussion.chatId,
+          messageId: input.messageId,
+          question: discussion.question,
+        },
+        idempotencyKey: groupEffectKey(
+          input.tenantKey,
+          input.chatId,
+          input.messageId,
+          "discussion-started",
+        ),
+      });
+      assertDiscussionStartedEvent(started, input, discussion);
+      topicEventSeq = started.seq;
+    }
     const initialReceipt = this.#store.recordSteer({
       id: this.#idFactory(),
       discussionId: discussion.id,
       messageId: input.messageId,
-      topicEventSeq: started.seq,
+      topicEventSeq,
       principalId: discussion.starterPrincipalId,
       text: discussion.question,
       ...(input.preferredProvider === undefined
@@ -945,4 +981,83 @@ function assertValidDecodedProviderValue(value: unknown): void {
 function summarizeQuestion(text: string): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length <= 60 ? oneLine : `${oneLine.slice(0, 59)}…`;
+}
+
+type GroupEffectOperation = "topic" | "discussion-started" | "steer";
+
+function groupEffectKey(
+  tenantKey: string,
+  chatId: string,
+  messageId: string,
+  operation: GroupEffectOperation,
+): string {
+  return `group-message:${JSON.stringify([tenantKey, chatId, messageId, operation])}`;
+}
+
+function assertTopicCreatedEvent(
+  event: TopicEvent,
+  input: GroupDiscussionReceiveInput,
+): void {
+  const payload = recordValue(event.payload);
+  const topic = recordValue(payload?.topic);
+  if (
+    event.type !== "topic.created"
+    || topic?.id !== event.topicId
+    || topic.tenantKey !== input.tenantKey
+    || payload?.tenantKey !== input.tenantKey
+    || payload.chatId !== input.chatId
+    || payload.messageId !== input.messageId
+  ) {
+    throw new Error("Inconsistent topic.created event");
+  }
+}
+
+function assertDiscussionStartedEvent(
+  event: TopicEvent,
+  input: GroupDiscussionReceiveInput,
+  discussion: GroupDiscussion,
+): void {
+  const payload = recordValue(event.payload);
+  if (
+    event.type !== "discussion.started"
+    || event.topicId !== discussion.topicId
+    || discussion.tenantKey !== input.tenantKey
+    || discussion.chatId !== input.chatId
+    || discussion.startMessageId !== input.messageId
+    || payload?.discussionId !== discussion.id
+    || payload.tenantKey !== input.tenantKey
+    || payload.chatId !== input.chatId
+    || payload.messageId !== input.messageId
+    || payload.question !== discussion.question
+  ) {
+    throw new Error("Inconsistent discussion.started event");
+  }
+}
+
+function assertDiscussionSteerAddedEvent(
+  event: TopicEvent,
+  input: GroupDiscussionReceiveInput,
+  discussion: GroupDiscussion,
+): void {
+  const payload = recordValue(event.payload);
+  if (
+    event.type !== "discussion.steer.added"
+    || event.topicId !== discussion.topicId
+    || discussion.state !== "active"
+    || discussion.tenantKey !== input.tenantKey
+    || discussion.chatId !== input.chatId
+    || payload?.discussionId !== discussion.id
+    || payload.tenantKey !== input.tenantKey
+    || payload.chatId !== input.chatId
+    || payload.messageId !== input.messageId
+    || payload.text !== input.text
+  ) {
+    throw new Error("Inconsistent discussion.steer.added event");
+  }
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
