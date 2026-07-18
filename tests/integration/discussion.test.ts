@@ -1102,6 +1102,210 @@ describe("DiscussionCoordinator", () => {
     }
   });
 
+  it("prioritizes a paused human steer in the final summary and consumes it only after success", async () => {
+    let summaryStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { summaryStarted = resolve; });
+    let releaseSummary: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => { releaseSummary = resolve; });
+    const summaryPrompts: string[] = [];
+    const test = harness({
+      claude: deterministicAdapter("claude", summaryPrompts, async () => {
+        summaryStarted?.();
+        await blocked;
+        return JSON.stringify({ summary: "Summary follows the human steer" });
+      }),
+      codex: deterministicAdapter("codex", [], async () => {
+        throw new Error("Codex must not run after a successful summary");
+      }),
+      copilot: deterministicAdapter("copilot", [], async () => {
+        throw new Error("Copilot must not run after a successful summary");
+      }),
+    });
+    const paused = transitionDiscussion(test.discussion, "pause");
+    test.discussions.saveDiscussion(paused);
+    test.discussions.recordSteer({
+      id: "paused-summary-steer",
+      discussionId: paused.id,
+      messageId: "paused-summary-message",
+      topicEventSeq: 2,
+      principalId: "tenant-1:user:reviewer",
+      text: "Prioritize the rollback risk in the final recommendation",
+      preferredProvider: "claude",
+      createdAt: "2026-07-18T01:01:00.000Z",
+    });
+    try {
+      await test.coordinator.control(paused.id, "summarize", "tenant-1:user:reviewer");
+      await started;
+
+      expect(test.discussions.steerForMessage("paused-summary-message")?.status).toBe("pending");
+      expect(summaryPrompts).toHaveLength(1);
+      expect(summaryPrompts[0]).toContain("Human steer has priority");
+      expect(summaryPrompts[0]).toContain("tenant-1:user:reviewer");
+      expect(summaryPrompts[0]).toContain("Prioritize the rollback risk in the final recommendation");
+
+      releaseSummary?.();
+      await test.coordinator.waitForIdle(paused.id);
+
+      expect(test.discussions.discussion(paused.id)).toMatchObject({
+        state: "completed",
+        summaryText: "Summary follows the human steer",
+      });
+      expect(test.discussions.steerForMessage("paused-summary-message")?.status).toBe("consumed");
+      expect(test.discussions.pendingSteers(paused.id)).toEqual([]);
+    } finally {
+      releaseSummary?.();
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("regenerates an in-flight summary when a newer human steer arrives", async () => {
+    let firstSummaryStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { firstSummaryStarted = resolve; });
+    let releaseFirstSummary: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => { releaseFirstSummary = resolve; });
+    const summaryPrompts: string[] = [];
+    let summaryCalls = 0;
+    const test = harness({
+      claude: deterministicAdapter("claude", summaryPrompts, async () => {
+        summaryCalls += 1;
+        if (summaryCalls === 1) {
+          firstSummaryStarted?.();
+          await blocked;
+          return JSON.stringify({ summary: "Stale first summary" });
+        }
+        return JSON.stringify({ summary: "Regenerated summary with both steers" });
+      }),
+      codex: deterministicAdapter("codex", [], async () => {
+        throw new Error("Codex must not run after a successful summary");
+      }),
+      copilot: deterministicAdapter("copilot", [], async () => {
+        throw new Error("Copilot must not run after a successful summary");
+      }),
+    });
+    const paused = transitionDiscussion(test.discussion, "pause");
+    test.discussions.saveDiscussion(paused);
+    test.discussions.recordSteer({
+      id: "summary-steer-old",
+      discussionId: paused.id,
+      messageId: "summary-message-old",
+      topicEventSeq: 2,
+      principalId: "tenant-1:user:first",
+      text: "Preserve the original rollout constraint",
+      createdAt: "2026-07-18T01:01:00.000Z",
+    });
+    try {
+      await test.coordinator.control(paused.id, "summarize", "tenant-1:user:first");
+      await started;
+      test.discussions.recordSteer({
+        id: "summary-steer-new",
+        discussionId: paused.id,
+        messageId: "summary-message-new",
+        topicEventSeq: 3,
+        principalId: "tenant-1:user:second",
+        text: "Also include the newly discovered data-loss risk",
+        createdAt: "2026-07-18T01:02:00.000Z",
+      });
+
+      releaseFirstSummary?.();
+      await test.coordinator.waitForIdle(paused.id);
+
+      expect(summaryPrompts).toHaveLength(2);
+      expect(summaryPrompts[0]).toContain("Preserve the original rollout constraint");
+      expect(summaryPrompts[0]).not.toContain("newly discovered data-loss risk");
+      expect(summaryPrompts[1]).toContain("tenant-1:user:first");
+      expect(summaryPrompts[1]).toContain("Preserve the original rollout constraint");
+      expect(summaryPrompts[1]).toContain("tenant-1:user:second");
+      expect(summaryPrompts[1]).toContain("Also include the newly discovered data-loss risk");
+      expect(test.discussions.discussion(paused.id)).toMatchObject({
+        state: "completed",
+        summaryText: "Regenerated summary with both steers",
+      });
+      expect(test.discussions.pendingSteers(paused.id)).toEqual([]);
+      expect(test.discussions.steerForMessage("summary-message-old")?.status).toBe("consumed");
+      expect(test.discussions.steerForMessage("summary-message-new")?.status).toBe("consumed");
+    } finally {
+      releaseFirstSummary?.();
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("rejects a new steer after transactional summary finalization wins the race", async () => {
+    const test = harness({
+      claude: deterministicAdapter("claude"),
+      codex: deterministicAdapter("codex"),
+      copilot: deterministicAdapter("copilot"),
+    });
+    try {
+      await test.coordinator.control(test.discussion.id, "summarize", "tenant-1:user:reviewer");
+      await test.coordinator.waitForIdle(test.discussion.id);
+      expect(test.discussions.discussion(test.discussion.id)?.state).toBe("completed");
+
+      expect(() => test.discussions.recordSteer({
+        id: "late-summary-steer",
+        discussionId: test.discussion.id,
+        messageId: "late-summary-message",
+        topicEventSeq: 3,
+        principalId: "tenant-1:user:late",
+        text: "This must not become pending after completion",
+      })).toThrow(/no longer accepts steers/i);
+      expect(test.discussions.pendingSteers(test.discussion.id)).toEqual([]);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
+  it("keeps a human steer pending when every summary provider fails", async () => {
+    const prompts: string[][] = [[], [], []];
+    const failingSummary = (provider: ProviderName, providerPrompts: string[]) =>
+      deterministicAdapter(provider, providerPrompts, async () => {
+        throw new Error(`${provider} summary unavailable`);
+      });
+    const test = harness({
+      claude: failingSummary("claude", prompts[0]!),
+      codex: failingSummary("codex", prompts[1]!),
+      copilot: failingSummary("copilot", prompts[2]!),
+    });
+    const paused = transitionDiscussion(test.discussion, "pause");
+    test.discussions.saveDiscussion(paused);
+    test.discussions.recordSteer({
+      id: "failed-summary-steer",
+      discussionId: paused.id,
+      messageId: "failed-summary-message",
+      topicEventSeq: 2,
+      principalId: "tenant-1:user:reviewer",
+      text: "Retain this requirement for the summary retry",
+      createdAt: "2026-07-18T01:01:00.000Z",
+    });
+    try {
+      await test.coordinator.control(paused.id, "summarize", "tenant-1:user:reviewer");
+      await test.coordinator.waitForIdle(paused.id);
+
+      expect(prompts.flat()).toHaveLength(3);
+      for (const prompt of prompts.flat()) {
+        expect(prompt).toContain("tenant-1:user:reviewer");
+        expect(prompt).toContain("Retain this requirement for the summary retry");
+      }
+      expect(test.discussions.discussion(paused.id)?.state).toBe("paused");
+      expect(test.discussions.steerForMessage("failed-summary-message")?.status).toBe("pending");
+      expect(test.discussions.pendingSteers(paused.id).map(({ id }) => id))
+        .toEqual(["failed-summary-steer"]);
+    } finally {
+      await test.coordinator.shutdown();
+      test.discussions.close();
+      test.events.close();
+      test.outbox.close();
+    }
+  });
+
   it("extracts a final summary wrapped in a JSON markdown fence", async () => {
     const fencedSummary = (provider: ProviderName) => deterministicAdapter(provider, [], async (task) => {
       expect(task.prompt).toContain("PHASE: discussion_summary");

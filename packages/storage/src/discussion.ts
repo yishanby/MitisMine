@@ -68,6 +68,11 @@ export interface CompleteDiscussionTurnInput {
   readonly completedAt?: string;
 }
 
+export type FinalizeDiscussionSummaryResult =
+  | { readonly status: "completed"; readonly discussion: GroupDiscussion }
+  | { readonly status: "retry" }
+  | { readonly status: "inactive" };
+
 interface DiscussionRow {
   id: string;
   topic_id: string;
@@ -445,6 +450,19 @@ export class SqliteDiscussionStore {
         this.#database.exec("COMMIT");
         return { steer: steer as DiscussionSteer, inserted: false };
       }
+      const discussion = this.#database.prepare(`
+        SELECT state FROM group_discussions WHERE id = ?
+      `).get(input.discussionId) as { state: GroupDiscussion["state"] } | undefined;
+      if (discussion === undefined) {
+        throw new Error(`Discussion not found: ${input.discussionId}`);
+      }
+      if (
+        discussion.state !== "active"
+        && discussion.state !== "paused"
+        && discussion.state !== "summarizing"
+      ) {
+        throw new Error(`Discussion no longer accepts steers: ${input.discussionId}`);
+      }
       this.#database.prepare(`
         INSERT INTO discussion_steers (
           id, discussion_id, message_id, topic_event_seq, principal_id, text,
@@ -504,6 +522,66 @@ export class SqliteDiscussionStore {
     try {
       for (const id of ids) update.run(consumedAt, discussionId, id);
       this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finalizeSummary(
+    discussionId: string,
+    summaryText: string,
+    expectedSteerIds: readonly string[],
+    completedAt = new Date().toISOString(),
+  ): FinalizeDiscussionSummaryResult {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.discussion(discussionId);
+      if (current === undefined) throw new Error(`Discussion not found: ${discussionId}`);
+      if (current.state !== "summarizing") {
+        this.#database.exec("COMMIT");
+        return { status: "inactive" };
+      }
+      const pendingRows = this.#database.prepare(`
+        SELECT id FROM discussion_steers
+        WHERE discussion_id = ? AND status = 'pending'
+        ORDER BY created_at, id
+      `).all(discussionId) as unknown as Array<{ id: string }>;
+      const pendingIds = pendingRows.map(({ id }) => id);
+      if (
+        pendingIds.length !== expectedSteerIds.length
+        || pendingIds.some((id, index) => id !== expectedSteerIds[index])
+      ) {
+        this.#database.exec("COMMIT");
+        return { status: "retry" };
+      }
+      const completed: GroupDiscussion = {
+        ...current,
+        state: "completed",
+        summaryText,
+        version: current.version + 1,
+        updatedAt: completedAt,
+      };
+      const saved = this.#database.prepare(`
+        UPDATE group_discussions SET
+          state = 'completed', summary_text = ?, version = ?, updated_at = ?
+        WHERE id = ? AND state = 'summarizing' AND version = ?
+      `).run(summaryText, completed.version, completedAt, discussionId, current.version);
+      if (Number(saved.changes) !== 1) {
+        throw new Error(`Discussion summary completion conflicted: ${discussionId}`);
+      }
+      const consume = this.#database.prepare(`
+        UPDATE discussion_steers SET status = 'consumed', consumed_at = ?
+        WHERE discussion_id = ? AND id = ? AND status = 'pending'
+      `);
+      for (const id of expectedSteerIds) {
+        const consumed = consume.run(completedAt, discussionId, id);
+        if (Number(consumed.changes) !== 1) {
+          throw new Error(`Discussion summary steer changed unexpectedly: ${id}`);
+        }
+      }
+      this.#database.exec("COMMIT");
+      return { status: "completed", discussion: completed };
     } catch (error) {
       this.#database.exec("ROLLBACK");
       throw error;

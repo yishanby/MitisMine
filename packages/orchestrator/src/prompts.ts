@@ -57,6 +57,10 @@ SHARED_TOPIC_CONTEXT: ${JSON.stringify(input.sharedContext)}`;
 
 export interface DiscussionSummaryInput {
   readonly question: string;
+  readonly pendingSteers: readonly {
+    readonly principalId: string;
+    readonly text: string;
+  }[];
   readonly transcript: readonly {
     readonly provider: ProviderName;
     readonly text: string;
@@ -68,9 +72,11 @@ export interface DiscussionSummaryInput {
 export function discussionSummaryPrompt(input: DiscussionSummaryInput): string {
   return `PHASE: discussion_summary
 QUESTION: ${input.question}
+Human steer has priority over the earlier transcript. Reflect every pending steer in the final recommendation.
 Synthesize the visible roundtable without hiding disagreement.
 Return only JSON: {"summary":"decision-ready group summary with consensus, disagreements, evidence gaps, and next actions"}
 ROUND_LIMIT_REACHED: ${String(input.reachedRoundLimit)}
+PENDING_STEERS: ${JSON.stringify(input.pendingSteers)}
 PUBLIC_TRANSCRIPT: ${JSON.stringify(input.transcript)}`;
 }
 

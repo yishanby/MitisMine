@@ -533,69 +533,65 @@ export class DiscussionCoordinator {
       (turn): turn is DiscussionTurn & { text: string } =>
         turn.state === "completed" && turn.text !== undefined,
     );
-    const prompt = discussionSummaryPrompt({
-      question: discussion.question,
-      transcript: turns.map((turn) => ({
-        provider: turn.provider,
-        text: turn.text,
-        openQuestions: turn.openQuestions,
-      })),
-      reachedRoundLimit: discussion.turnIndex >= discussion.maxRounds * 3,
-    });
     const controller = new AbortController();
     this.#controllers.set(discussion.id, controller);
-    let summary: string | undefined;
-    const failures: string[] = [];
     try {
-      for (const provider of providers) {
-        try {
-          const raw = await this.#callProvider(discussion, provider, prompt, controller.signal);
-          summary = parseDiscussionSummary(raw);
-          break;
-        } catch (error) {
-          if (controller.signal.aborted) throw interruptionReason(controller.signal, error);
-          failures.push(`${providerLabel(provider)}: ${errorMessage(error)}`);
-        }
-      }
-      if (summary === undefined) {
-        for (let attempt = 0; attempt < 5; attempt += 1) {
-          const current = this.#requireDiscussion(discussion.id);
-          if (current.state !== "summarizing") break;
-          const paused = transitionDiscussion(current, "pause");
-          if (this.#store.saveDiscussionCas(paused, current.version)) break;
-        }
-        const current = this.#requireDiscussion(discussion.id);
-        this.#outbox.enqueue({
-          id: `outbox:discussion:${discussion.id}:summary:failed:${current.version}`,
-          appRole: "hub",
-          receiveId: discussion.chatId,
-          payload: textCard("总结暂不可用", `${failures.join("\n")}\n\n可稍后点击「立即总结」重试。`),
-          idempotencyKey: `discussion:${discussion.id}:summary:failed:${current.version}`,
+      while (true) {
+        const steers = this.#store.pendingSteers(discussion.id);
+        const prompt = discussionSummaryPrompt({
+          question: discussion.question,
+          pendingSteers: steers.map((steer) => ({
+            principalId: steer.principalId,
+            text: steer.text,
+          })),
+          transcript: turns.map((turn) => ({
+            provider: turn.provider,
+            text: turn.text,
+            openQuestions: turn.openQuestions,
+          })),
+          reachedRoundLimit: discussion.turnIndex >= discussion.maxRounds * 3,
         });
+        let summary: string | undefined;
+        const failures: string[] = [];
+        for (const provider of providers) {
+          try {
+            const raw = await this.#callProvider(discussion, provider, prompt, controller.signal);
+            summary = parseDiscussionSummary(raw);
+            break;
+          } catch (error) {
+            if (controller.signal.aborted) throw interruptionReason(controller.signal, error);
+            failures.push(`${providerLabel(provider)}: ${errorMessage(error)}`);
+          }
+        }
+        if (summary === undefined) {
+          for (let attempt = 0; attempt < 5; attempt += 1) {
+            const current = this.#requireDiscussion(discussion.id);
+            if (current.state !== "summarizing") break;
+            const paused = transitionDiscussion(current, "pause");
+            if (this.#store.saveDiscussionCas(paused, current.version)) break;
+          }
+          const current = this.#requireDiscussion(discussion.id);
+          this.#outbox.enqueue({
+            id: `outbox:discussion:${discussion.id}:summary:failed:${current.version}`,
+            appRole: "hub",
+            receiveId: discussion.chatId,
+            payload: textCard("总结暂不可用", `${failures.join("\n")}\n\n可稍后点击「立即总结」重试。`),
+            idempotencyKey: `discussion:${discussion.id}:summary:failed:${current.version}`,
+          });
+          await this.refreshControl(discussion.id);
+          return;
+        }
+        const finalized = this.#store.finalizeSummary(
+          discussion.id,
+          summary,
+          steers.map(({ id }) => id),
+        );
+        if (finalized.status === "inactive") return;
+        if (finalized.status === "retry") continue;
+        this.#repairSummaryEffect(finalized.discussion);
         await this.refreshControl(discussion.id);
         return;
       }
-      let completed: GroupDiscussion | undefined;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        const current = this.#requireDiscussion(discussion.id);
-        if (current.state !== "summarizing") return;
-        const candidate: GroupDiscussion = {
-          ...current,
-          state: "completed",
-          summaryText: summary,
-          version: current.version + 1,
-          updatedAt: new Date().toISOString(),
-        };
-        if (this.#store.saveDiscussionCas(candidate, current.version)) {
-          completed = candidate;
-          break;
-        }
-      }
-      if (completed === undefined) {
-        throw new Error(`Discussion summary completion conflicted repeatedly: ${discussion.id}`);
-      }
-      this.#repairSummaryEffect(completed);
-      await this.refreshControl(discussion.id);
     } finally {
       if (this.#controllers.get(discussion.id) === controller) {
         this.#controllers.delete(discussion.id);
