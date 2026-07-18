@@ -88,10 +88,11 @@ The persisted Copilot turn 2 text was:
 同意二位。WAL 核心优势：读事务见启动快照，无脏读且并发高效。关键限制是单写者、内存映射依赖。NFS 跨主机访问违反映射前提—确实会导致损坏。建议补充：WAL 文件与数据库需同盘位置。
 ```
 
-It followed the snapshot instruction but not the requested length constraint:
-it measured 93 UTF-16 code units, 93 code points, and 71 Han characters. The
-steer's `consumed` status proves delivery and association with Copilot turn 2,
-not full provider compliance with every instruction.
+It followed the snapshot instruction but not the length constraint stated in
+both the initial question and the repeated steer: it measured 93 UTF-16 code
+units, 93 code points, and 71 Han characters. The steer's `consumed` status
+proves delivery and association with Copilot turn 2, not full provider
+compliance with every instruction.
 
 ## Visible messages and durable turn rows
 
@@ -99,14 +100,21 @@ The App identities and message content were visible in Feishu. The turn indexes,
 lengths, and completed/cancelled outcomes in this table come from the separate
 read-only Discussion audit.
 
-| Turn index | Visible App identity | Length | Result |
-|---:|---|---:|---|
-| 0 | Claude | 99 | Completed visible content |
-| 1 | Codex | 58 | Completed visible content |
-| 2 | Copilot | 93 | Completed after resume; steer associated as consumed, but the reply contained 71 Han characters and exceeded the requested limit |
-| 3 | Codex | 47 | Completed; corrected the overstrong NFS/cross-host claim |
-| 4 | Copilot | 66 | Completed; accepted the Codex correction |
-| 5 | Claude | — | In flight, then intentionally cancelled; no visible content |
+| Turn index | Visible App identity | Code points | Han characters | ≤60 Han | Result |
+|---:|---|---:|---:|---|---|
+| 0 | Claude | 99 | 72 | No | Completed visible content; violated the initial length limit |
+| 1 | Codex | 58 | 37 | Yes | Completed visible content |
+| 2 | Copilot | 93 | 71 | No | Completed after resume; violated both the initial and repeated length limits |
+| 3 | Codex | 47 | 30 | Yes | Completed; corrected the overstrong NFS/cross-host claim |
+| 4 | Copilot | 66 | 46 | Yes | Completed; accepted the Codex correction |
+| 5 | Claude | — | — | — | In flight, then intentionally cancelled; no visible content |
+
+Length adherence was therefore partial: three of five completed replies met the
+initial ≤60-Han requirement, while Claude turn 0 (72 Han) and Copilot turn 2
+(71 Han) did not. Copilot turn 2 also missed the repeated post-pause limit. The
+provider messages addressed the requested WAL and snapshot points, but semantic
+relevance and a `consumed` steer do not establish compliance with the separate
+length rule.
 
 Claude therefore supplied one completed visible provider message, Codex two,
 and Copilot two. Hub supplied the control card and a separate summary message;

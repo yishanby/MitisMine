@@ -59,9 +59,9 @@ included in this report.
 | Multi-Session migration preflight | Revision `a74ca6d` started against the live database; legacy Claude/Codex/Copilot direct rows migrated to named `main` Sessions without changing their external IDs; `/ready` remained 200 | Pass |
 | Fresh real CLI start+resume | `tests/live/cli-smoke.test.ts` passed 3/3 after ChatGPT login: Claude 14,283 ms; Codex 27,676 ms; Copilot 31,747 ms; 73,708 ms total tests, 74.61 s Vitest duration | Pass |
 | Canonical visible group start and identity | In Feishu, the human used the @ toolbar and selected the real entity whose display name is exactly `MitisMine 总控`, verified it was an entity mention, and then typed the question. The UI showed one Hub control card and real content from all three provider identities; the read-only Discussion audit associated that flow with `01KXSRVC8DFBMTJRSY1KJKCM5C` | Pass |
-| Automatic turns | The UI showed five completed provider messages. The read-only Discussion audit mapped them to Claude 0 (99 characters), Codex 1 (58), Copilot 2 (93), Codex 3 (47), and Copilot 4 (66), and recorded Claude turn 5 as cancelled with no visible content | Pass, 3/3 current content |
+| Automatic turns | The UI showed five completed provider messages. The read-only Discussion audit mapped their code-point/Han counts to Claude 0 (99/72), Codex 1 (58/37), Copilot 2 (93/71), Codex 3 (47/30), and Copilot 4 (66/46), and recorded Claude turn 5 as cancelled with no visible content | Pass, 3/3 current content |
 | Durable pause, steer, and resume | A separate read-only SQLite audit—not the visible UI alone—showed that pause cancelled the in-flight Copilot turn 2 attempt, persisted round 1/turn index 2/version 8, retained the speaker slot, kept the genuine entity-mention steer pending, and associated its consumption with Copilot turn 2 after resume | Pass |
-| Steer instruction compliance | Copilot turn 2 followed the requested snapshot instruction, but not the requested length limit: the persisted text measured 93 UTF-16 code units, 93 code points, and 71 Han characters, exceeding 60 Han characters. `consumed` proves delivery and turn association, not full provider compliance | Partial provider compliance; orchestration evidence remains valid |
+| Instruction delivery and length compliance | Provider messages addressed the requested WAL and snapshot points, but length adherence was partial. Against the initial ≤60-Han limit, Claude 0 (72 Han) and Copilot 2 (71) violated it; Codex 1 (37), Codex 3 (30), and Copilot 4 (46) complied. Copilot 2 also violated the repeated post-pause limit. `consumed` proves steer delivery and turn association, not full provider compliance | Partial provider compliance; orchestration evidence remains valid |
 | Cross-provider acknowledgement after steer | Resumed Copilot turn 2 explicitly addressed the transaction-start snapshot point. Codex turn 3 corrected the overstrong claim that cross-host/NFS access would `必然损坏`; Copilot turn 4 accepted that correction | Pass; visible consensus, not independent empirical or external technical verification |
 | Same-card controls | The read-only Outbox audit showed every sent or superseded control update through version 19 targeted `om_x100b6a84163cb4a0c3dadf616c2fcda`; pause, resume, and immediate-summary did not create a replacement control card | Pass |
 | Immediate summary | The read-only Discussion audit recorded the in-flight Claude turn at index 5 as intentionally cancelled and state as summarizing at round 2/turn index 5/version 18, then completed at version 19 | Pass |
@@ -91,7 +91,7 @@ tests_ms=73708 vitest_duration_s=74.61
 discussion=01KXSRVC8DFBMTJRSY1KJKCM5C
 state=completed round=2 turn_index=5 version=19
 control_message=om_x100b6a84163cb4a0c3dadf616c2fcda
-visible_turns=[claude:99,codex:58,copilot:93,codex:47,copilot:66]
+visible_turns=[claude:{cp:99,han:72},codex:{cp:58,han:37},copilot:{cp:93,han:71},codex:{cp:47,han:30},copilot:{cp:66,han:46}]
 summary_length=324 replacement_count=0
 ```
 
@@ -99,7 +99,9 @@ summary_length=324 replacement_count=0
 paused_at={round:1,turn_index:2,version:8}
 steer_message=om_x100b6a8429f170b0c4afe4588666c37
 steer=persisted_then_consumed_by_copilot_turn_2
-steer_compliance={snapshot:true,max_60_han:false,utf16:93,code_points:93,han:71}
+initial_60_han={claude_0:false,codex_1:true,copilot_2:false,codex_3:true,copilot_4:true}
+post_pause_60_han={copilot_2:false}
+steer_compliance={snapshot:true,delivery_associated:true,full_compliance:false}
 correction=codex_turn_3_acknowledged_by_copilot_turn_4
 summary_transition=summarizing(v18)->completed(v19)
 same_control_message_through_version_19=true
@@ -214,9 +216,14 @@ The persisted Copilot turn 2 text was:
 ```
 
 It followed the snapshot instruction but measured 93 UTF-16 code units, 93
-code points, and 71 Han characters. It therefore did not meet the requested
-60-Han-character limit. The steer row's `consumed` status proves delivery and
-association with that provider turn, not full compliance with every instruction.
+code points, and 71 Han characters. It therefore violated both the initial and
+repeated 60-Han-character limits. Across all five completed replies, Claude turn
+0 also violated the initial limit at 72 Han characters; Codex turn 1 (37), Codex
+turn 3 (30), and Copilot turn 4 (46) complied. Copilot turn 4 had 66 total code
+points but still met the rule because the request limited Han characters.
+Provider messages addressed the requested WAL and snapshot points, but length
+adherence was partial. The steer row's `consumed` status proves delivery and
+association with Copilot turn 2, not full compliance with every instruction.
 
 Real provider start+resume is separate and quota-consuming:
 
