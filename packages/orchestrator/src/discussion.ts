@@ -1043,7 +1043,7 @@ function assertDiscussionSteerAddedEvent(
   if (
     event.type !== "discussion.steer.added"
     || event.topicId !== discussion.topicId
-    || discussion.state !== "active"
+    || !["active", "paused", "summarizing"].includes(discussion.state)
     || discussion.tenantKey !== input.tenantKey
     || discussion.chatId !== input.chatId
     || payload?.discussionId !== discussion.id

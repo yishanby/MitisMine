@@ -761,6 +761,133 @@ describe("GroupDiscussionChannel", () => {
     }
   });
 
+  it.each([
+    ["paused", "delivery"],
+    ["paused", "event-before-receipt"],
+    ["summarizing", "delivery"],
+    ["summarizing", "event-before-receipt"],
+  ] as const)(
+    "records one scoped steer while %s across the %s boundary and App retry",
+    async (state, boundary) => {
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-${state}-steer-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => `${state}-steer-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `${state}-steer-start`,
+          text: `${state} steer Discussion`,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-${state}-steer-start`,
+        });
+        const active = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(active).toBeDefined();
+        const discussion = discussions.saveDiscussion({
+          ...active!,
+          state,
+          version: active!.version + 1,
+        });
+        refreshed.length = 0;
+        kicked.length = 0;
+        const messageId = `${state}-${boundary}-steer-message`;
+        const text = `Steer while ${state}`;
+        if (boundary === "event-before-receipt") {
+          events.append({
+            topicId: discussion.topicId,
+            type: "discussion.steer.added",
+            actorPrincipalId: scope.principalId,
+            payload: {
+              discussionId: discussion.id,
+              tenantKey: scope.tenantKey,
+              chatId: scope.chatId,
+              messageId,
+              text,
+            },
+            idempotencyKey: groupEffectKey(
+              scope.tenantKey,
+              scope.chatId,
+              messageId,
+              "steer",
+            ),
+          });
+        }
+
+        await channel.receive({
+          ...scope,
+          messageId,
+          text,
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-${state}-${boundary}-steer`,
+        });
+        const firstReceipt = discussions.steerForMessage(messageId);
+        expect(firstReceipt).toMatchObject({
+          discussionId: discussion.id,
+          messageId,
+          text,
+          status: "pending",
+        });
+
+        await channel.receive({
+          ...scope,
+          messageId,
+          text,
+          sourceAppRole: "codex",
+          preferredProvider: "codex",
+          idempotencyKey: `codex-${state}-${boundary}-steer`,
+        });
+
+        const steerEvents = events.events(discussion.topicId)
+          .filter(({ type }) => type === "discussion.steer.added");
+        expect(steerEvents).toHaveLength(1);
+        expect(steerEvents[0]).toMatchObject({
+          topicId: discussion.topicId,
+          payload: {
+            discussionId: discussion.id,
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+          },
+        });
+        expect(discussions.steerForMessage(messageId)).toMatchObject({
+          id: firstReceipt?.id,
+          discussionId: discussion.id,
+          topicEventSeq: steerEvents[0]?.seq,
+          preferredProvider: "codex",
+          status: "pending",
+        });
+        expect(discussions.pendingSteers(discussion.id)
+          .filter((steer) => steer.messageId === messageId)).toHaveLength(1);
+        expect(discussions.discussion(discussion.id)?.state).toBe(state);
+        expect(refreshed).toEqual([discussion.id, discussion.id]);
+        expect(kicked).toEqual([discussion.id, discussion.id]);
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it("rejects an inconsistent returned scoped steer event before recording receipt", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-group-steer-validation-"));
     temporaryDirectories.push(directory);
