@@ -24,11 +24,28 @@ export interface FeishuMessageEvent {
   readonly messageId: string;
   readonly chatId: string;
   readonly text: string;
+  readonly chatType?: "p2p" | "group";
+  readonly senderType?: "user" | "app" | "bot" | "unknown";
   readonly mentions?: readonly {
     readonly key: string;
     readonly userId?: string;
     readonly unionId?: string;
   }[];
+}
+
+export interface GroupDiscussionMessageInput {
+  readonly tenantKey: string;
+  readonly principalId: string;
+  readonly chatId: string;
+  readonly messageId: string;
+  readonly text: string;
+  readonly sourceAppRole: AppRole;
+  readonly idempotencyKey: string;
+  readonly preferredProvider?: ProviderName;
+}
+
+export interface GroupDiscussionPort {
+  receive(input: GroupDiscussionMessageInput): Promise<void>;
 }
 
 export type DispatchInput =
@@ -84,6 +101,7 @@ interface GatewayOptions {
   readonly outbox: OutboxPort;
   readonly dispatcher: FeishuDispatcher;
   readonly idFactory: () => string;
+  readonly groupDiscussions?: GroupDiscussionPort;
 }
 
 export class FeishuGateway {
@@ -91,34 +109,67 @@ export class FeishuGateway {
   readonly #outbox: OutboxPort;
   readonly #dispatcher: FeishuDispatcher;
   readonly #idFactory: () => string;
+  readonly #groupDiscussions: GroupDiscussionPort | undefined;
 
   constructor(options: GatewayOptions) {
     this.#store = options.store;
     this.#outbox = options.outbox;
     this.#dispatcher = options.dispatcher;
     this.#idFactory = options.idFactory;
+    this.#groupDiscussions = options.groupDiscussions;
   }
 
   async receive(event: FeishuMessageEvent): Promise<{ duplicate: boolean }> {
+    if (
+      (event.chatType ?? "p2p") === "group"
+      && (event.senderType ?? "user") !== "user"
+    ) {
+      return { duplicate: false };
+    }
     const principalId = resolvePrincipal({
       tenantKey: event.tenantKey,
       ...(event.userId === undefined ? {} : { userId: event.userId }),
       ...(event.unionId === undefined ? {} : { unionId: event.unionId }),
     });
-    const command = parseCommand(event.text);
     const claim = this.#store.claimFeishuEvent(event.appRole, event.eventId);
     if (claim === "completed") {
       return { duplicate: true };
     }
     if (claim === "processing") throw new Error("Feishu event is already processing");
     try {
-      await this.#route(event, principalId, command, eventKey(event));
+      if ((event.chatType ?? "p2p") === "group") {
+        await this.#routeGroup(event, principalId, eventKey(event));
+      } else {
+        await this.#route(event, principalId, parseCommand(event.text), eventKey(event));
+      }
       this.#store.completeFeishuEvent(event.appRole, event.eventId);
       return { duplicate: false };
     } catch (error) {
       this.#store.releaseFeishuEventClaim(event.appRole, event.eventId);
       throw error;
     }
+  }
+
+  async #routeGroup(
+    event: FeishuMessageEvent,
+    principalId: string,
+    routeKey: string,
+  ): Promise<void> {
+    if (this.#groupDiscussions === undefined) {
+      throw new Error("Group Discussion coordinator is not configured");
+    }
+    const text = stripMentions(event.text, event.mentions);
+    if (!text) throw new Error("Group Discussion message is empty after removing mentions");
+    await this.#groupDiscussions.receive({
+      tenantKey: event.tenantKey,
+      principalId,
+      chatId: event.chatId,
+      messageId: event.messageId,
+      text,
+      sourceAppRole: event.appRole,
+      idempotencyKey: `${routeKey}:group-discussion`,
+      ...(event.appRole === "hub" ? {} : { preferredProvider: event.appRole }),
+    });
   }
 
   async receiveSdkEvent(appRole: AppRole, raw: unknown): Promise<{ duplicate: boolean }> {
@@ -631,6 +682,17 @@ function summarize(text: string): string {
   return oneLine.length <= 60 ? oneLine : `${oneLine.slice(0, 59)}…`;
 }
 
+function stripMentions(
+  text: string,
+  mentions: FeishuMessageEvent["mentions"],
+): string {
+  let result = text;
+  for (const mention of mentions ?? []) {
+    result = result.replaceAll(mention.key, " ");
+  }
+  return result.replace(/\s+/g, " ").trim();
+}
+
 function parseSdkEvent(appRole: AppRole, raw: unknown): FeishuMessageEvent {
   const root = object(raw, "Feishu event");
   const header = object(root.header, "Feishu event header");
@@ -664,8 +726,15 @@ function parseSdkEvent(appRole: AppRole, raw: unknown): FeishuMessageEvent {
     messageId: string(message.message_id, "message ID"),
     chatId: string(message.chat_id, "chat ID"),
     text: string(content.text, "text content"),
+    chatType: message.chat_type === "group" ? "group" : "p2p",
+    senderType: parseSenderType(sender.sender_type),
     ...(mentions.length === 0 ? {} : { mentions }),
   };
+}
+
+function parseSenderType(value: unknown): "user" | "app" | "bot" | "unknown" {
+  if (value === "user" || value === "app" || value === "bot") return value;
+  return "unknown";
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {

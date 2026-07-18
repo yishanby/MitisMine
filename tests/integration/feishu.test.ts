@@ -9,6 +9,7 @@ import {
   FeishuGateway,
   type DispatchInput,
   type FeishuMessageEvent,
+  type GroupDiscussionMessageInput,
 } from "../../packages/feishu/src/gateway.js";
 import { verifyCrossAppIdentity } from "../../packages/feishu/src/registry.js";
 import { DurableOutbox } from "../../packages/storage/src/outbox.js";
@@ -63,6 +64,7 @@ function messageFrom(
 function gatewayHarness(
   path: string,
   onDispatch: (input: DispatchInput) => Promise<void> = async () => {},
+  onGroupMessage?: (input: GroupDiscussionMessageInput) => Promise<void>,
 ) {
   const store = EventStore.open(path);
   const outbox = DurableOutbox.open(path);
@@ -78,6 +80,9 @@ function gatewayHarness(
         await onDispatch(input);
       },
     },
+    ...(onGroupMessage === undefined
+      ? {}
+      : { groupDiscussions: { receive: onGroupMessage } }),
   });
   return { store, outbox, gateway, dispatches };
 }
@@ -119,6 +124,105 @@ describe("Feishu commands", () => {
 });
 
 describe("FeishuGateway", () => {
+  it("routes human group messages to the visible Discussion port", async () => {
+    const { path } = temporaryDatabase();
+    const groupMessages: GroupDiscussionMessageInput[] = [];
+    const harness = gatewayHarness(path, async () => {}, async (input) => {
+      groupMessages.push(input);
+    });
+    try {
+      await harness.gateway.receive({
+        ...message("hub", "@_hub Compare designs", "group-human"),
+        chatId: "group-chat",
+        chatType: "group",
+        senderType: "user",
+        mentions: [{ key: "@_hub", userId: "hub-bot" }],
+      });
+      await harness.gateway.receive({
+        ...message("codex", "@_codex Focus on cost", "group-codex"),
+        chatId: "group-chat",
+        chatType: "group",
+        senderType: "user",
+        mentions: [{ key: "@_codex", userId: "codex-bot" }],
+      });
+
+      expect(groupMessages).toEqual([
+        expect.objectContaining({
+          chatId: "group-chat",
+          messageId: "group-human-message",
+          text: "Compare designs",
+          sourceAppRole: "hub",
+        }),
+        expect.objectContaining({
+          chatId: "group-chat",
+          text: "Focus on cost",
+          sourceAppRole: "codex",
+          preferredProvider: "codex",
+        }),
+      ]);
+      expect(harness.dispatches).toEqual([]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
+  it.each(["app", "bot"] as const)(
+    "ignores a %s-authored group message before identity resolution or inbox claim",
+    async (senderType) => {
+      const { path } = temporaryDatabase();
+      const groupMessages: GroupDiscussionMessageInput[] = [];
+      const harness = gatewayHarness(path, async () => {}, async (input) => {
+        groupMessages.push(input);
+      });
+      const human = message("hub", "Agent output", `group-${senderType}`);
+      const { userId: _userId, unionId: _unionId, ...withoutIdentity } = human;
+      try {
+        await expect(harness.gateway.receive({
+          ...withoutIdentity,
+          chatType: "group",
+          senderType,
+        })).resolves.toEqual({ duplicate: false });
+        expect(groupMessages).toEqual([]);
+        expect(harness.store.claimFeishuEvent("hub", human.eventId)).toBe("claimed");
+      } finally {
+        harness.store.close();
+        harness.outbox.close();
+      }
+    },
+  );
+
+  it("parses group chat and sender types from the Feishu SDK event", async () => {
+    const { path } = temporaryDatabase();
+    const groupMessages: GroupDiscussionMessageInput[] = [];
+    const harness = gatewayHarness(path, async () => {}, async (input) => {
+      groupMessages.push(input);
+    });
+    try {
+      await harness.gateway.receiveSdkEvent("hub", {
+        header: { event_id: "sdk-group", tenant_key: "tenant-1" },
+        event: {
+          sender: {
+            sender_type: "user",
+            sender_id: { user_id: "user-1", open_id: "open-1" },
+          },
+          message: {
+            message_id: "sdk-group-message",
+            chat_id: "sdk-group-chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "Discuss this" }),
+          },
+        },
+      });
+      expect(groupMessages).toEqual([
+        expect.objectContaining({ chatId: "sdk-group-chat", text: "Discuss this" }),
+      ]);
+    } finally {
+      harness.store.close();
+      harness.outbox.close();
+    }
+  });
+
   it("shares a global Topic cursor across four app-specific open_ids", async () => {
     const { path } = temporaryDatabase();
     const harness = gatewayHarness(path);
