@@ -444,6 +444,13 @@ export class SqliteDiscussionStore {
         ) {
           throw new Error(`Inconsistent Discussion steer receipt: ${input.messageId}`);
         }
+        if (
+          existing.preferred_provider !== null
+          && input.preferredProvider !== undefined
+          && existing.preferred_provider !== input.preferredProvider
+        ) {
+          throw new Error(`Conflicting preferred provider for Discussion steer: ${input.messageId}`);
+        }
         if (input.topicEventSeq !== undefined && input.topicEventSeq > 0) {
           if (existing.topic_event_seq === 0) {
             this.#database.prepare(`
@@ -545,7 +552,8 @@ export class SqliteDiscussionStore {
       SELECT s.id, s.discussion_id, s.message_id, s.topic_event_seq, s.principal_id, s.text,
              s.preferred_provider, s.status, s.created_at, s.consumed_at
       FROM group_discussions d
-      JOIN discussion_steers s ON s.discussion_id = d.id
+      JOIN discussion_steers AS s INDEXED BY discussion_steers_event_idx
+        ON s.discussion_id = d.id
       WHERE d.topic_id = ? AND s.topic_event_seq = ?
       ORDER BY s.id
     `).all(topicId, topicEventSeq) as unknown as SteerRow[];

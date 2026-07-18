@@ -2204,6 +2204,180 @@ describe("GroupDiscussionChannel", () => {
     },
   );
 
+  it.each([
+    ["codex", "claude", undefined, true],
+    ["codex", undefined, "codex", false],
+    [undefined, "claude", "claude", false],
+  ] as const)(
+    "reconciles prior steer event provider %s with live input %s",
+    async (eventProvider, inputProvider, expectedProvider, rejects) => {
+      const label = `${eventProvider ?? "none"}-${inputProvider ?? "none"}`;
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-live-event-${label}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => `live-event-${label}-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `live-event-${label}-message`;
+      const text = "Live prior event provider";
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `live-event-${label}-start`,
+          text: "Live prior event Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-live-event-${label}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        events.append({
+          topicId: discussion!.topicId,
+          type: "discussion.steer.added",
+          actorPrincipalId: "tenant-1:user:member",
+          payload: {
+            schemaVersion: 2,
+            discussionId: discussion!.id,
+            principalId: "tenant-1:user:member",
+            tenantKey: scope.tenantKey,
+            chatId: scope.chatId,
+            messageId,
+            text,
+            ...(eventProvider === undefined ? {} : { preferredProvider: eventProvider }),
+          },
+          idempotencyKey: groupEffectKey(scope.tenantKey, scope.chatId, messageId, "steer"),
+        });
+        refreshed.length = 0;
+        kicked.length = 0;
+        const delivery = channel.receive({
+          ...scope,
+          principalId: "tenant-1:user:member",
+          messageId,
+          text,
+          sourceAppRole: inputProvider ?? "hub",
+          idempotencyKey: `${inputProvider ?? "hub"}-live-event-${label}`,
+          ...(inputProvider === undefined ? {} : { preferredProvider: inputProvider }),
+        });
+
+        if (rejects) {
+          await expect(delivery).rejects.toThrow(/inconsistent discussion\.steer\.added event/i);
+          expect(discussions.steerForMessage(messageId)).toBeUndefined();
+          expect(refreshed).toEqual([]);
+          expect(kicked).toEqual([]);
+        } else {
+          await delivery;
+          expect(discussions.steerForMessage(messageId)).toMatchObject({
+            discussionId: discussion!.id,
+            preferredProvider: expectedProvider,
+          });
+        }
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
+  it.each([
+    ["claude", true],
+    [undefined, false],
+  ] as const)(
+    "reconciles prior codex receipt with live input provider %s",
+    async (inputProvider, rejects) => {
+      const label = inputProvider ?? "hub";
+      const directory = mkdtempSync(join(tmpdir(), `mitismine-group-live-receipt-${label}-`));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "group.db");
+      const events = EventStore.open(path);
+      const discussions = SqliteDiscussionStore.open(path);
+      const refreshed: string[] = [];
+      const kicked: string[] = [];
+      let id = 0;
+      const channel = new GroupDiscussionChannel({
+        store: discussions,
+        events,
+        coordinator: {
+          refreshControl: async (discussionId) => { refreshed.push(discussionId); },
+          kick: (discussionId) => { kicked.push(discussionId); },
+        },
+        idFactory: () => `live-receipt-${label}-${++id}`,
+      });
+      const scope = {
+        tenantKey: "tenant-1",
+        principalId: "tenant-1:user:owner",
+        chatId: "chat-1",
+      };
+      const messageId = `live-receipt-${label}-message`;
+      const text = "Live prior receipt provider";
+      try {
+        await channel.receive({
+          ...scope,
+          messageId: `live-receipt-${label}-start`,
+          text: "Live prior receipt Discussion",
+          sourceAppRole: "hub",
+          idempotencyKey: `hub-live-receipt-${label}-start`,
+        });
+        const discussion = discussions.activeForChat(scope.tenantKey, scope.chatId);
+        expect(discussion).toBeDefined();
+        discussions.recordSteer({
+          id: `live-receipt-${label}-receipt`,
+          discussionId: discussion!.id,
+          messageId,
+          principalId: "tenant-1:user:member",
+          text,
+          preferredProvider: "codex",
+        });
+        refreshed.length = 0;
+        kicked.length = 0;
+        const beforeReceipt = discussions.steerForMessage(messageId);
+        const delivery = channel.receive({
+          ...scope,
+          principalId: "tenant-1:user:member",
+          messageId,
+          text,
+          sourceAppRole: inputProvider ?? "hub",
+          idempotencyKey: `${inputProvider ?? "hub"}-live-receipt-${label}`,
+          ...(inputProvider === undefined ? {} : { preferredProvider: inputProvider }),
+        });
+
+        if (rejects) {
+          await expect(delivery).rejects.toThrow(/conflicting preferred provider/i);
+          expect(discussions.steerForMessage(messageId)).toEqual(beforeReceipt);
+          expect(events.events(discussion!.topicId)
+            .filter(({ type }) => type === "discussion.steer.added")).toEqual([]);
+          expect(refreshed).toEqual([]);
+          expect(kicked).toEqual([]);
+        } else {
+          await delivery;
+          expect(discussions.steerForMessage(messageId)).toMatchObject({
+            preferredProvider: "codex",
+          });
+          const steerEvent = events.events(discussion!.topicId)
+            .find(({ type }) => type === "discussion.steer.added");
+          expect(steerEvent?.payload).toMatchObject({ preferredProvider: "codex" });
+        }
+      } finally {
+        discussions.close();
+        events.close();
+      }
+    },
+  );
+
   it.each(["unpublished", "linked"] as const)(
     "enriches an exact %s receipt from its provider steer event during recovery",
     async (boundary) => {

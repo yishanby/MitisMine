@@ -174,6 +174,9 @@ CREATE INDEX IF NOT EXISTS discussion_steers_pending_idx
 CREATE INDEX IF NOT EXISTS discussion_steers_event_idx
   ON discussion_steers (discussion_id, topic_event_seq);
 
+CREATE INDEX IF NOT EXISTS discussion_steers_unpublished_idx
+  ON discussion_steers (topic_event_seq, created_at, id);
+
 CREATE TABLE IF NOT EXISTS discussion_turns (
   id TEXT PRIMARY KEY,
   discussion_id TEXT NOT NULL REFERENCES group_discussions(id) ON DELETE CASCADE,

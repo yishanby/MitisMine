@@ -187,6 +187,54 @@ describe("SqliteDiscussionStore", () => {
     },
   );
 
+  it("rejects a conflicting defined provider before binding an existing receipt", () => {
+    const path = databasePath();
+    seedTopic(path);
+    const events = EventStore.open(path);
+    const store = SqliteDiscussionStore.open(path);
+    const discussion = createDiscussion({
+      id: "provider-identity-discussion",
+      topicId: "topic-1",
+      tenantKey: "tenant-1",
+      chatId: "provider-identity-chat",
+      question: "Provider identity",
+      starterPrincipalId: "tenant-1:user:owner",
+    });
+    store.createDiscussion(discussion);
+    store.recordSteer({
+      id: "provider-identity-steer",
+      discussionId: discussion.id,
+      messageId: "provider-identity-message",
+      principalId: "tenant-1:user:member",
+      text: "Immutable provider steer",
+      preferredProvider: "codex",
+    });
+    const event = events.append({
+      topicId: discussion.topicId,
+      type: "discussion.steer.added",
+      actorPrincipalId: "tenant-1:user:member",
+      payload: { text: "Immutable provider steer" },
+    });
+    const beforeReceipt = store.steerForMessage("provider-identity-message");
+    const beforeDiscussion = store.discussion(discussion.id);
+    try {
+      expect(() => store.recordSteer({
+        id: "provider-identity-duplicate",
+        discussionId: discussion.id,
+        messageId: "provider-identity-message",
+        topicEventSeq: event.seq,
+        principalId: "tenant-1:user:member",
+        text: "Immutable provider steer",
+        preferredProvider: "claude",
+      })).toThrow(/conflicting preferred provider/i);
+      expect(store.steerForMessage("provider-identity-message")).toEqual(beforeReceipt);
+      expect(store.discussion(discussion.id)).toEqual(beforeDiscussion);
+    } finally {
+      store.close();
+      events.close();
+    }
+  });
+
   it("returns only a fully correlated start-message replay", () => {
     const path = databasePath();
     seedTopic(path);
@@ -565,6 +613,8 @@ describe("SqliteDiscussionStore", () => {
       expect(indexColumns("group_discussions_topic_idx")).toEqual(["topic_id", "id"]);
       expect(indexColumns("discussion_steers_event_idx"))
         .toEqual(["discussion_id", "topic_event_seq"]);
+      expect(indexColumns("discussion_steers_unpublished_idx"))
+        .toEqual(["topic_event_seq", "created_at", "id"]);
 
       const eventPlan = database.prepare(`
         EXPLAIN QUERY PLAN
@@ -578,12 +628,25 @@ describe("SqliteDiscussionStore", () => {
         EXPLAIN QUERY PLAN
         SELECT s.id
         FROM group_discussions d
-        JOIN discussion_steers s ON s.discussion_id = d.id
+        JOIN discussion_steers AS s INDEXED BY discussion_steers_event_idx
+          ON s.discussion_id = d.id
         WHERE d.topic_id = ? AND s.topic_event_seq = ?
       `).all("topic-1", 1) as unknown as Array<{ detail: string }>;
       const receiptDetails = receiptPlan.map(({ detail }) => detail).join("\n");
       expect(receiptDetails).toContain("group_discussions_topic_idx");
       expect(receiptDetails).toContain("discussion_steers_event_idx");
+
+      const unpublishedPlan = database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT id, discussion_id, message_id, topic_event_seq, principal_id, text,
+               preferred_provider, status, created_at, consumed_at
+        FROM discussion_steers
+        WHERE topic_event_seq = 0
+        ORDER BY created_at, id
+      `).all() as unknown as Array<{ detail: string }>;
+      const unpublishedDetails = unpublishedPlan.map(({ detail }) => detail).join("\n");
+      expect(unpublishedDetails).toContain("discussion_steers_unpublished_idx");
+      expect(unpublishedDetails).not.toMatch(/SCAN|USE TEMP B-TREE/i);
     } finally {
       database.close();
     }

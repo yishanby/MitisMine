@@ -858,7 +858,14 @@ export class GroupDiscussionChannel {
         && active?.id !== priorReceipt.discussionId
         && priorReceipt.topicEventSeq !== 0
       ) return;
-      this.#publishSteerEvent(input, receiptDiscussion, priorReceipt.id, true);
+      const preferredProvider = reconcilePreferredProvider(
+        priorReceipt.preferredProvider,
+        input.preferredProvider,
+      );
+      this.#publishSteerEvent({
+        ...input,
+        ...(preferredProvider === undefined ? {} : { preferredProvider }),
+      }, receiptDiscussion, priorReceipt.id, true);
       await this.#coordinator.refreshControl(priorReceipt.discussionId);
       this.#coordinator.kick(priorReceipt.discussionId);
       return;
@@ -875,6 +882,9 @@ export class GroupDiscussionChannel {
       if (priorEvent !== undefined) {
         assertDiscussionSteerAddedEvent(priorEvent, input, active);
       }
+      const preferredProvider = priorEvent === undefined
+        ? input.preferredProvider
+        : steerEventPreferredProvider(priorEvent) ?? input.preferredProvider;
       const receipt = this.#store.recordSteer({
         id: this.#idFactory(),
         discussionId: active.id,
@@ -882,9 +892,9 @@ export class GroupDiscussionChannel {
         ...(priorEvent === undefined ? {} : { topicEventSeq: priorEvent.seq }),
         principalId: input.principalId,
         text: input.text,
-        ...(input.preferredProvider === undefined
+        ...(preferredProvider === undefined
           ? {}
-          : { preferredProvider: input.preferredProvider }),
+          : { preferredProvider }),
       }).steer;
       if (priorEvent === undefined) {
         this.#publishSteerEvent(input, active, receipt.id, false);
@@ -1236,6 +1246,7 @@ function assertDiscussionSteerAddedEvent(
     ["discussionId", "tenantKey", "chatId", "messageId", "text"],
     ["preferredProvider"],
   );
+  const eventPreferredProvider = steerEventPreferredProvider(event);
   if (
     event.type !== "discussion.steer.added"
     || (!currentPayload && !legacyPayload)
@@ -1250,6 +1261,11 @@ function assertDiscussionSteerAddedEvent(
     || payload.chatId !== input.chatId
     || payload.messageId !== input.messageId
     || payload.text !== input.text
+    || (
+      eventPreferredProvider !== undefined
+      && input.preferredProvider !== undefined
+      && eventPreferredProvider !== input.preferredProvider
+    )
   ) {
     throw new Error("Inconsistent discussion.steer.added event");
   }
@@ -1257,19 +1273,13 @@ function assertDiscussionSteerAddedEvent(
 
 function recoveryInputForSteerEvent(event: TopicEvent): GroupDiscussionReceiveInput {
   const payload = recordValue(event.payload);
-  const preferredProvider = payload?.preferredProvider;
+  const preferredProvider = steerEventPreferredProvider(event);
   if (
     event.actorPrincipalId === undefined
     || typeof payload?.tenantKey !== "string"
     || typeof payload.chatId !== "string"
     || typeof payload.messageId !== "string"
     || typeof payload.text !== "string"
-    || (
-      preferredProvider !== undefined
-      && preferredProvider !== "claude"
-      && preferredProvider !== "codex"
-      && preferredProvider !== "copilot"
-    )
   ) {
     throw new Error("Inconsistent discussion.steer.added event");
   }
@@ -1283,6 +1293,29 @@ function recoveryInputForSteerEvent(event: TopicEvent): GroupDiscussionReceiveIn
     idempotencyKey: `discussion-steer-event-recovery:${event.topicId}:${event.seq}`,
     ...(preferredProvider === undefined ? {} : { preferredProvider }),
   };
+}
+
+function steerEventPreferredProvider(event: TopicEvent): ProviderName | undefined {
+  const value = recordValue(event.payload)?.preferredProvider;
+  if (
+    value !== undefined
+    && value !== "claude"
+    && value !== "codex"
+    && value !== "copilot"
+  ) {
+    throw new Error("Inconsistent discussion.steer.added event");
+  }
+  return value;
+}
+
+function reconcilePreferredProvider(
+  persisted: ProviderName | undefined,
+  incoming: ProviderName | undefined,
+): ProviderName | undefined {
+  if (persisted !== undefined && incoming !== undefined && persisted !== incoming) {
+    throw new Error("Conflicting preferred provider for Discussion steer");
+  }
+  return persisted ?? incoming;
 }
 
 function assertSteerReceiptMatchesEvent(
