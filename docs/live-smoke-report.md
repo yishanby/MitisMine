@@ -58,14 +58,15 @@ included in this report.
 | Session recovery | Post-restart `RESUMED_CLAUDE_OK`, `RESUMED_CODEX_OK`, and `RESUMED_COPILOT_OK` used unchanged session IDs | Pass |
 | Multi-Session migration preflight | Revision `a74ca6d` started against the live database; legacy Claude/Codex/Copilot direct rows migrated to named `main` Sessions without changing their external IDs; `/ready` remained 200 | Pass |
 | Fresh real CLI start+resume | `tests/live/cli-smoke.test.ts` passed 3/3 after ChatGPT login: Claude 14,283 ms; Codex 27,676 ms; Copilot 31,747 ms; 73,708 ms total tests, 74.61 s Vitest duration | Pass |
-| Canonical visible group start and identity | In Feishu, the human used the @ toolbar and selected the real entity whose display name is exactly `MitisMine 总控`, verified it was an entity mention, and then typed the question. This created Discussion `01KXSRVC8DFBMTJRSY1KJKCM5C` and one Hub control card; Claude, Codex, and Copilot each posted real content under their own App identity | Pass |
-| Automatic turns | Five completed visible turns: Claude 0 (99 characters), Codex 1 (58), Copilot 2 (93), Codex 3 (47), and Copilot 4 (66). Claude turn 5 was intentionally cancelled by immediate summary and produced no visible content | Pass, 3/3 current content |
-| Durable pause, steer, and resume | Pause occurred while Copilot turn 2 was in flight. Its attempt was cancelled, durable state reached round 1/turn index 2/version 8, and the speaker slot was retained. A genuine `MitisMine 总控` entity-mention steer persisted while paused; resume consumed it in Copilot turn 2 | Pass |
+| Canonical visible group start and identity | In Feishu, the human used the @ toolbar and selected the real entity whose display name is exactly `MitisMine 总控`, verified it was an entity mention, and then typed the question. The UI showed one Hub control card and real content from all three provider identities; the read-only Discussion audit associated that flow with `01KXSRVC8DFBMTJRSY1KJKCM5C` | Pass |
+| Automatic turns | The UI showed five completed provider messages. The read-only Discussion audit mapped them to Claude 0 (99 characters), Codex 1 (58), Copilot 2 (93), Codex 3 (47), and Copilot 4 (66), and recorded Claude turn 5 as cancelled with no visible content | Pass, 3/3 current content |
+| Durable pause, steer, and resume | A separate read-only SQLite audit—not the visible UI alone—showed that pause cancelled the in-flight Copilot turn 2 attempt, persisted round 1/turn index 2/version 8, retained the speaker slot, kept the genuine entity-mention steer pending, and associated its consumption with Copilot turn 2 after resume | Pass |
+| Steer instruction compliance | Copilot turn 2 followed the requested snapshot instruction, but not the requested length limit: the persisted text measured 93 UTF-16 code units, 93 code points, and 71 Han characters, exceeding 60 Han characters. `consumed` proves delivery and turn association, not full provider compliance | Partial provider compliance; orchestration evidence remains valid |
 | Cross-provider acknowledgement after steer | Resumed Copilot turn 2 explicitly addressed the transaction-start snapshot point. Codex turn 3 corrected the overstrong claim that cross-host/NFS access would `必然损坏`; Copilot turn 4 accepted that correction | Pass; visible consensus, not independent empirical or external technical verification |
-| Same-card controls | Every sent or superseded control update through version 19 targeted `om_x100b6a84163cb4a0c3dadf616c2fcda`; pause, resume, and immediate-summary did not create a replacement control card | Pass |
-| Immediate summary | An in-flight Claude turn at index 5 was intentionally cancelled; durable state moved to summarizing at round 2/turn index 5/version 18 and then completed at version 19 | Pass |
-| Final visible summary | The existing Hub control card was patched to completed at the same message ID. Hub sent the Unicode-clean, 324-character summary as a separate message; it was not posted inside or on the control card | Pass |
-| Unicode integrity | The question, `summary_text`, all turn text/open questions/steer IDs, both steer texts, and every related Outbox payload/delivery effect/result had replacement_count=0. The visible UI segment also had no U+FFFD, and every visible provider/summary Outbox row was sent | Pass |
+| Same-card controls | The read-only Outbox audit showed every sent or superseded control update through version 19 targeted `om_x100b6a84163cb4a0c3dadf616c2fcda`; pause, resume, and immediate-summary did not create a replacement control card | Pass |
+| Immediate summary | The read-only Discussion audit recorded the in-flight Claude turn at index 5 as intentionally cancelled and state as summarizing at round 2/turn index 5/version 18, then completed at version 19 | Pass |
+| Final visible summary | The UI showed the control card render completed and Hub send a separate Unicode-clean summary. The read-only Outbox audit established that the existing card was patched at the same message ID and that the separate summary length was 324 characters | Pass |
+| Unicode integrity | The read-only database/Outbox audit found replacement_count=0 in the question, `summary_text`, all turn text/open questions/steer IDs, both steer texts, and every related payload/delivery effect/result. The separately inspected visible UI segment also had no U+FFFD, and every visible provider/summary Outbox row was sent | Pass |
 | Historical Discussion classification | Discussion `01KXSM5XNX4STNQTPR245H86TY` contains U+FFFD in a Claude turn and Hub summary and is retained only as pre-fix evidence. Earlier Discussion `01KXSCB2AX0GSY6YNT98S8GN61` remains failure-isolation evidence | Historical only; neither is canonical |
 | Approval before write | Smoke target absent before approval; approval row was pending | Pass |
 | Approval idempotency | First click created one 18-byte file; second click left the same mtime and stored result | Pass |
@@ -98,6 +99,7 @@ summary_length=324 replacement_count=0
 paused_at={round:1,turn_index:2,version:8}
 steer_message=om_x100b6a8429f170b0c4afe4588666c37
 steer=persisted_then_consumed_by_copilot_turn_2
+steer_compliance={snapshot:true,max_60_han:false,utf16:93,code_points:93,han:71}
 correction=codex_turn_3_acknowledged_by_copilot_turn_4
 summary_transition=summarizing(v18)->completed(v19)
 same_control_message_through_version_19=true
@@ -162,33 +164,59 @@ all four bots:
    请三位各用不超过60个汉字说明 SQLite WAL 的一个适用条件，并互相校验。
    ```
 
-2. Confirm Hub creates one control card, Claude turn 0 and Codex turn 1 visibly
-   complete under their own App identities, and Copilot turn 2 starts under its
-   own identity.
-3. While Copilot turn 2 is in flight, click **暂停**. Confirm the in-flight
-   attempt is cancelled, the durable card reaches round 1/turn index 2/version
-   8, and the Copilot speaker slot is retained.
-4. While paused, again select the genuine `MitisMine 总控` entity mention and
+2. Confirm Hub creates one control card and that Claude and Codex post visible
+   replies under their own App identities. When Copilot begins its next visible
+   activity, click **暂停** and confirm the control card renders a paused state.
+3. While paused, again select the genuine `MitisMine 总控` entity mention and
    send this natural steer:
 
    ```text
    请把后续发言控制在60个汉字内，并明确：读事务看到开始时的已提交快照。
    ```
 
-5. Click **继续**. Confirm Copilot consumes the pending user steer in turn 2
-   and explicitly addresses the transaction-start snapshot point. The start
-   question also appears internally as a consumed initial steer; it is distinct
-   from this user steer.
-6. Confirm Codex turn 3 corrects the overstrong statement that cross-host/NFS
-   access would `必然损坏`, then Copilot turn 4 accepts that correction. Treat
-   this as cross-provider acknowledgement and consensus, not independent
-   empirical or external technical verification.
-7. While Claude turn 5 is in flight, click **立即总结**. Confirm the turn is
-   cancelled without visible content and state reaches summarizing version 18,
-   then completed version 19.
-8. Confirm the original control message ID remains unchanged and is patched to
-   a completed card. Confirm Hub sends its Unicode-clean summary as a separate
-   message, not inside or on the original control card.
+4. Click **继续**. In the UI, confirm the next Copilot reply explicitly addresses
+   the transaction-start snapshot point. Confirm the subsequent Codex reply
+   corrects the overstrong statement that cross-host/NFS access would
+   `必然损坏`, then the next Copilot reply accepts that correction. This visible
+   exchange establishes cross-provider acknowledgement and consensus, not
+   independent empirical or external technical verification.
+5. When Claude begins the next visible activity, click **立即总结**. Confirm no
+   additional Claude provider content appears, the control card renders a
+   completed state, and Hub posts its Unicode-clean summary as a separate
+   message rather than inside or on the control card.
+
+Those UI steps establish visible App identities, the rendered pause/completed
+card states, the visible provider exchange, the absence of an additional Claude
+message, and the separate Hub summary. They do not expose exact turn indexes,
+versions, steer database status, cancellation rows, or Outbox target message
+IDs.
+
+The recorded acceptance evidence therefore included a subsequent read-only
+SQLite/Outbox audit. That audit—not UI observation—established all of the
+following:
+
+- pause cancelled the in-flight Copilot attempt and persisted round 1/turn
+  index 2/version 8 while retaining the speaker slot;
+- user steer `om_x100b6a8429f170b0c4afe4588666c37` stayed pending while
+  paused and was consumed by Copilot turn 2 after resume; the separately
+  consumed initial steer represents the start question;
+- the completed/cancelled turn rows, exact provider order, indexes, and lengths;
+- immediate summary persisted round 2/turn index 5/version 18 as summarizing,
+  then version 19 as completed; and
+- every sent or superseded control update targeted
+  `om_x100b6a84163cb4a0c3dadf616c2fcda`, with all visible provider and summary
+  Outbox rows sent.
+
+The persisted Copilot turn 2 text was:
+
+```text
+同意二位。WAL 核心优势：读事务见启动快照，无脏读且并发高效。关键限制是单写者、内存映射依赖。NFS 跨主机访问违反映射前提—确实会导致损坏。建议补充：WAL 文件与数据库需同盘位置。
+```
+
+It followed the snapshot instruction but measured 93 UTF-16 code units, 93
+code points, and 71 Han characters. It therefore did not meet the requested
+60-Han-character limit. The steer row's `consumed` status proves delivery and
+association with that provider turn, not full compliance with every instruction.
 
 Real provider start+resume is separate and quota-consuming:
 

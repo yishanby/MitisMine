@@ -32,48 +32,78 @@ evidence only.
 No App Secret, access token, cookie, authorization header, CLI credential, or
 user credential is included here.
 
-## Reproduction and exact interaction sequence
+## UI-observable interaction sequence
 
 1. In Feishu, the human clicked the @ toolbar, selected the real mention entity
    whose display name is exactly `MitisMine 总控`, verified it was an entity
    mention, and then typed the recorded question. Merely typing `@Hub` or plain
    text is not the reproduced start path.
-2. Hub created Discussion `01KXSRVC8DFBMTJRSY1KJKCM5C` and control message
-   `om_x100b6a84163cb4a0c3dadf616c2fcda`.
-3. Claude turn 0 and Codex turn 1 completed visibly. Copilot turn 2 then began.
-4. While Copilot turn 2 was in flight, the human clicked **暂停**. The attempt
-   was cancelled; durable state reached `paused` at round 1, turn index 2,
-   version 8. The Copilot speaker slot was retained.
-5. While paused, the human selected a genuine `MitisMine 总控` entity mention
+2. Hub displayed one control card. Claude and Codex completed visible replies
+   under their own App identities. As Copilot began its next visible activity,
+   the human clicked **暂停**, and the card rendered a paused state.
+3. While paused, the human selected a genuine `MitisMine 总控` entity mention
    and sent this natural steer:
 
    ```text
    请把后续发言控制在60个汉字内，并明确：读事务看到开始时的已提交快照。
    ```
 
-   Message `om_x100b6a8429f170b0c4afe4588666c37` remained pending while
-   paused. The start question is also represented internally as a consumed
-   initial steer; it is distinct from this user steer.
-6. The human clicked **继续**. Copilot retained turn index 2, consumed the user
-   steer after resume, and explicitly addressed the transaction-start committed
-   snapshot point.
-7. Codex turn 3 corrected an overstrong claim that cross-host/NFS access would
-   `必然损坏`, replacing it with the narrower conclusion that the arrangement is
-   unreliable and not recommended. Copilot turn 4 accepted that correction.
-8. Claude turn 5 began. The human clicked **立即总结**; that turn was
-   intentionally cancelled and produced no visible content.
-9. Durable state reached `summarizing` at round 2, turn index 5, version 18 and
-   then `completed` at version 19. The existing Hub control card was patched to
-   completed at the same control message ID. Hub sent the summary as a separate
-   message; the summary was not posted inside or on the original control card.
+4. The human clicked **继续**. The next Copilot reply visibly addressed the
+   transaction-start committed snapshot point. The subsequent Codex reply
+   narrowed the overstrong claim that cross-host/NFS access would `必然损坏` to
+   unreliable and not recommended; the next Copilot reply accepted that
+   correction.
+5. As Claude began the next visible activity, the human clicked **立即总结**.
+   No additional Claude provider message appeared. The existing control card
+   rendered a completed state, and Hub sent the Unicode-clean summary as a
+   separate message rather than inside or on that control card.
 
-## Visible identity and turn evidence
+The UI therefore proves visible identities and content, the rendered
+pause/completed states, the absence of an additional Claude provider message,
+and the separate Hub summary. It does not expose exact turn indexes, versions,
+steer status, cancelled/completed database rows, or Outbox target message IDs.
+
+## Recorded durable interaction audit
+
+A subsequent read-only SQLite/Outbox audit—not the visible UI alone—established
+the exact durable sequence:
+
+1. Create established Discussion `01KXSRVC8DFBMTJRSY1KJKCM5C` and control
+   message `om_x100b6a84163cb4a0c3dadf616c2fcda`.
+2. Pause cancelled the in-flight Copilot turn 2 attempt and persisted `paused`
+   at round 1, turn index 2, version 8 while retaining the Copilot speaker slot.
+3. User steer `om_x100b6a8429f170b0c4afe4588666c37` stayed pending while
+   paused and was consumed by Copilot turn 2 only after resume. The separately
+   consumed initial steer represents the start question, not this user steer.
+4. Claude turn 5 was recorded as cancelled with no visible content. Immediate
+   summary persisted `summarizing` at round 2, turn index 5, version 18 and then
+   `completed` at version 19.
+5. Every sent or superseded control update targeted the same control message ID.
+   Every visible provider and summary Outbox row was sent; the summary was a
+   separate Hub message.
+
+The persisted Copilot turn 2 text was:
+
+```text
+同意二位。WAL 核心优势：读事务见启动快照，无脏读且并发高效。关键限制是单写者、内存映射依赖。NFS 跨主机访问违反映射前提—确实会导致损坏。建议补充：WAL 文件与数据库需同盘位置。
+```
+
+It followed the snapshot instruction but not the requested length constraint:
+it measured 93 UTF-16 code units, 93 code points, and 71 Han characters. The
+steer's `consumed` status proves delivery and association with Copilot turn 2,
+not full provider compliance with every instruction.
+
+## Visible messages and durable turn rows
+
+The App identities and message content were visible in Feishu. The turn indexes,
+lengths, and completed/cancelled outcomes in this table come from the separate
+read-only Discussion audit.
 
 | Turn index | Visible App identity | Length | Result |
 |---:|---|---:|---|
 | 0 | Claude | 99 | Completed visible content |
 | 1 | Codex | 58 | Completed visible content |
-| 2 | Copilot | 93 | Completed after resume; consumed the pending user steer |
+| 2 | Copilot | 93 | Completed after resume; steer associated as consumed, but the reply contained 71 Han characters and exceeded the requested limit |
 | 3 | Codex | 47 | Completed; corrected the overstrong NFS/cross-host claim |
 | 4 | Copilot | 66 | Completed; accepted the Codex correction |
 | 5 | Claude | — | In flight, then intentionally cancelled; no visible content |
