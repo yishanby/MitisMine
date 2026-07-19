@@ -76,6 +76,7 @@ export function createCopilotAdapter(runner: AgentRunner): AgentAdapter {
         optionsFor(task, sessionId, false),
         normalizeCopilot,
         sessionId,
+        task.onEvent,
       );
     },
     resume: (task: ResumeAgentTask) =>
@@ -85,6 +86,7 @@ export function createCopilotAdapter(runner: AgentRunner): AgentAdapter {
         optionsFor(task, task.externalSessionId, true),
         normalizeCopilot,
         task.externalSessionId,
+        task.onEvent,
       ),
   };
 }

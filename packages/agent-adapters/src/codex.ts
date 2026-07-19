@@ -86,7 +86,9 @@ function optionsFor(task: AgentTask, sessionId?: string): RunJsonlOptions {
 export function createCodexAdapter(runner: AgentRunner): AgentAdapter {
   return {
     provider: "codex",
-    start: (task) => collectNormalized("codex", runner, optionsFor(task), normalizeCodex),
+    start: (task) => collectNormalized(
+      "codex", runner, optionsFor(task), normalizeCodex, undefined, task.onEvent,
+    ),
     resume: (task: ResumeAgentTask) =>
       collectNormalized(
         "codex",
@@ -94,6 +96,7 @@ export function createCodexAdapter(runner: AgentRunner): AgentAdapter {
         optionsFor(task, task.externalSessionId),
         normalizeCodex,
         task.externalSessionId,
+        task.onEvent,
       ),
   };
 }

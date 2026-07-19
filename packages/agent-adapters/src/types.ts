@@ -35,6 +35,18 @@ export class ProviderInvocationError extends Error {
   }
 }
 
+export class ProviderOutputUnicodeError extends Error {
+  readonly provider: ProviderName;
+  readonly externalSessionId: string | undefined;
+
+  constructor(provider: ProviderName, externalSessionId?: string) {
+    super("Invalid Unicode in provider output");
+    this.name = "ProviderOutputUnicodeError";
+    this.provider = provider;
+    this.externalSessionId = externalSessionId;
+  }
+}
+
 export type ProviderName = "claude" | "codex" | "copilot";
 
 export interface AgentTask {
@@ -44,6 +56,7 @@ export interface AgentTask {
   readonly cwd: string;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  readonly onEvent?: (event: AgentEvent) => void | Promise<void>;
 }
 
 export interface ResumeAgentTask extends AgentTask {
@@ -76,6 +89,7 @@ export async function collectNormalized(
   options: RunJsonlOptions,
   normalize: (event: AgentEvent) => readonly AgentEvent[],
   fallbackSessionId?: string,
+  onEvent?: (event: AgentEvent) => void | Promise<void>,
 ): Promise<AdapterResult> {
   const events: AgentEvent[] = [];
   let externalSessionId = fallbackSessionId;
@@ -85,6 +99,7 @@ export async function collectNormalized(
       if (event.type === "session" && typeof event.externalSessionId === "string") {
         externalSessionId = event.externalSessionId;
       }
+      await onEvent?.(event);
     }
   }
   const fatal = events.find(
@@ -100,7 +115,9 @@ export async function collectNormalized(
   for (const event of events) {
     if (event.type !== "final" || typeof event.text !== "string") continue;
     hasFinal = true;
-    assertValidProviderText(event.text);
+    if (event.text.includes("\ufffd")) {
+      throw new ProviderOutputUnicodeError(provider, externalSessionId);
+    }
   }
   if (!hasFinal) {
     throw new Error(`${provider} did not emit a final event`);

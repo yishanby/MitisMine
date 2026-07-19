@@ -11,6 +11,7 @@ import {
   type AdapterRegistry,
 } from "../../../packages/agent-adapters/src/index.js";
 import { runJsonl } from "../../../packages/agent-protocol/src/runner.js";
+import type { AgentEvent } from "../../../packages/agent-protocol/src/types.js";
 import { compileContext } from "../../../packages/domain/src/context.js";
 import type { DiscussionAction, GroupDiscussion } from "../../../packages/domain/src/discussion.js";
 import { resolvePrincipal } from "../../../packages/domain/src/topic.js";
@@ -55,6 +56,7 @@ import { DurableOutbox } from "../../../packages/storage/src/outbox.js";
 import { EventStore } from "../../../packages/storage/src/store.js";
 import { WorkerLeaseStore } from "../../worker/src/main.js";
 import { loadConfig, type Config } from "./config.js";
+import { DirectProgressReporter } from "./direct-progress.js";
 import { RecoverySupervisor } from "./recovery.js";
 export { RecoverySupervisor } from "./recovery.js";
 
@@ -129,9 +131,22 @@ export class ChannelDispatcher implements FeishuDispatcher {
       input.mode === "control" ? input.action : "任务已进入队列",
       "accepted",
     );
+    const progress = input.mode === "direct"
+      ? new DirectProgressReporter({
+          outbox: this.#outbox,
+          dispatchIdempotencyKey: input.idempotencyKey,
+          appRole: input.replyAppRole,
+          receiveId: input.receiveId,
+          provider: input.provider,
+        })
+      : undefined;
+    progress?.start();
     const controller = new AbortController();
     const handling = input.mode === "direct"
-      ? this.#serializeDirect(input.directSessionId, () => this.#handle(input, controller.signal))
+      ? this.#serializeDirect(
+          input.directSessionId,
+          () => this.#handle(input, controller.signal, progress),
+        )
       : this.#handle(input, controller.signal);
     this.#pending.set(handling, {
       controller,
@@ -140,8 +155,14 @@ export class ChannelDispatcher implements FeishuDispatcher {
         : {}),
     });
     void handling.then(
-      () => { this.#pending.delete(handling); },
-      () => { this.#pending.delete(handling); },
+      () => {
+        progress?.complete();
+        this.#pending.delete(handling);
+      },
+      () => {
+        progress?.fail();
+        this.#pending.delete(handling);
+      },
     );
     if (
       input.mode === "research"
@@ -169,7 +190,11 @@ export class ChannelDispatcher implements FeishuDispatcher {
     await Promise.allSettled(pending.map(([handling]) => handling));
   }
 
-  async #handle(input: DispatchInput, signal: AbortSignal): Promise<void> {
+  async #handle(
+    input: DispatchInput,
+    signal: AbortSignal,
+    progress?: DirectProgressReporter,
+  ): Promise<void> {
     if (input.mode === "research") {
       const runId = `research:${input.idempotencyKey}`;
       const result = this.#checkpoints.load(runId) === undefined
@@ -224,6 +249,9 @@ export class ChannelDispatcher implements FeishuDispatcher {
           ),
           cwd: this.#workspace(input.topicId),
           signal,
+          ...(progress === undefined
+            ? {}
+            : { onEvent: (event: AgentEvent) => { progress.onEvent(event); } }),
         };
         const result = await this.#limiter.run(async () => {
           if (session.externalSessionId === undefined) return adapter.start(task);

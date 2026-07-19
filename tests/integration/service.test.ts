@@ -588,6 +588,96 @@ describe("ChannelDispatcher Context Pack", () => {
     }
   });
 
+  it("streams direct Agent progress into the accepted Feishu card", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-progress-wiring-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "direct.db");
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    const topic = createTopic("Direct progress", "tenant:user:owner", {
+      id: "topic-direct-progress",
+    });
+    store.append({ topicId: topic.id, type: "topic.created", payload: { topic } });
+    const directSession = store.createDirectSession({
+      id: "direct-session-progress",
+      topicId: topic.id,
+      provider: "claude",
+      title: "main",
+    });
+    let releaseProvider: (() => void) | undefined;
+    const providerBlocked = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    let signalProviderStarted: (() => void) | undefined;
+    const providerStarted = new Promise<void>((resolve) => { signalProviderStarted = resolve; });
+    let receivedEventCallback = false;
+    const adapter: AgentAdapter = {
+      provider: "claude",
+      start: async (task) => {
+        receivedEventCallback = typeof task.onEvent === "function";
+        signalProviderStarted?.();
+        await providerBlocked;
+        await task.onEvent?.({ type: "session", externalSessionId: "external-progress" });
+        await task.onEvent?.({ type: "progress", stage: "tool", message: "正在查询 Kusto" });
+        await task.onEvent?.({ type: "delta", text: "已获得第一批统计结果" });
+        return {
+          provider: "claude",
+          externalSessionId: "external-progress",
+          events: [{ type: "final", text: "最终统计结果" }],
+        };
+      },
+      resume: async () => { throw new Error("unexpected resume"); },
+    };
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected research resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: { claude: adapter, codex: adapter, copilot: adapter },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+    const dispatchKey = "direct-progress-wiring";
+
+    try {
+      await dispatcher.dispatch({
+        mode: "direct",
+        provider: "claude",
+        directSessionId: directSession.id,
+        topicId: topic.id,
+        topicTitle: topic.title,
+        principalId: topic.ownerPrincipalId,
+        question: "show progress",
+        idempotencyKey: dispatchKey,
+        replyAppRole: "claude",
+        receiveId: "chat",
+      });
+      await providerStarted;
+      const acceptedId = `outbox:${dispatchKey}:accepted`;
+      outbox.markDelivered(acceptedId, { messageId: "om-direct-progress" });
+      outbox.markSent(acceptedId);
+      releaseProvider?.();
+      await waitUntil(
+        () => store.events(topic.id).some((event) => event.type === "agent.direct.completed"),
+        "direct progress completion",
+      );
+
+      expect(receivedEventCallback).toBe(true);
+      expect(outbox.message(`outbox:${dispatchKey}:progress:1`)).toMatchObject({
+        operation: "update",
+        targetMessageId: "om-direct-progress",
+      });
+      expect(JSON.stringify(outbox.message(`outbox:${dispatchKey}:progress:1`)?.payload))
+        .toMatch(/Session|Kusto|统计结果/);
+    } finally {
+      await dispatcher.shutdown();
+      store.close();
+      outbox.close();
+    }
+  });
+
   it("starts and resumes the selected direct Session without crossing external IDs", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-selection-"));
     temporaryDirectories.push(directory);

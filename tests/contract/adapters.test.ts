@@ -45,6 +45,145 @@ function fakeRunner(calls: RunJsonlOptions[]): AgentRunner {
 }
 
 describe("CLI adapters", () => {
+  it("streams normalized Claude events before the invocation completes", async () => {
+    let releaseProvider: (() => void) | undefined;
+    const providerBlocked = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    let observeSession: (() => void) | undefined;
+    const sessionObserved = new Promise<void>((resolve) => { observeSession = resolve; });
+    let completed = false;
+    const runner: AgentRunner = async function* () {
+      yield { type: "system", subtype: "init", session_id: "claude-live-events" };
+      await providerBlocked;
+      yield { type: "result", result: "done", session_id: "claude-live-events" };
+    };
+
+    const invocation = createAdapters(runner).claude.start({
+      topicId: "topic-live-events",
+      runId: "run-live-events",
+      prompt: "stream progress",
+      cwd: process.cwd(),
+      onEvent: (event) => {
+        if (event.type === "session") observeSession?.();
+      },
+    }).finally(() => { completed = true; });
+
+    const observedBeforeCompletion = await Promise.race([
+      sessionObserved.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    const completedWhenObserved = completed;
+    releaseProvider?.();
+    expect(observedBeforeCompletion).toBe(true);
+    expect(completedWhenObserved).toBe(false);
+    await expect(invocation).resolves.toMatchObject({ externalSessionId: "claude-live-events" });
+  });
+
+  it("emits safe Claude tool milestones without exposing tool input", async () => {
+    const sensitiveQuery = "SECRET KUSTO QUERY MUST NOT LEAK";
+    const runner: AgentRunner = async function* () {
+      yield { type: "system", subtype: "init", session_id: "claude-tools" };
+      yield {
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "lumina-kusto", args: sensitiveQuery } },
+            {
+              type: "tool_use",
+              name: "mcp__kusto-tools__execute_kusto_query",
+              input: { query: sensitiveQuery },
+            },
+          ],
+        },
+      };
+      yield {
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text: "阶段结果" } },
+      };
+      yield {
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: sensitiveQuery } },
+      };
+      yield { type: "result", result: "最终结果", session_id: "claude-tools" };
+    };
+    const observed: AgentEvent[] = [];
+
+    await createAdapters(runner).claude.start({
+      topicId: "topic-tools",
+      runId: "run-tools",
+      prompt: "use tools",
+      cwd: process.cwd(),
+      onEvent: (event) => { observed.push(event); },
+    });
+
+    expect(observed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "progress", stage: "tool", message: "正在加载 Skill" }),
+      expect.objectContaining({ type: "progress", stage: "tool", message: "正在查询 Kusto" }),
+      { type: "delta", text: "阶段结果" },
+    ]));
+    expect(JSON.stringify(observed)).not.toContain(sensitiveQuery);
+  });
+
+  it("rewrites one corrupt Claude response inside the same Session", async () => {
+    const replacementCharacter = String.fromCodePoint(0xfffd);
+    const calls: RunJsonlOptions[] = [];
+    const observed: AgentEvent[] = [];
+    const runner: AgentRunner = async function* (options) {
+      calls.push(options);
+      yield { type: "system", subtype: "init", session_id: "claude-unicode-repair" };
+      if (calls.length === 1) {
+        yield {
+          type: "result",
+          result: `损坏${replacementCharacter}${replacementCharacter}${replacementCharacter}答案`,
+          session_id: "claude-unicode-repair",
+        };
+        return;
+      }
+      yield { type: "result", result: "完整重写后的答案", session_id: "claude-unicode-repair" };
+    };
+
+    const result = await createAdapters(runner).claude.start({
+      topicId: "topic-unicode-repair",
+      runId: "run-unicode-repair",
+      prompt: "answer in Chinese",
+      cwd: process.cwd(),
+      onEvent: (event) => { observed.push(event); },
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.args).toEqual(expect.arrayContaining([
+      "--resume",
+      "claude-unicode-repair",
+    ]));
+    expect(calls[1]?.args?.at(-1)).toMatch(/完整.*重写|rewrite.*complete/i);
+    expect(result.events).toContainEqual({ type: "final", text: "完整重写后的答案" });
+    expect(observed).toContainEqual(expect.objectContaining({
+      type: "progress",
+      stage: "unicode_repair",
+    }));
+  });
+
+  it("stops after one Claude Unicode rewrite attempt", async () => {
+    const replacementCharacter = String.fromCodePoint(0xfffd);
+    let calls = 0;
+    const runner: AgentRunner = async function* () {
+      calls += 1;
+      yield { type: "system", subtype: "init", session_id: "claude-still-corrupt" };
+      yield {
+        type: "result",
+        result: `still ${replacementCharacter} corrupt`,
+        session_id: "claude-still-corrupt",
+      };
+    };
+
+    await expect(createAdapters(runner).claude.start({
+      topicId: "topic-still-corrupt",
+      runId: "run-still-corrupt",
+      prompt: "answer",
+      cwd: process.cwd(),
+    })).rejects.toThrow(/invalid Unicode.*provider output/i);
+    expect(calls).toBe(2);
+  });
+
   it("rejects fatal or warning-only results that never emit a final event", async () => {
     const fatalRunner: AgentRunner = async function* () {
       yield { type: "session", externalSessionId: "session-fatal" };
