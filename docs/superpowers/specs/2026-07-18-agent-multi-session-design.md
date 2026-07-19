@@ -104,6 +104,28 @@ Topic 的固定信息、用户笔记以及群体调研结果属于共享上下�
 - provider 不可用：Session 保留，响应报错但不丢失外部 ID。
 - viewer：允许 list/show/use，拒绝 new/rename/archive/普通消息。
 
+### 6.1 实时进度与 Unicode 恢复
+
+单 Agent 普通消息复用最初的“已接收”卡片作为状态卡，而不是为每个阶段新增
+飞书消息。Adapter 将 provider 已公开的流式事件交给控制面；控制面只展示：
+
+- Session 正在建立或恢复；
+- Skill、WebSearch、WebFetch、只读 Kusto 等工具的安全显示名；
+- provider 已输出的可见文本片段；
+- 最近活动时间和累计耗时。
+
+状态卡最多每 2 秒因事件更新一次；没有新事件时每 15 秒写入一次心跳。新状态
+通过 Outbox patch 同一飞书 message ID，旧的待发送 patch 可被 supersede。隐藏
+thinking、工具参数、查询文本、Secret、external Session ID 和完整 Context Pack
+不得进入状态卡。最终答案继续作为独立消息发送，状态卡只保留完成或失败状态。
+
+若 Claude 的流式 delta 或最终 `result` 包含 U+FFFD，控制面不得猜测或删除字符。
+Claude Adapter 在同一 external Session 内最多自动追加一次“完整重写上一条答案”的
+请求，并重新执行 Unicode 校验。重写期间状态卡显示编码恢复阶段；重写成功后才把
+干净答案持久化和发送。第二次仍损坏时安全失败，不覆盖 external Session ID，也不
+写 `agent.direct.completed`。普通 provider 错误和不存在的 Session 继续遵守各自现有
+恢复规则。
+
 ## 7. 验收标准
 
 - 每个 provider App 可独立创建、列出、切换、重命名和归档多个 Session。
@@ -113,6 +135,8 @@ Topic 的固定信息、用户笔记以及群体调研结果属于共享上下�
 - 旧 `agent_sessions` direct 数据无损迁移。
 - Topic viewer/editor 权限和飞书事件幂等规则覆盖 Session 操作。
 - 群体 discuss/research 行为及既有测试不回归。
+- 长任务持续更新一条状态卡，展示安全阶段和阶段性可见结果而不刷屏。
+- Claude 输出含 U+FFFD 时仅执行一次 Session 内完整重写；不猜字、不持久化损坏文本。
 
 当前验证记录为：根级 `pnpm test:run` 通过 23 个测试文件、跳过 1 个，
 345 个测试通过、3 个显式 live 用例跳过，耗时 10.27 秒；真实 CLI
