@@ -4,7 +4,7 @@ Date: 2026-07-18 (Asia/Shanghai)
 
 Canonical interaction revision: `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
 
-Current audited application revision: `04c04d4a17cfe7fe6f4227c1cf268dfa6bb38399`
+Current audited application revision: `6dbde98776a26e9270d4de3a3357fe9b668acf62`
 
 Scope: one real Feishu group Discussion using the rebuilt persistent four-App
 service. This is the canonical Unicode-clean visible-group acceptance run.
@@ -16,7 +16,7 @@ summary-steer, and startup-query hardening without claiming a second UI run.
 
 Service PID `58564` belongs to the canonical `dcc1df4` Feishu acceptance
 window. The exact CLI durations below come from a separate opt-in run on the
-current `04c04d4` application revision.
+current `6dbde98` application revision.
 
 Discussion `01KXSM5XNX4STNQTPR245H86TY` is retained only as historical pre-fix
 evidence: a Claude turn and the Hub summary contain U+FFFD, so that run is not
@@ -177,10 +177,10 @@ benchmarking, or verification against an external technical source.
 
 The final verification window recorded:
 
-- fresh root `pnpm test:run`: 23 test files passed, 1 skipped; 345 tests passed,
-  3 opt-in live tests skipped; duration 10.27 s;
-- current-revision opt-in real CLI suite: 3/3 passed (Claude 21,122 ms;
-  Codex 27,585 ms; Copilot 46,109 ms; 94,817 ms test total; 95.79 s Vitest
+- fresh root `pnpm test:run`: 24 test files passed, 1 skipped; 351 tests passed,
+  3 opt-in live tests skipped; duration 10.86 s;
+- current-revision opt-in real CLI suite: 3/3 passed (Claude 24,770 ms;
+  Codex 31,512 ms; Copilot 53,415 ms; 109,699 ms test total; 110.49 s Vitest
   duration);
 - the final recorded lint, typecheck, and build runs: passed;
 - tracked-secret scan: passed for 5 configured keys without exposing a value;
@@ -189,7 +189,7 @@ The final verification window recorded:
   cross-reviews, and important evidence coverage 2/2.
 
 The post-interaction recovery suite additionally covers missing Claude direct
-Session replacement, exact v2, scoped legacy,
+Session replacement, streamed direct progress, bounded Unicode rewrite, exact v2, scoped legacy,
 and minimal v0 event replay; Hub-only start; tenant/chat and principal/text
 scoping; failed-turn resume; receipt-first and event-first crash repair; bound
 legacy-event replay without duplicate events; terminal consumed tombstones;

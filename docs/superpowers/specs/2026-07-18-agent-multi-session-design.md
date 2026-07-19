@@ -1,7 +1,7 @@
 # MitisMine 单 Agent 多 Session 设计
 
 日期：2026-07-18  
-状态：已实施；截至代码修订 `04c04d4a17cfe7fe6f4227c1cf268dfa6bb38399` 于 2026-07-19 完成全量回归验证
+状态：已实施；截至代码修订 `6dbde98776a26e9270d4de3a3357fe9b668acf62` 于 2026-07-19 完成全量回归验证
 
 范围：在共享 Topic 和群体调研之外，为 Claude、Codex、Copilot 三个飞书 App 提供彼此独立、可持久化恢复的多 Session 体验。
 
@@ -138,13 +138,13 @@ Claude Adapter 在同一 external Session 内最多自动追加一次“完整�
 - 长任务持续更新一条状态卡，展示安全阶段和阶段性可见结果而不刷屏。
 - Claude 输出含 U+FFFD 时仅执行一次 Session 内完整重写；不猜字、不持久化损坏文本。
 
-当前验证记录为：根级 `pnpm test:run` 通过 23 个测试文件、跳过 1 个，
-345 个测试通过、3 个显式 live 用例跳过，耗时 10.27 秒；真实 CLI
-start+resume 验证为 Claude 21,122 ms、Codex 27,585 ms、Copilot 46,109 ms，
+当前验证记录为：根级 `pnpm test:run` 通过 24 个测试文件、跳过 1 个，
+351 个测试通过、3 个显式 live 用例跳过，耗时 10.86 秒；真实 CLI
+start+resume 验证为 Claude 24,770 ms、Codex 31,512 ms、Copilot 53,415 ms，
 3/3 通过。以上是仓库级回归与真实 provider 连续性证据，不表示每条验收标准
 都分别经过独立的线上实证。
 
-上述精确 CLI 时长来自当前 `04c04d4` 修订的独立 opt-in 运行；它们与
+上述精确 CLI 时长来自当前 `6dbde98` 修订的独立 opt-in 运行；它们与
 canonical 飞书交互是两组证据，也不表示性能基准或服务级 SLA。
 
 若 provider 侧已清理 Claude conversation，`resume` 会产生安全的
@@ -152,3 +152,9 @@ canonical 飞书交互是两组证据，也不表示性能基准或服务级 SLA
 `start`，成功后原子替换 external Session ID。普通 `process_exit` 不会触发
 重开。真实 stale-Session 验证返回 `LIVE_DIRECT_FALLBACK_OK`；另一次真实
 Claude 调用成功使用 `Skill` 与只读 Kusto MCP，且没有 permission denial。
+
+当前修订的真实 Claude/Kusto 调用还验证了 Skill、Kusto 和分析阶段事件实时
+到达回调，最终 1,045 字且无 U+FFFD。另一真实 Session 在首轮 final 被注入
+测试用损坏字符后，Adapter 只执行一次同 Session 重写，22,212 ms 内返回干净
+答案。单卡 patch、2 秒限频、15 秒心跳、可见文本边界和工具参数不泄漏由
+确定性 Outbox/Dispatcher 测试验证；部署后的飞书 UI 观察不与这些证据混写。

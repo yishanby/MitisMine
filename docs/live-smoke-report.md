@@ -5,14 +5,14 @@ Initial smoke: 2026-07-17; final multi-Session, CLI, and visible-group rechecks:
 
 Environment: Windows, Node `24.12.0`, Feishu persistent connection, local SQLite WAL Worker
 
-Current audited application revision: `04c04d4a17cfe7fe6f4227c1cf268dfa6bb38399`
+Current audited application revision: `6dbde98776a26e9270d4de3a3357fe9b668acf62`
 
 Canonical visible-group interaction revision:
 `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
 
 Service PID `58564` was captured in the canonical `dcc1df4` Feishu acceptance
 window. The exact CLI durations below come from a separate opt-in run on the
-current `04c04d4` application revision.
+current `6dbde98` application revision.
 
 CLI versions at the final recheck:
 
@@ -64,9 +64,11 @@ included in this report.
 | Restart recovery | Service restarted; `/ready` returned 200; `/status` and `/report` cards reloaded | Pass |
 | Session recovery | Post-restart `RESUMED_CLAUDE_OK`, `RESUMED_CODEX_OK`, and `RESUMED_COPILOT_OK` used unchanged session IDs | Pass |
 | Multi-Session migration preflight | Revision `a74ca6d` started against the live database; legacy Claude/Codex/Copilot direct rows migrated to named `main` Sessions without changing their external IDs; `/ready` remained 200 | Pass |
-| Fresh real CLI start+resume | On the current application revision, `tests/live/cli-smoke.test.ts` passed 3/3: Claude 21,122 ms; Codex 27,585 ms; Copilot 46,109 ms; 94,817 ms total tests, 95.79 s Vitest duration | Pass |
+| Fresh real CLI start+resume | On the current application revision, `tests/live/cli-smoke.test.ts` passed 3/3: Claude 24,770 ms; Codex 31,512 ms; Copilot 53,415 ms; 109,699 ms total tests, 110.49 s Vitest duration | Pass |
 | Stale Claude direct Session recovery | A real missing Claude conversation was classified as `session_not_found`; the same direct turn started a replacement Session, returned `LIVE_DIRECT_FALLBACK_OK`, persisted the replacement external ID, and restored status `active` | Pass |
-| Claude Skill and read-only Kusto | A real Claude call used `Skill` followed by `mcp__kusto-tools__execute_kusto_query`, completed successfully, and reported zero permission denials. The 24-hour result contained 3,083,552 requests and 38 HTTP 5xx failures | Pass |
+| Claude Skill and read-only Kusto | A current-revision real Claude call emitted safe `Skill`, Kusto, and analysis milestones, completed in 52,022 ms, and produced a 1,045-character final with zero replacement characters | Pass |
+| Claude Unicode rewrite | A real Claude Session had one replacement character injected into its first final event. The Adapter emitted the `unicode_repair` milestone, resumed that same Session exactly once, and returned a clean final in 22,212 ms | Pass |
+| Direct progress card | Deterministic Outbox tests prove the accepted Feishu card is patched in place, provider events are limited to one update per two seconds, quiet work receives a 15-second heartbeat, visible text is bounded, and tool input is absent. The current live provider run proves the upstream milestones; a new post-deploy Feishu UI observation remains separate | Pass (deterministic card + live provider events) |
 | Canonical visible group start and identity | In Feishu, the human used the @ toolbar and selected the real entity whose display name is exactly `MitisMine 总控`, verified it was an entity mention, and then typed the question. The UI showed one Hub control card and real content from all three provider identities; the read-only Discussion audit associated that flow with `01KXSRVC8DFBMTJRSY1KJKCM5C` | Pass |
 | Automatic turns | The UI showed five completed provider messages. The read-only Discussion audit mapped their code-point/Han counts to Claude 0 (99/72), Codex 1 (58/37), Copilot 2 (93/71), Codex 3 (47/30), and Copilot 4 (66/46), and recorded Claude turn 5 as cancelled with no visible content | Pass; all 3 provider identities produced visible content |
 | Durable pause, steer, and resume | A separate read-only SQLite audit—not the visible UI alone—showed that pause cancelled the in-flight Copilot turn 2 attempt, persisted round 1/turn index 2/version 8, retained the speaker slot, kept the genuine entity-mention steer pending, and associated its consumption with Copilot turn 2 after resume | Pass |
@@ -81,7 +83,7 @@ included in this report.
 | Approval before write | Smoke target absent before approval; approval row was pending | Pass |
 | Approval idempotency | First click created one 18-byte file; second click left the same mtime and stored result | Pass |
 | Secret isolation | `.env.local` ignored; the recorded tracked scan passed for 5 configured keys without exposing a value; child environment tests pass | Pass |
-| Build verification | Fresh root `pnpm test:run`: 23 test files passed and 1 skipped; 345 tests passed and 3 opt-in live tests skipped; duration 10.27 s. The final recorded lint, typecheck, and build runs passed | Pass |
+| Build verification | Fresh root `pnpm test:run`: 24 test files passed and 1 skipped; 351 tests passed and 3 opt-in live tests skipped; duration 10.86 s. The final recorded lint, typecheck, and build runs passed | Pass |
 | Worker lease execution | Deterministic task IDs, heartbeat, terminal state, and expired same-task resume verified automatically | Pass |
 
 ## Redacted excerpts
@@ -93,8 +95,8 @@ apps=[hub,claude,codex,copilot] workers=1 pid=58564
 
 ```text
 cli_smoke=passed tests=3/3
-claude_ms=21122 codex_ms=27585 copilot_ms=46109
-tests_ms=94817 vitest_duration_s=95.79
+claude_ms=24770 codex_ms=31512 copilot_ms=53415
+tests_ms=109699 vitest_duration_s=110.49
 ```
 
 ```text
