@@ -5,7 +5,11 @@ import { pathToFileURL } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
 import { ulid } from "ulid";
 
-import { createAdapters, type AdapterRegistry } from "../../../packages/agent-adapters/src/index.js";
+import {
+  createAdapters,
+  ProviderInvocationError,
+  type AdapterRegistry,
+} from "../../../packages/agent-adapters/src/index.js";
 import { runJsonl } from "../../../packages/agent-protocol/src/runner.js";
 import { compileContext } from "../../../packages/domain/src/context.js";
 import type { DiscussionAction, GroupDiscussion } from "../../../packages/domain/src/discussion.js";
@@ -221,9 +225,25 @@ export class ChannelDispatcher implements FeishuDispatcher {
           cwd: this.#workspace(input.topicId),
           signal,
         };
-        const result = await this.#limiter.run(async () => session.externalSessionId === undefined
-          ? adapter.start(task)
-          : adapter.resume({ ...task, externalSessionId: session.externalSessionId }));
+        const result = await this.#limiter.run(async () => {
+          if (session.externalSessionId === undefined) return adapter.start(task);
+          try {
+            return await adapter.resume({
+              ...task,
+              externalSessionId: session.externalSessionId,
+            });
+          } catch (error) {
+            if (
+              !(error instanceof ProviderInvocationError)
+              || error.provider !== input.provider
+              || error.code !== "session_not_found"
+            ) {
+              throw error;
+            }
+            if (signal.aborted) throw signal.reason ?? new Error("Direct turn aborted");
+            return adapter.start(task);
+          }
+        });
         const text = finalText(result.events);
         const contextWatermark = this.#store.topic(input.topicId)?.lastEventSeq ?? 0;
         const latest = this.#store.directSession(session.id);

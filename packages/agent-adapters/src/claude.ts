@@ -16,14 +16,10 @@ function argumentsFor(task: AgentTask, sessionId?: string): string[] {
     "--include-partial-messages",
     "--verbose",
     "--permission-mode",
-    "plan",
-    "--tools",
-    "WebSearch,WebFetch",
-    "--allowedTools",
-    "WebSearch,WebFetch",
-    "--disallowedTools",
-    "Read,Glob,Grep,Bash,Edit,Write",
-    "--strict-mcp-config",
+    "default",
+    "--tools=Skill,WebSearch,WebFetch",
+    "--allowedTools=Skill,WebSearch,WebFetch,mcp__kusto-tools__execute_kusto_query",
+    "--disallowedTools=Read,Glob,Grep,Bash,Edit,Write",
   ];
   if (sessionId !== undefined) args.push("--resume", sessionId);
   args.push(task.prompt);
@@ -33,6 +29,21 @@ function argumentsFor(task: AgentTask, sessionId?: string): string[] {
 function normalizeClaude(event: AgentEvent): readonly AgentEvent[] {
   const error = passthroughError(event);
   if (error) return error;
+  if (
+    event.type === "result"
+    && event.is_error === true
+    && Array.isArray(event.errors)
+    && event.errors.some(
+      (message) => typeof message === "string"
+        && /No conversation found with session ID:/i.test(message),
+    )
+  ) {
+    return [{
+      type: "error",
+      code: "session_not_found",
+      message: "Claude resume Session was not found",
+    }];
+  }
   if (
     event.type === "system" &&
     event.subtype === "init" &&

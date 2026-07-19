@@ -3,7 +3,7 @@ import { createCodexAdapter } from "./codex.js";
 import { createCopilotAdapter } from "./copilot.js";
 import type { AgentAdapter, AgentRunner, ProviderName } from "./types.js";
 
-export { assertValidProviderText } from "./types.js";
+export { assertValidProviderText, ProviderInvocationError } from "./types.js";
 
 export type {
   AdapterResult,
@@ -11,6 +11,7 @@ export type {
   AgentRunner,
   AgentTask,
   ProviderName,
+  ProviderErrorCode,
   ResumeAgentTask,
 } from "./types.js";
 

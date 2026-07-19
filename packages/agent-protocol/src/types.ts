@@ -13,6 +13,7 @@ export interface AgentErrorEvent extends AgentDataEvent {
     | "process_error"
     | "process_exit"
     | "process_stderr"
+    | "session_not_found"
     | "timeout";
   readonly message: string;
   readonly truncated?: boolean;

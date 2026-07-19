@@ -13,8 +13,27 @@ const safeProviderErrorCodes: ReadonlySet<string> = new Set([
   "process_exit",
   "process_stderr",
   "provider_error",
+  "session_not_found",
   "timeout",
 ] satisfies readonly (AgentErrorEvent["code"] | "provider_error")[]);
+
+export type ProviderErrorCode = AgentErrorEvent["code"] | "provider_error";
+
+function isProviderErrorCode(value: unknown): value is ProviderErrorCode {
+  return typeof value === "string" && safeProviderErrorCodes.has(value);
+}
+
+export class ProviderInvocationError extends Error {
+  readonly provider: ProviderName;
+  readonly code: ProviderErrorCode;
+
+  constructor(provider: ProviderName, code: ProviderErrorCode) {
+    super(`${provider} failed with ${code}`);
+    this.name = "ProviderInvocationError";
+    this.provider = provider;
+    this.code = code;
+  }
+}
 
 export type ProviderName = "claude" | "codex" | "copilot";
 
@@ -72,10 +91,10 @@ export async function collectNormalized(
     (event) => event.type === "error" && event.code !== "process_stderr",
   );
   if (fatal !== undefined) {
-    const code = typeof fatal.code === "string" && safeProviderErrorCodes.has(fatal.code)
+    const code = isProviderErrorCode(fatal.code)
       ? fatal.code
       : "provider_error";
-    throw new Error(`${provider} failed with ${code}`);
+    throw new ProviderInvocationError(provider, code);
   }
   let hasFinal = false;
   for (const event of events) {

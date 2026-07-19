@@ -64,6 +64,46 @@ describe("CLI adapters", () => {
     }, normalize)).rejects.toThrow(/final/);
   });
 
+  it("classifies a missing Claude resume Session without exposing its ID", async () => {
+    const missingSessionId = "missing-claude-session-do-not-echo";
+    const runner: AgentRunner = async function* () {
+      yield {
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        session_id: missingSessionId,
+        errors: [`No conversation found with session ID: ${missingSessionId}`],
+      };
+      yield {
+        type: "error",
+        code: "process_exit",
+        message: "Agent process exited with code 1",
+      };
+    };
+    const adapter = createAdapters(runner).claude;
+
+    let rejection: unknown;
+    try {
+      await adapter.resume({
+        topicId: "topic-missing-session",
+        runId: "run-missing-session",
+        prompt: "Continue safely",
+        cwd: process.cwd(),
+        externalSessionId: missingSessionId,
+      });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toEqual(expect.objectContaining({
+      name: "ProviderInvocationError",
+      provider: "claude",
+      code: "session_not_found",
+      message: "claude failed with session_not_found",
+    }));
+    expect((rejection as Error).message).not.toContain(missingSessionId);
+  });
+
   it("maps an unknown runtime error code to a safe provider error", async () => {
     const arbitraryCode = "unknown_code:do-not-echo";
     const runner: AgentRunner = async function* () {
@@ -175,15 +215,18 @@ describe("CLI adapters", () => {
         "--print",
         "--output-format",
         "stream-json",
-        "--tools",
-        "WebSearch,WebFetch",
-        "--allowedTools",
-        "WebSearch,WebFetch",
-        "--disallowedTools",
-        "Read,Glob,Grep,Bash,Edit,Write",
+        "--permission-mode",
+        "default",
+        "--tools=Skill,WebSearch,WebFetch",
+        "--allowedTools=Skill,WebSearch,WebFetch,mcp__kusto-tools__execute_kusto_query",
+        "--disallowedTools=Read,Glob,Grep,Bash,Edit,Write",
       ]),
       providerAuthEnv: [],
     });
+    expect(calls[0]?.args).not.toContain("--strict-mcp-config");
+    expect(calls[0]?.args).not.toContain("--tools");
+    expect(calls[0]?.args).not.toContain("--allowedTools");
+    expect(calls[0]?.args).not.toContain("--disallowedTools");
     expect(calls[1]).toMatchObject({
       args: expect.arrayContaining([
         "exec",

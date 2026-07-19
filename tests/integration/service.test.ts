@@ -9,12 +9,13 @@ import {
   createService,
   handleDiscussionCardAction,
 } from "../../apps/control-plane/src/main.js";
-import type {
-  AdapterRegistry,
-  AgentAdapter,
-  AgentTask,
-  ProviderName,
-  ResumeAgentTask,
+import {
+  ProviderInvocationError,
+  type AdapterRegistry,
+  type AgentAdapter,
+  type AgentTask,
+  type ProviderName,
+  type ResumeAgentTask,
 } from "../../packages/agent-adapters/src/index.js";
 import {
   AppConnectionRegistry,
@@ -487,6 +488,101 @@ describe("ChannelDispatcher Context Pack", () => {
       expect(store.events(topic.id).some((event) => event.type === "agent.direct.completed"))
         .toBe(false);
     } finally {
+      store.close();
+      outbox.close();
+    }
+  });
+
+  it("restarts a missing external direct Session and completes the same turn", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mitismine-direct-missing-session-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "direct.db");
+    const store = EventStore.open(path);
+    const outbox = DurableOutbox.open(path);
+    const topic = createTopic("Missing direct Session", "tenant:user:owner", {
+      id: "topic-direct-missing-session",
+    });
+    store.append({
+      topicId: topic.id,
+      type: "topic.created",
+      actorPrincipalId: topic.ownerPrincipalId,
+      payload: { topic },
+    });
+    const directSession = store.createDirectSession({
+      id: "direct-session-missing",
+      topicId: topic.id,
+      provider: "claude",
+      title: "main",
+    });
+    store.updateDirectSession(directSession.id, {
+      externalSessionId: "stale-external-session",
+    });
+    const resumed: string[] = [];
+    let starts = 0;
+    const adapter: AgentAdapter = {
+      provider: "claude",
+      resume: async (task) => {
+        resumed.push(task.externalSessionId);
+        throw new ProviderInvocationError("claude", "session_not_found");
+      },
+      start: async () => {
+        starts += 1;
+        return {
+          provider: "claude",
+          externalSessionId: "replacement-external-session",
+          events: [{ type: "final", text: "continued after Session replacement" }],
+        };
+      },
+    };
+    const dispatcher = new ChannelDispatcher({
+      orchestrator: {
+        start: async () => { throw new Error("unexpected research"); },
+        resume: async () => { throw new Error("unexpected research resume"); },
+        cancel: async () => {},
+      },
+      checkpoints: { load: () => undefined, latestForTopic: () => undefined },
+      store,
+      outbox,
+      adapters: { claude: adapter, codex: adapter, copilot: adapter },
+      agentWorkspaceRoot: directory,
+      approval: { request: () => { throw new Error("unexpected approval"); } },
+    });
+
+    try {
+      await dispatcher.dispatch({
+        mode: "direct",
+        provider: "claude",
+        directSessionId: directSession.id,
+        topicId: topic.id,
+        topicTitle: topic.title,
+        principalId: topic.ownerPrincipalId,
+        question: "continue this turn",
+        idempotencyKey: "direct-missing-session",
+        replyAppRole: "claude",
+        receiveId: "chat",
+      });
+      await waitUntil(
+        () => store.events(topic.id).some((event) => event.type === "agent.direct.completed"),
+        "replacement direct Session completion",
+      );
+
+      expect(resumed).toEqual(["stale-external-session"]);
+      expect(starts).toBe(1);
+      expect(store.directSession(directSession.id)).toMatchObject({
+        externalSessionId: "replacement-external-session",
+        status: "active",
+      });
+      expect(store.events(topic.id).find((event) => event.type === "agent.direct.completed"))
+        .toMatchObject({
+          payload: {
+            provider: "claude",
+            directSessionId: directSession.id,
+            externalSessionId: "replacement-external-session",
+            text: "continued after Session replacement",
+          },
+        });
+    } finally {
+      await dispatcher.shutdown();
       store.close();
       outbox.close();
     }
