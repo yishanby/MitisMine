@@ -30,10 +30,8 @@ function argumentsFor(task: AgentTask, sessionId?: string): string[] {
     "--include-partial-messages",
     "--verbose",
     "--permission-mode",
-    "default",
-    "--tools=Skill,WebSearch,WebFetch",
-    "--allowedTools=Skill,WebSearch,WebFetch,mcp__kusto-tools__execute_kusto_query",
-    "--disallowedTools=Read,Glob,Grep,Bash,Edit,Write",
+    "bypassPermissions",
+    "--tools=default",
   ];
   if (sessionId !== undefined) args.push("--resume", sessionId);
   args.push(task.prompt);
@@ -109,6 +107,7 @@ function optionsFor(task: AgentTask, sessionId?: string): RunJsonlOptions {
     command: "claude",
     args: argumentsFor(task, sessionId),
     cwd: task.cwd,
+    environmentPolicy: "native",
     providerAuthEnv: [],
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.signal === undefined ? {} : { signal: task.signal }),

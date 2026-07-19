@@ -74,6 +74,37 @@ describe("runJsonl", () => {
     });
   });
 
+  it("inherits native proxy, provider authentication, and tool configuration", () => {
+    const original = {
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      AZURE_CONFIG_DIR: process.env.AZURE_CONFIG_DIR,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      KUSTO_DEFAULT_CLUSTER: process.env.KUSTO_DEFAULT_CLUSTER,
+    };
+    Object.assign(process.env, {
+      HTTPS_PROXY: "http://127.0.0.1:8080",
+      AZURE_CONFIG_DIR: "C:\\Users\\test\\.azure",
+      ANTHROPIC_API_KEY: "provider-auth-value",
+      KUSTO_DEFAULT_CLUSTER: "https://cluster.example.kusto.windows.net",
+    });
+
+    try {
+      const environment = curateChildEnvironment({}, [], [], "native");
+
+      expect(environment).toMatchObject({
+        HTTPS_PROXY: "http://127.0.0.1:8080",
+        AZURE_CONFIG_DIR: "C:\\Users\\test\\.azure",
+        ANTHROPIC_API_KEY: "provider-auth-value",
+        KUSTO_DEFAULT_CLUSTER: "https://cluster.example.kusto.windows.net",
+      });
+    } finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("turns malformed JSONL into a structured error event", async () => {
     const events = await collect(
       runJsonl({ command: process.execPath, args: [fake, "malformed"] }),

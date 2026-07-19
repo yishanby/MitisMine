@@ -5,6 +5,7 @@ import type { AgentErrorEvent, AgentEvent, RunJsonlOptions } from "./types.js";
 
 const SENSITIVE_ENV = /SECRET|TOKEN|COOKIE|AUTHORIZATION|FEISHU|LARK|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL/i;
 const SENSITIVE_ASSIGNMENT = /\b([a-z0-9_.-]*(?:secret|token|cookie|authorization|password|passwd|api[_-]?key|private[_-]?key|credential)[a-z0-9_.-]*)\s*([:=])\s*(?:bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+const CONTROL_PLANE_ENV = /^(?:FEISHU|LARK|MITISMINE)_/i;
 const BASE_ENV = new Set([
   "PATH",
   "HOME",
@@ -118,8 +119,21 @@ export function curateChildEnvironment(
   supplied: Readonly<Record<string, string | undefined>> = {},
   allowEnv: readonly string[] = [],
   providerAuthEnv: readonly string[] = [],
+  policy: "curated" | "native" = "curated",
 ): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
+  if (policy === "native") {
+    for (const source of [process.env, supplied]) {
+      for (const [key, value] of Object.entries(source)) {
+        const existingKey = Object.keys(result).find(
+          (candidate) => candidate.toUpperCase() === key.toUpperCase(),
+        );
+        if (existingKey !== undefined) delete result[existingKey];
+        if (value !== undefined && !CONTROL_PLANE_ENV.test(key)) result[key] = value;
+      }
+    }
+    return result;
+  }
   const providerKeys = new Set(providerAuthEnv.map((key) => key.toUpperCase()));
 
   for (const key of BASE_ENV) {
@@ -155,7 +169,12 @@ export async function* runJsonl(options: RunJsonlOptions): AsyncGenerator<AgentE
   const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
-  const childEnvironment = curateChildEnvironment(options.env, options.allowEnv, options.providerAuthEnv);
+  const childEnvironment = curateChildEnvironment(
+    options.env,
+    options.allowEnv,
+    options.providerAuthEnv,
+    options.environmentPolicy,
+  );
   const sensitiveValues = Object.entries(childEnvironment)
     .filter(([key]) => SENSITIVE_ENV.test(key))
     .map(([, value]) => value)

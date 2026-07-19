@@ -27,7 +27,7 @@ function argumentsFor(task: AgentTask, sessionId: string, resume: boolean): stri
     "on",
     "--no-ask-user",
     "--no-color",
-    "--available-tools=web_search,web_fetch",
+    "--allow-all",
     `--secret-env-vars=${REDACTED_SECRET_NAMES}`,
   ];
   if (resume) args.push(`--resume=${sessionId}`);
@@ -59,6 +59,7 @@ function optionsFor(task: AgentTask, sessionId: string, resume: boolean): RunJso
     command: "copilot",
     args: argumentsFor(task, sessionId, resume),
     cwd: task.cwd,
+    environmentPolicy: "native",
     providerAuthEnv: [],
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.signal === undefined ? {} : { signal: task.signal }),

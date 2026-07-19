@@ -11,21 +11,11 @@ import {
   type ResumeAgentTask,
 } from "./types.js";
 
-const PERMISSION_ARGS = [
-  "--ignore-user-config",
-  "--strict-config",
-  "--skip-git-repo-check",
-  "-c",
-  'default_permissions="workspace"',
-  "-c",
-  'permissions.workspace.filesystem={":workspace_roots"={"."="read","**/*.env"="deny"}}',
-] as const;
-
 function argumentsFor(sessionId?: string): string[] {
   if (sessionId !== undefined) {
     return [
       "exec",
-      ...PERMISSION_ARGS,
+      "--skip-git-repo-check",
       "resume",
       "--json",
       sessionId,
@@ -34,7 +24,7 @@ function argumentsFor(sessionId?: string): string[] {
   }
   return [
     "exec",
-    ...PERMISSION_ARGS,
+    "--skip-git-repo-check",
     "--json",
     "--color",
     "never",
@@ -77,6 +67,7 @@ function optionsFor(task: AgentTask, sessionId?: string): RunJsonlOptions {
     args: [...invocation.prefixArgs, ...argumentsFor(sessionId)],
     stdin: task.prompt,
     cwd: task.cwd,
+    environmentPolicy: "native",
     providerAuthEnv: [],
     ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.signal === undefined ? {} : { signal: task.signal }),

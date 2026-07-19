@@ -331,10 +331,14 @@ describe("CLI adapters", () => {
         text: `${provider} answer`,
       });
       expect(calls).toHaveLength(2);
+      expect(calls).toEqual([
+        expect.objectContaining({ environmentPolicy: "native" }),
+        expect.objectContaining({ environmentPolicy: "native" }),
+      ]);
     },
   );
 
-  it("builds non-interactive, read-only and secret-aware commands", async () => {
+  it("builds non-interactive, native and Session-writable commands", async () => {
     const calls: RunJsonlOptions[] = [];
     const adapters = createAdapters(fakeRunner(calls));
     const task = {
@@ -355,12 +359,11 @@ describe("CLI adapters", () => {
         "--output-format",
         "stream-json",
         "--permission-mode",
-        "default",
-        "--tools=Skill,WebSearch,WebFetch",
-        "--allowedTools=Skill,WebSearch,WebFetch,mcp__kusto-tools__execute_kusto_query",
-        "--disallowedTools=Read,Glob,Grep,Bash,Edit,Write",
+        "bypassPermissions",
+        "--tools=default",
       ]),
       providerAuthEnv: [],
+      environmentPolicy: "native",
     });
     expect(calls[0]?.args).not.toContain("--strict-mcp-config");
     expect(calls[0]?.args).not.toContain("--tools");
@@ -370,16 +373,15 @@ describe("CLI adapters", () => {
       args: expect.arrayContaining([
         "exec",
         "--json",
-        "--ignore-user-config",
-        "--strict-config",
         "--skip-git-repo-check",
-        "-c",
-        'default_permissions="workspace"',
-        'permissions.workspace.filesystem={":workspace_roots"={"."="read","**/*.env"="deny"}}',
       ]),
       stdin: "Question",
       providerAuthEnv: [],
+      environmentPolicy: "native",
     });
+    expect(calls[1]?.args).not.toContain("--ignore-user-config");
+    expect(calls[1]?.args).not.toContain("--strict-config");
+    expect(calls[1]?.args).not.toContain("-c");
     expect(calls[1]?.args).not.toContain("--sandbox");
     expect(calls[1]?.args?.at(-1)).toBe("-");
     if (process.platform === "win32") {
@@ -397,10 +399,12 @@ describe("CLI adapters", () => {
         "json",
         "--no-ask-user",
         "--session-id",
-        "--available-tools=web_search,web_fetch",
+        "--allow-all",
       ]),
       providerAuthEnv: [],
+      environmentPolicy: "native",
     });
+    expect(calls[2]?.args).not.toContain("--available-tools=web_search,web_fetch");
     expect(calls[2]?.args).not.toContain("--allow-all-paths");
     expect(calls[2]?.args).toContain(
       "--secret-env-vars=FEISHU_HUB_APP_SECRET,FEISHU_CLAUDE_APP_SECRET,FEISHU_CODEX_APP_SECRET,FEISHU_COPILOT_APP_SECRET",
