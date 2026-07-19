@@ -4,10 +4,10 @@ Audit date: 2026-07-19 (Asia/Shanghai)
 
 Branch: `feat/visible-group-discussion`
 
-Audited application revision: `6dbde98776a26e9270d4de3a3357fe9b668acf62`
+Audited application revision: `b2e08865d1c97b4296b6465661423a9078304f71`
 
 This audit covers application code through
-`6dbde98776a26e9270d4de3a3357fe9b668acf62`.
+`b2e08865d1c97b4296b6465661423a9078304f71`.
 The documentation-only commit that
 records this final evidence follows that revision and is intentionally not
 represented here as audited application code.
@@ -21,7 +21,7 @@ They do not rewrite the immutable canonical Discussion evidence.
 
 PID `58564` was captured in the canonical `dcc1df4` Feishu acceptance window.
 The exact CLI durations below come from a separate opt-in run on the current
-`6dbde98` application revision; they are not timings of the Feishu interaction.
+`b2e08865` application revision; they are not timings of the Feishu interaction.
 
 ## Acceptance evidence
 
@@ -32,7 +32,8 @@ The exact CLI durations below come from a separate opt-in run on the current
 | Standalone Agent multi-Session | Parser/Gateway/Store/Dispatcher tests cover create/list/use/show/rename/archive, lazy `main`, per-user/provider cursors, start/resume, stale external-Session replacement, streamed progress, one-card patch throttling/heartbeat, isolation, serialization, cross-Session concurrency, restart and legacy migration | A real stale Claude resume was replaced in the same turn. A separate real Claude/Kusto call emitted safe Skill, Kusto, and analysis milestones; an injected corrupt final triggered exactly one same-Session rewrite and returned with zero replacement characters | Pass |
 | Visible group Discussion with natural steer | Domain, Gateway, coordinator, card, store, recovery, Unicode guards, and Outbox suites cover one-active-per-chat, three unique speakers per round, same-card patching, steer consumption, pause/resume/summarize/stop, failed providers, turn-index 3/9 crash boundaries, fenced JSON, exact v2/scoped-legacy/minimal-v0 event replay, receipt-first and event-first crash recovery, bound-event replay, terminal tombstones, provider reconciliation, pending-steer summary regeneration, bounded paid retries, and indexed `(topic_id, seq)` recovery lookup | Unicode-clean canonical Discussion `01KXSRVC8DFBMTJRSY1KJKCM5C` completed at round 2/turn index 5/version 19. Claude, Codex, and Copilot produced five visible completed turns. Pause cancelled an in-flight Copilot attempt while retaining its slot; a genuine `MitisMine 总控` entity-mention steer persisted while paused and was consumed by Copilot after resume; Codex corrected an overstrong NFS claim and Copilot accepted the correction. All control updates targeted one control message; Hub sent the summary separately | Pass |
 | Owner/editor/viewer enforcement | `canReadTopic`/`canEditTopic`; viewer command matrix | Viewer rules reflected in deployed command path | Pass |
-| Three CLIs and Topic sessions | Adapter contracts; cross-Run/restart Topic-session tests | Current-revision real-CLI start+resume suite passed 3/3: Claude 24,770 ms, Codex 31,512 ms, Copilot 53,415 ms; a separate Claude read-only Kusto call used `Skill` and `mcp__kusto-tools__execute_kusto_query` and produced a 1,045-character Unicode-clean final | Pass |
+| Three CLIs and Topic sessions | Adapter contracts; cross-Run/restart Topic-session tests | Current-revision real-CLI start+resume suite passed 3/3: Claude 29,651 ms, Codex 87,640 ms, Copilot 41,228 ms | Pass |
+| Native capabilities and Session-wide modification | Adapter contracts prove Codex inherits user config, Claude uses `bypassPermissions` plus default tools, Copilot uses `--allow-all`, and every start/resume selects native environment inheritance | Each provider created a marker in an isolated workspace on its first turn, modified it after resume, and retained the same external Session; Claude, Codex, and Copilot each executed a harmless Kusto query whose fresh UTC time and random GUID were validated without recording either value | Pass |
 | Context reaches every agent | Context Pack unit test; real Gateway→ChannelDispatcher note/watermark test | Historical Topic/Run remains queryable | Pass |
 | Independent fan-out, child sessions, concurrency ≤6 | Orchestrator tests: isolation, six unique child sessions, semaphore cap | Three live reports; no degraded provider | Pass |
 | All-pairs review, repair, and ≤3 rounds | Six first-pass reviews; resolution report merge; signoff-only critique; round cap tests | 18 directed reviews over three rounds | Pass |
@@ -42,9 +43,9 @@ The exact CLI durations below come from a separate opt-in run on the current
 | Worker calls use lease protocol | Terminal/same-worker exclusion; durable completed-result cache; heartbeat abort/requeue; every Orchestrator call lease assertion; expired same-task resume | `/ready` reports one local Worker | Pass (local transport) |
 | Privileged work waits for approval | Approval/Gateway tests, orphaned-executing recovery test | Target absent before click; double click preserved one write/mtime | Pass |
 | `/stop` cancels real work | Abort propagation, stale-save guard, process-tree/grandchild test, lease requeue test | Not used on the evidence Run | Pass (automated) |
-| Secrets do not reach Git/logs/children | Synthetic secret isolation; redaction; least-privilege adapter contracts; tracked-value scan | `.env.local` ignored/untracked; the recorded scan checked 5 configured keys without exposing a value | Pass |
+| Secrets do not reach Git/logs/children | Native-environment tests preserve proxy/provider/tool values while removing every case variant of `FEISHU_*`, `LARK_*`, and `MITISMINE_*`; runner redaction and tracked-value scan remain active | Local Skill/MCP content stayed outside Git; the recorded scan checked 5 synthetic secret values without exposing a value | Pass |
 | Health, safe shutdown, delivery replay | Readiness, all-hook cleanup, startup unwind, pending-call cancel/drain, Outbox stable UUID, active-flush plus newly-queued-output drain, periodic lease recovery tests | Canonical acceptance service PID `58564`: HTTP 200, ready=true, store=true, four Apps, one Worker | Pass |
-| Deterministic and live verification | 351 tests passed; 3 live tests remain opt-in and skipped in the deterministic run | Fresh opt-in CLI suite passed 3/3; real Claude progress and Unicode-rewrite paths passed; the Unicode-clean canonical group Discussion completed with all 3 providers producing real visible content; the final recorded lint, typecheck, build, secret scan, source-Unicode scan, and diff checks passed | Pass |
+| Deterministic and live verification | 353 tests passed; 3 live tests remain opt-in and skipped in the deterministic run | Fresh opt-in CLI suite passed 3/3; all three providers passed start/resume, Session write, and Kusto capability checks; real Claude progress and Unicode-rewrite paths passed; the final recorded lint, typecheck, build, secret scan, source-Unicode scan, and diff checks passed | Pass |
 
 ## Verification snapshot
 
@@ -52,8 +53,8 @@ Fresh deterministic run on 2026-07-19:
 
 ```text
 Test Files  24 passed | 1 skipped (25)
-Tests       351 passed | 3 skipped (354)
-Duration    10.86 s
+Tests       353 passed | 3 skipped (356)
+Duration    10.47 s
 ```
 
 The three skipped cases are the explicit `MITISMINE_LIVE_CLI=1` suite. A fresh
@@ -66,12 +67,29 @@ Claude Code 2.1.212; Codex CLI 0.143.0; GitHub Copilot CLI 1.0.72-1
 
 ```text
 tests/live/cli-smoke.test.ts  3 passed (3)
-Claude start+resume           24770 ms
-Codex start+resume            31512 ms
-Copilot start+resume          53415 ms
-Tests                         109699 ms
-Vitest duration               110.49 s
+Claude start+resume           29651 ms
+Codex start+resume            87640 ms
+Copilot start+resume          41228 ms
+Tests                         158521 ms
+Vitest duration               159.51 s
 ```
+
+Native capability acceptance on `b2e08865d1c97b4296b6465661423a9078304f71`
+also established:
+
+```text
+workspace_write_start_resume={claude:pass,codex:pass,copilot:pass}
+same_external_session={claude:true,codex:true,copilot:true}
+kusto_result_validation={claude:pass,codex:pass,copilot:pass}
+control_plane_env_prefixes_in_children=0
+```
+
+The Kusto Skill remains local-only. Claude uses its existing user Skill and MCP.
+Copilot registers that Skill directory and MCP at user scope. Codex uses a
+properly cased user `SKILL.md`, a user MCP registration, a local preload that
+keeps the MCP stdout protocol clean, and `default_tools_approval_mode =
+"approve"` so non-interactive read queries are not cancelled. No Skill body,
+MCP environment value, query result, or provider Session ID is recorded in Git.
 
 The final recorded `pnpm lint`, `pnpm typecheck`, and `pnpm build` runs passed. The
 tracked-secret scan passed for 5 configured keys without exposing a value; no
@@ -117,6 +135,9 @@ historical failure-isolation run. Neither qualifies the canonical 3/3 outcome.
   provider turn can require resending the user message.
 - Remote Worker transport, leader election, and multi-control-plane HA are not shipped.
 - Persistent CLI credential stores belong to a trusted dedicated OS account.
+- Codex and Copilot Kusto access depends on the documented user-profile Skill,
+  MCP, and clean-stdio preload installation on this machine; those local files
+  are intentionally not embedded in the public repository.
 - The canonical group smoke covers one tenant, one group, five completed turns,
   and pause/resume/immediate-summary. Cross-provider acknowledgement establishes
   visible consensus, not independent empirical or external technical

@@ -67,7 +67,7 @@ expect(claude.args).toEqual(expect.arrayContaining([
   "--permission-mode", "bypassPermissions", "--tools=default",
 ]));
 expect(codex.args).not.toEqual(expect.arrayContaining([
-  "--ignore-user-config", "--strict-config", "--skip-git-repo-check",
+  "--ignore-user-config", "--strict-config",
 ]));
 expect(copilot.args).toContain("--allow-all");
 ```
@@ -90,7 +90,7 @@ For Claude, replace the current permission/tool block with:
 "--tools=default",
 ```
 
-For Codex, remove `PERMISSION_ARGS` and keep only `exec`, JSONL/color transport, resume, stdin, and working-directory behavior. For Copilot, remove `--available-tools=web_search,web_fetch` and add `--allow-all`. Set `environmentPolicy: "native"` in every adapter's `RunJsonlOptions`.
+For Codex, remove `PERMISSION_ARGS` and keep only `exec`, JSONL/color transport, `--skip-git-repo-check` for non-repository Topic workspaces, resume, stdin, and working-directory behavior. For Copilot, remove `--available-tools=web_search,web_fetch` and add `--allow-all`. Set `environmentPolicy: "native"` in every adapter's `RunJsonlOptions`.
 
 - [ ] **Step 4: Run the adapter contract and verify GREEN**
 
@@ -120,15 +120,17 @@ Expected: direct, Research, and Discussion tests pass with their existing workin
 
 **Files:**
 - Local-only source: `%USERPROFILE%\.claude\skills\lumina-kusto`
-- Local-only targets: `%USERPROFILE%\.codex\skills\lumina-kusto`, Copilot user Skill registry
+- Local-only targets: `%USERPROFILE%\.agents\skills\lumina-kusto`, Copilot user Skill registry
 - Local-only configuration: Codex and Copilot user MCP configuration
 
 - [ ] **Step 1: Link/register the existing Skill without copying it into Git**
 
-On Windows, create a user-level Codex junction pointing at the existing Claude Skill, then register that same source directory with Copilot:
+On Windows, copy the Skill to Codex's documented personal root, normalize its entry filename to uppercase `SKILL.md`, then register the existing Claude source directory with Copilot:
 
 ```powershell
-New-Item -ItemType Junction -Path "$HOME\.codex\skills\lumina-kusto" -Target "$HOME\.claude\skills\lumina-kusto"
+Copy-Item "$HOME\.claude\skills\lumina-kusto" "$HOME\.agents\skills\lumina-kusto" -Recurse
+Move-Item "$HOME\.agents\skills\lumina-kusto\skill.md" "$HOME\.agents\skills\lumina-kusto\skill.rename.tmp"
+Move-Item "$HOME\.agents\skills\lumina-kusto\skill.rename.tmp" "$HOME\.agents\skills\lumina-kusto\SKILL.md"
 copilot skill add "$HOME\.claude\skills\lumina-kusto"
 ```
 
@@ -136,7 +138,7 @@ If either target is already correctly registered, leave it in place and verify i
 
 - [ ] **Step 2: Register the existing `kusto-tools` MCP server for both CLIs**
 
-Read the existing Claude user MCP object locally, pass its command, arguments, and environment directly to each provider's supported user-level `mcp add` command, and do not print or persist those values in the repository. Use `codex mcp list` and `copilot mcp list` to verify an enabled `kusto-tools` entry.
+Read the existing Claude user MCP object locally, pass its command, arguments, and environment directly to each provider's supported user-level `mcp add` command, and do not print or persist those values in the repository. Preload a local script that suppresses ordinary server console output so stdout remains a valid MCP protocol stream. Set Codex `mcp_servers.kusto-tools.default_tools_approval_mode = "approve"` for non-interactive calls. Use `codex mcp list` and `copilot mcp list` to verify an enabled `kusto-tools` entry.
 
 - [ ] **Step 3: Prove the public worktree contains no capability content or credential**
 

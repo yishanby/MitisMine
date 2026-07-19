@@ -35,7 +35,7 @@ This approach is preferred over duplicating local provider configuration in Miti
 
 ### Codex
 
-Codex keeps `exec`, JSONL output, stdin prompt delivery, working directory, and `exec resume`. It no longer receives `--ignore-user-config`, `--strict-config`, `--skip-git-repo-check`, or MitisMine permission overrides. The local Codex configuration therefore controls model, approval policy, sandbox, MCP servers, Skills, plugins, and network access. On this host that means the existing `approval_policy = "never"` and writable workspace policy apply to every turn, including resumed turns.
+Codex keeps `exec`, JSONL output, stdin prompt delivery, working directory, `--skip-git-repo-check`, and `exec resume`. Topic workspaces are not required to be Git repositories, so the repository check must remain disabled. Codex no longer receives `--ignore-user-config`, `--strict-config`, or MitisMine permission overrides. The local Codex configuration therefore controls model, approval policy, sandbox, MCP servers, Skills, plugins, and network access. On this host that means the existing `approval_policy = "never"` and writable workspace policy apply to every turn, including resumed turns.
 
 MitisMine does not add `--dangerously-bypass-approvals-and-sandbox`; doing so would be broader than the user's normal local Codex policy. If the user changes the local Codex policy later, new and resumed MitisMine turns inherit that change.
 
@@ -66,9 +66,9 @@ The deny boundary is prefix-based instead of enumerating four current App Secret
 
 The existing Claude installation remains the local source for `lumina-kusto` and `kusto-tools`:
 
-- Codex receives a user-level directory link from its Skill directory to the existing Claude Skill directory.
+- Codex receives a user-level copy under `$HOME/.agents/skills/lumina-kusto`, with the entry file normalized to the exact `SKILL.md` casing required by Codex discovery.
 - Copilot registers that existing Skill directory through its supported `copilot skill add` command.
-- Codex and Copilot receive user-level `kusto-tools` MCP registrations pointing at the already installed local server command and the same local MCP configuration values.
+- Codex and Copilot receive user-level `kusto-tools` MCP registrations pointing at the already installed local server command and the same local MCP configuration values. A local Node preload suppresses the server's ordinary stdout logging so the stdio MCP protocol stays valid. Codex also marks this specific MCP's tools approved for non-interactive Sessions.
 
 No Skill file, MCP credential, connection string, or generated provider configuration is added to Git. The repository may document verification commands, but the installation itself stays in the user's profile. Because every MitisMine turn launches a fresh CLI process before resuming the external Session, the newly installed capabilities are loaded on the next turn; Topic records and external Session IDs do not need replacement.
 

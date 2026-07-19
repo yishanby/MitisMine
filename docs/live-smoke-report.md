@@ -5,14 +5,14 @@ Initial smoke: 2026-07-17; final multi-Session, CLI, and visible-group rechecks:
 
 Environment: Windows, Node `24.12.0`, Feishu persistent connection, local SQLite WAL Worker
 
-Current audited application revision: `6dbde98776a26e9270d4de3a3357fe9b668acf62`
+Current audited application revision: `b2e08865d1c97b4296b6465661423a9078304f71`
 
 Canonical visible-group interaction revision:
 `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`
 
 Service PID `58564` was captured in the canonical `dcc1df4` Feishu acceptance
 window. The exact CLI durations below come from a separate opt-in run on the
-current `6dbde98` application revision.
+current `b2e08865` application revision.
 
 CLI versions at the final recheck:
 
@@ -64,7 +64,9 @@ included in this report.
 | Restart recovery | Service restarted; `/ready` returned 200; `/status` and `/report` cards reloaded | Pass |
 | Session recovery | Post-restart `RESUMED_CLAUDE_OK`, `RESUMED_CODEX_OK`, and `RESUMED_COPILOT_OK` used unchanged session IDs | Pass |
 | Multi-Session migration preflight | Revision `a74ca6d` started against the live database; legacy Claude/Codex/Copilot direct rows migrated to named `main` Sessions without changing their external IDs; `/ready` remained 200 | Pass |
-| Fresh real CLI start+resume | On the current application revision, `tests/live/cli-smoke.test.ts` passed 3/3: Claude 24,770 ms; Codex 31,512 ms; Copilot 53,415 ms; 109,699 ms total tests, 110.49 s Vitest duration | Pass |
+| Fresh real CLI start+resume | On the current application revision, `tests/live/cli-smoke.test.ts` passed 3/3: Claude 29,651 ms; Codex 87,640 ms; Copilot 41,228 ms; 158,521 ms total tests, 159.51 s Vitest duration | Pass |
+| Native Session write | In provider-specific disposable workspaces, Claude, Codex, and Copilot each created a marker on start, replaced its content on resume, and returned the same external Session ID across both turns | Pass |
+| Three-provider local Kusto | Claude emitted the normalized Kusto progress event; Codex emitted a completed `mcp_tool_call` for `kusto-tools.execute_kusto_query`; Copilot loaded the custom Skill/MCP and completed the tool execution. Each provider returned a fresh UTC time and random GUID from a harmless bounded query; the verifier checked both but recorded neither value | Pass |
 | Stale Claude direct Session recovery | A real missing Claude conversation was classified as `session_not_found`; the same direct turn started a replacement Session, returned `LIVE_DIRECT_FALLBACK_OK`, persisted the replacement external ID, and restored status `active` | Pass |
 | Claude Skill and read-only Kusto | A current-revision real Claude call emitted safe `Skill`, Kusto, and analysis milestones, completed in 52,022 ms, and produced a 1,045-character final with zero replacement characters | Pass |
 | Claude Unicode rewrite | A real Claude Session had one replacement character injected into its first final event. The Adapter emitted the `unicode_repair` milestone, resumed that same Session exactly once, and returned a clean final in 22,212 ms | Pass |
@@ -82,8 +84,8 @@ included in this report.
 | Current recovery and steer hardening | Deterministic tests cover exact v2/scoped-legacy/minimal-v0 payload replay, Hub-only start, tenant/chat/principal scoping, receipt-first and event-first crash repair, bound legacy-event replay without duplicates, terminal consumed tombstones, live/recovery provider reconciliation, pending-steer summary regeneration, bounded paid retries, and indexed startup plus `(topic_id, seq)` queries. The immutable canonical records remain Unicode-clean and readable under the current schema | Pass |
 | Approval before write | Smoke target absent before approval; approval row was pending | Pass |
 | Approval idempotency | First click created one 18-byte file; second click left the same mtime and stored result | Pass |
-| Secret isolation | `.env.local` ignored; the recorded tracked scan passed for 5 configured keys without exposing a value; child environment tests pass | Pass |
-| Build verification | Fresh root `pnpm test:run`: 24 test files passed and 1 skipped; 351 tests passed and 3 opt-in live tests skipped; duration 10.86 s. The final recorded lint, typecheck, and build runs passed | Pass |
+| Secret isolation | Native inheritance retained representative proxy, provider-auth, and Kusto variables while dropping all `FEISHU_*`, `LARK_*`, and `MITISMINE_*` variables; the tracked scan passed for 5 synthetic secret values without exposing a value | Pass |
+| Build verification | Fresh root `pnpm test:run`: 24 test files passed and 1 skipped; 353 tests passed and 3 opt-in live tests skipped; duration 10.47 s. The final recorded lint, typecheck, and build runs passed | Pass |
 | Worker lease execution | Deterministic task IDs, heartbeat, terminal state, and expired same-task resume verified automatically | Pass |
 
 ## Redacted excerpts
@@ -95,8 +97,10 @@ apps=[hub,claude,codex,copilot] workers=1 pid=58564
 
 ```text
 cli_smoke=passed tests=3/3
-claude_ms=24770 codex_ms=31512 copilot_ms=53415
-tests_ms=109699 vitest_duration_s=110.49
+claude_ms=29651 codex_ms=87640 copilot_ms=41228
+tests_ms=158521 vitest_duration_s=159.51
+workspace_write_start_resume=passed providers=3/3 same_session=3/3
+kusto_result_validation=passed providers=3/3
 ```
 
 ```text
@@ -148,6 +152,15 @@ file_exists=true content_matches=true
    from `dcc1df4fb5cedd74ff2f8d19d17bf987e42e385a`, and a new canonical run
    verified zero replacements across durable Discussion fields, both steers,
    related Outbox JSON, the visible UI segment, and the separate Hub summary.
+10. The existing Kusto MCP wrote diagnostic messages and query responses to
+    stdout. Claude tolerated that stream, but Codex timed out during
+    `tools/list`. A local preload now suppresses ordinary console output before
+    the server starts; Codex then initialized and completed the tool call.
+    Because the Kusto schema does not advertise a read-only annotation, Codex
+    also needed user-scope `default_tools_approval_mode = "approve"` for the
+    non-interactive Session. The Skill filename was normalized to `SKILL.md` in
+    Codex's user skill directory. These machine-local files and settings are not
+    committed.
 
 ## Reproduction
 
